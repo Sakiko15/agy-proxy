@@ -1,11 +1,23 @@
-// agy-proxy entry point (M0 skeleton): config loading, agy binary probe,
-// dormant-state startup. Service wiring (Fastify, engine, pool) lands in M1/M2.
-import { resolveConfig, dataDir } from './common/config.ts'
+// agy-proxy entry point: config loading, agy binary probe, server wiring.
+// The engine layer (src/host) is ported from dsh-agy-link; the server layer
+// (src/server) is new — Fastify service skeleton + OpenAI non-streaming
+// route (charter §3/§4). M1 deliberately wires NO account pool, quota
+// polling, or media sweep: the gateway starts empty (no pool = single
+// logged-in system account) and images arrive in M2.
+import { join } from 'node:path'
+import { resolveConfig, dataDir, stateDir } from './common/config.ts'
 import { resolveAgyBin, probeProcess, MIN_AGY_VERSION } from './host/runner.ts'
-import { Err } from './common/types.ts'
+import { AgyEngine } from './host/engine.ts'
+import { ModelCatalog } from './host/models.ts'
+import { SessionStore } from './host/sessions.ts'
+import { RunRegistry } from './host/recording.ts'
+import { redactLine } from './host/diagnostics.ts'
+import { buildLogger } from './server/logger.ts'
+import { buildServer } from './server/app.ts'
+import { GatewaySemaphore } from './server/semaphore.ts'
+import { installShutdown } from './server/shutdown.ts'
 
 export { resolveConfig, dataDir } from './common/config.ts'
-export { Err } from './common/types.ts'
 
 export interface StartupReport {
   ok: boolean
@@ -58,16 +70,64 @@ export function compareVersions(a: string, b: string): number {
   return 0
 }
 
-// CLI entry: `node dist/index.js` prints the startup report and exits 0.
-// The HTTP server wiring replaces this in M1.
+async function main(): Promise<void> {
+  const log = buildLogger()
+  const report = await startup()
+  if (!report.ok) {
+    log.error({ ...report }, report.dormantReason ?? 'startup failed')
+    process.exit(1)
+  }
+  log.info({ agyBin: report.agyBin, agyVersion: report.agyVersion, dataDir: report.dataDir }, 'agy probe ok')
+
+  const getConfig = () => resolveConfig()
+  if (getConfig().apiKey === '') {
+    log.warn('AGY_PROXY_API_KEY is not set — /v1/* endpoints are UNAUTHENTICATED; set a key before exposing this gateway')
+  }
+
+  const bin = await resolveAgyBin(getConfig().agyBin)
+  if (bin === null) {
+    // Unreachable after startup() unless the binary vanished in between.
+    log.error('agy binary vanished between probe and wiring')
+    process.exit(1)
+  }
+  const catalog = new ModelCatalog(
+    async (signal) => {
+      const probe = await probeProcess(bin, ['models'], 30_000, signal)
+      if (!probe.ok) throw new Error(probe.error ?? 'agy models failed')
+      return { stdout: 'version ' + (probe.version ?? '') + '\n', stderr: '' }
+    },
+    getConfig().fallbackModels,
+    getConfig().modelsCacheTtlMs,
+  )
+  const store = new SessionStore(join(stateDir(), 'sessions.json'))
+  const runs = new RunRegistry()
+  const sem = new GatewaySemaphore(
+    () => getConfig().maxConcurrent,
+    () => getConfig().maxQueueDepth,
+  )
+  const engine = new AgyEngine({
+    getConfig,
+    catalog,
+    store,
+    bin: () => resolveAgyBin(getConfig().agyBin),
+    acquire: () => sem.acquire(),
+    runs,
+    log: (m) => log.warn({ src: 'engine' }, redactLine(m)),
+    onRun: (i) => log.info({ ...i }, 'agy run finished'),
+  })
+
+  const built = buildServer({ getConfig, engine, log })
+  void catalog.refreshIfNeeded().catch(() => undefined)
+  await built.app.listen({ port: getConfig().port, host: getConfig().host })
+  log.info({ port: getConfig().port, host: getConfig().host }, 'agy-proxy listening')
+  installShutdown(built, { log })
+}
+
+// Entry detection: direct `node dist/index.js` / `tsx src/index.ts` runs the
+// server; imports (tests, programmatic use) stay inert.
 if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1].replace(/\\/g, '/')}`).href) {
-  startup()
-    .then((r) => {
-      console.log(JSON.stringify(r, null, 2))
-      process.exit(r.ok ? 0 : 1)
-    })
-    .catch((e: unknown) => {
-      console.error('startup failed:', e instanceof Error ? e.message : String(e))
-      process.exit(1)
-    })
+  main().catch((e: unknown) => {
+    console.error('startup failed:', e instanceof Error ? e.message : String(e))
+    process.exit(1)
+  })
 }

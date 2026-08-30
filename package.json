@@ -38,6 +38,9 @@
     "url": "git+https://github.com/amlyczz/agy-proxy.git"
   },
   "dependencies": {
+    "@sinclair/typebox": "^0.34.52",
+    "fastify": "^5.12.1",
+    "pino": "^10.3.1",
     "undici": "^7.29.0"
   }
 }

@@ -1,7 +1,8 @@
 // Config resolution for agy-proxy: env (AGY_PROXY_*) > runtime overrides file
 // > defaults. Ported from dsh-agy-link src/common/config.ts @ 46984db
 // (modified: env prefix DSH_AGY_* → AGY_PROXY_*; cordis entry-config layer
-// removed — the gateway has no host config; dataDir/base paths re-rooted).
+// removed — the gateway has no host config; dataDir/base paths re-rooted;
+// AGY_PROXY_API_KEY added, environment-only by design).
 // The overrides file backs admin-UI hot changes and survives restarts; env is
 // read per call so a changed process environment is honored without reload.
 import { defaultConfig, type GatewayConfig, type PermissionMode } from './types.ts'
@@ -162,5 +163,9 @@ export function resolveConfig(
   if (env.AGY_PROXY_ADMIN_ALLOW_CIDR) cfg.adminAllowCidr = env.AGY_PROXY_ADMIN_ALLOW_CIDR
   if (env.AGY_PROXY_ADMIN_PASSWORD) cfg.adminPassword = env.AGY_PROXY_ADMIN_PASSWORD
   if (env.AGY_PROXY_TRUSTED_PROXIES) cfg.trustedProxies = env.AGY_PROXY_TRUSTED_PROXIES
+  // Static API key: environment-only (never the overrides file) so a
+  // plaintext key cannot rest on disk. An explicitly-set empty string
+  // disables auth, distinct from leaving it unset.
+  if (env.AGY_PROXY_API_KEY !== undefined) cfg.apiKey = env.AGY_PROXY_API_KEY
   return cfg
 }

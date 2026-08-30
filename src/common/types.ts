@@ -70,6 +70,11 @@ export interface GatewayConfig {
   adminPassword: string
   /** Comma-separated list of proxy IPs trusted for X-Forwarded-For resolution. */
   trustedProxies: string
+  /** Static bearer key for /v1/* endpoints. Empty = auth disabled (a warning
+   *  is logged at boot). Read from the environment only — never from the
+   *  runtime-overrides file, so a plaintext key never rests on disk. The M3
+   *  sha256 key store replaces this behind the same middleware. */
+  apiKey: string
 }
 
 // Fallback line-up, mined from the agy 1.1.13 binary (inherited from
@@ -116,6 +121,7 @@ export function defaultConfig(): GatewayConfig {
     adminAllowCidr: '',
     adminPassword: '',
     trustedProxies: '',
+    apiKey: '',
   }
 }
 
