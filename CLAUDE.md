@@ -31,7 +31,7 @@ The engine layer is ported from `D:\prj_test\dsh-agy-link` (MIT). Discipline (de
 - Verbatim-ported files must not mix in functional changes — keep them diffable against upstream
 - `dsh-agy-link` env prefix `DSH_AGY_*` became `AGY_PROXY_*` here
 
-Already ported (M0): `src/host/runner.ts` (process spawn/watchdog/tree-kill), `src/common/config.ts` + `types.ts` (config layering: env > runtime-overrides.json > defaults), `test/fake-agy.mjs` (stub agy binary; modes `ok|auth|noise|exit12|exit-error|real|real-error|real-fail`, `FAKE_AGY_MODE` env, argv appended to `FAKE_AGY_ARGS_FILE`).
+Already ported: M0 brought `src/host/runner.ts`, `src/common/config.ts` + `types.ts`, `test/fake-agy.mjs`. M1 brought the full engine (parser/recording/mapper/pool/pool-auth/quota/oauth/net/sessions/media/models/discovery/diagnostics + `engine.ts` rewritten from adapter.ts — dsh-llm vocabulary replaced by the self-owned `EngineCall → AsyncIterable<StreamChunk>` surface in `src/host/stream-types.ts`). Server layer (new code, charter §3): `src/server/` — `app.ts` (buildServer factory, /healthz, POST /v1/chat/completions), `openai-adapter.ts` (pure request/response mapping), `errors.ts` (Err→HTTP table), `auth.ts` (static bearer), `semaphore.ts`, `logger.ts` (pino), `shutdown.ts`. `auth.ts` deliberately never reads the key from runtime-overrides.json.
 
 ## Key facts that shape the code
 
@@ -44,8 +44,8 @@ Already ported (M0): `src/host/runner.ts` (process spawn/watchdog/tree-kill), `s
 
 ## Testing
 
-- Golden-case system (from M1, acceptance.md §2): `test/golden/<protocol>/<case>/` with `request.json` + `events.ndjson` + `expected.json`; every golden case must cite its source (OpenAI SDK path / Anthropic docs URL) in a header comment.
-- fake-agy is the only upstream for tests — never hit real Google endpoints in CI.
+- Golden-case system (from M1, acceptance.md §2): `test/golden/<protocol>/<case>/` with `request.json` + `events.ndjson` + `expected.json`; every golden case must cite its source (OpenAI SDK path / Anthropic docs URL). Provenance convention: JSON cannot carry comments, so the citation lives in a sibling `PROVENANCE.md` plus an `_provenance` key in expected.json (stripped by the runner). Dynamic fields use sentinels: `id → __ID__`, `created → 0`.
+- fake-agy is the only upstream for tests — never hit real Google endpoints in CI. Its `FAKE_AGY_EVENTS_FILE` replay mode dumps a recorded ndjson file verbatim (golden runner).
 
 ## Release rules (inherited from AGENTS.md discipline of the upstream repo)
 
@@ -54,4 +54,4 @@ Already ported (M0): `src/host/runner.ts` (process spawn/watchdog/tree-kill), `s
 
 ## Roadmap status
 
-M0 done (skeleton). Next: M1 engine port (parser/recording/mapper/pool/quota/oauth — see charter §5 porting table), then Fastify + OpenAI non-streaming endpoint. Track in acceptance.md §3 DoD checklists.
+M0 done (skeleton). M1 done: engine layer ported (716fc3f), Fastify service layer + OpenAI non-streaming `/v1/chat/completions` + static `AGY_PROXY_API_KEY` auth + OA1 golden case (d3bf836, 06342e9); the M1 wrap-up committed the server WITHOUT account pool (pool paths verified inert — single logged-in system account). Next: M2 dual-protocol complete — SSE streaming (reply.hijack), tool_calls round trips, models routes (MA1-MA3), count_tokens, error matrix golden cases OA2-OA10/AN1-AN10. Track in acceptance.md §3 DoD checklists.
