@@ -1,7 +1,8 @@
 // Fake agy CLI for offline tests. Ported from dsh-agy-link
 // test/fake-agy.mjs @ 46984db (modified: the M0 header note about verbatim
 // modes no longer applies — the 'ok'/'noise'/'auth' exit semantics were
-// realigned to upstream in M1 when the engine test suite landed).
+// realigned to upstream in M1 when the engine test suite landed; a
+// FAKE_AGY_EVENTS_FILE replay mode was added for the golden-case runner).
 //
 // Modes via FAKE_AGY_MODE env:
 //   ok | auth | noise | exit12 | exit-error | real | real-error | real-fail
@@ -20,10 +21,15 @@
 //   auth          — stderr sign-in notice + auth URL
 //   hang          — emits nothing, keeps running until killed (watchdog /
 //                   process-tree kill verification)
+//
+// FAKE_AGY_EVENTS_FILE (any mode): when set, every line of that file is
+// written to stdout verbatim and the process exits 0 — the golden-case
+// runner replays recorded event sequences through this hook.
+//
 // Records its argv (JSON, one per line) to FAKE_AGY_ARGS_FILE when set;
 // records cwd to FAKE_AGY_CWD_FILE when set.
 
-import { appendFileSync } from 'node:fs'
+import { appendFileSync, readFileSync } from 'node:fs'
 
 const argv = process.argv.slice(2)
 const mode = process.env.FAKE_AGY_MODE ?? 'ok'
@@ -83,6 +89,15 @@ if (mode === 'exit-error') {
 }
 
 await sleep(Number(process.env.FAKE_AGY_DELAY_MS ?? 0))
+
+// Golden-case replay: dump the recorded event file verbatim.
+if (process.env.FAKE_AGY_EVENTS_FILE) {
+  try {
+    const lines = readFileSync(process.env.FAKE_AGY_EVENTS_FILE, 'utf8').split('\n').filter((l) => l.trim() !== '')
+    for (const line of lines) process.stdout.write(line + '\n')
+  } catch {}
+  process.exit(0)
+}
 
 if (mode === 'auth') {
   process.stderr.write('Please sign in. Visit https://accounts.google.com/o/oauth2/auth?access_type=offline&code=4/AbCdEf123 to authenticate, then paste the authorization code.\n')

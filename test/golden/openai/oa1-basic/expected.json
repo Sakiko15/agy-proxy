@@ -1,0 +1,25 @@
+{
+  "_provenance": "test/golden/openai/oa1-basic/PROVENANCE.md — acceptance.md §2 requires the source basis to be noted per case; JSON cannot carry comments, so it lives here and in the `_provenance` key (stripped before comparison). Sentinels: `__ID__` (id, regex-checked separately) and `created: 0`.",
+  "id": "__ID__",
+  "object": "chat.completion",
+  "created": 0,
+  "model": "gemini-3.7-flash",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "PONG"
+      },
+      "finish_reason": "stop",
+      "logprobs": null
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 12,
+    "completion_tokens": 5,
+    "total_tokens": 17,
+    "prompt_tokens_details": { "cached_tokens": 0 },
+    "completion_tokens_details": { "reasoning_tokens": 3 }
+  }
+}

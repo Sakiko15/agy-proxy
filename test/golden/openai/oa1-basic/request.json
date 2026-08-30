@@ -1,0 +1,6 @@
+{
+  "model": "gemini-3.7-flash",
+  "messages": [
+    { "role": "user", "content": "Reply with exactly one word: PONG" }
+  ]
+}
