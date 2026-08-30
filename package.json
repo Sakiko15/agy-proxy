@@ -1,0 +1,40 @@
+{
+  "name": "agy-proxy",
+  "version": "0.1.0",
+  "description": "Self-hosted LLM gateway: Google Antigravity (official agy CLI) upstream, OpenAI Chat Completions + Anthropic Messages compatible endpoints, per-key quotas, management WebUI.",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "keywords": [
+    "antigravity",
+    "agy",
+    "llm-gateway",
+    "openai-compatible",
+    "anthropic-compatible",
+    "proxy"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsdown",
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "dev": "tsx src/index.ts",
+    "web:dev": "npm --prefix web run dev",
+    "web:build": "npm --prefix web run build"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "tsdown": "^0.22.14",
+    "tsx": "^4.23.13",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/amlyczz/agy-proxy.git"
+  }
+}
