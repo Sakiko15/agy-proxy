@@ -16,6 +16,7 @@
 // settlement classification order, binding persistence/drop rules, steer
 // preemption, duplicate submission debounce, and continuation spans.
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Err, looksLikeAuthFailure, looksLikeHardRateLimit, looksLikeRateLimit, type GatewayConfig } from '../common/types.ts'
@@ -66,6 +67,12 @@ export interface EngineMessage {
   images?: EngineMessageImage[]
   /** For role='tool': callId of the mirrored agy tool call this answers. */
   toolCallId?: string
+  /**
+   * Provider that produced an assistant turn. Multi-model gateway sessions
+   * mark foreign replies so the digest keeps their turns; unmarked assistant
+   * messages are treated as foreign (agy's native history lacks them).
+   */
+  provider?: string
 }
 
 export interface EngineCall {
@@ -87,6 +94,13 @@ export interface EngineDeps {
   store: SessionStore
   pool?: AccountPoolManager
   bin: () => string | null
+  /**
+   * Fixed argv prefix inserted before the call's own arguments (after them
+   * nothing is appended by the engine). Test harnesses point `bin` at the
+   * node executable and pass the fake CLI script here; production leaves it
+   * empty (the real agy binary takes the args directly).
+   */
+  binArgs?: readonly string[]
   /** Shared semaphore for cross-session concurrency. */
   acquire: () => Promise<() => void>
   log?: (msg: string) => void
@@ -138,6 +152,14 @@ function brief(s: string): string {
   return flat.length > 300 ? flat.slice(0, 300) + '...' : flat
 }
 
+/** Gateway provider id; assistant turns marked with it rode OUR agy history. */
+const PROVIDER_ID = 'antigravity'
+
+function isForeignAssistant(m: EngineMessage): boolean {
+  if (m.role !== 'assistant') return false
+  return m.provider !== PROVIDER_ID
+}
+
 function sawAuthFailure(parser: StreamJsonParser, outcome: { stderrTail: string; stdout: string }): boolean {
   if (parser.stats.sawAuthFailure) return true
   return looksLikeAuthFailure(outcome.stderrTail) || looksLikeAuthFailure(outcome.stdout.slice(0, 4000))
@@ -161,13 +183,10 @@ export function buildDigest(messages: readonly EngineMessage[], fromIdx: number,
   }
   if (parts.length === 0) return ''
   return '[conversation so far]\n' + parts.join('\n\n') + '\n[end of conversation so far]\n\n'
-}
-
-/** Width/height are unknown at the protocol boundary; agy only uses the path. */
+}/** Width/height are unknown at the protocol boundary; agy only uses the path. */
 const UNKNOWN_DIM = 0
 
 export class AgyEngine {
-  private readonly warnedKeys = new Set<string>()
   /** sessionKey -> in-flight run, for steer-time preemption. */
   private readonly activeRuns = new Map<string, RunRecording>()
   /** sessionKey -> prompt info for duplicate submission debounce */
@@ -179,12 +198,6 @@ export class AgyEngine {
   private readonly requestTimestamps: number[] = []
 
   constructor(private readonly deps: EngineDeps) {}
-
-  private warnOnce(key: string, msg: string): void {
-    if (this.warnedKeys.has(key)) return
-    this.warnedKeys.add(key)
-    this.deps.log?.('WARNING: ' + msg)
-  }
 
   /** Build the agy argv for one call. Exported for tests. */
   buildArgs(opts: {
@@ -226,7 +239,7 @@ export class AgyEngine {
     let workspaceRoot = cfg.workspaceRoot
     if (workspaceRoot === '') {
       workspaceRoot = join(dataDir(), 'workspace')
-      mkdirWarnOnce(this.deps, workspaceRoot)
+      ensureWorkspaceDir(this.deps.log, workspaceRoot)
     }
 
     // ---- native tool mirroring: continuation spans (v1) ----
@@ -375,7 +388,7 @@ export class AgyEngine {
       const end = Math.max(from, lastAssistantIdx + 1)
       const span = messages
         .slice(from, end)
-        .filter((m) => m.role !== 'assistant')
+        .filter((m) => m.role !== 'assistant' || isForeignAssistant(m))
       if (span.some((m) => m.role === 'assistant')) {
         prompt = buildDigest(span, 0, digestMaxChars) + prompt
       }
@@ -516,7 +529,7 @@ export class AgyEngine {
     try {
       proc = startAgyProcess({
       bin,
-      args,
+      args: [...(this.deps.binArgs ?? []), ...args],
       cwd: workspaceRoot,
       timeoutMs: cfg.timeoutMs,
       signal: call.signal,
@@ -690,17 +703,15 @@ export class AgyEngine {
 
 /**
  * Roll a workspace directory into existence lazily; a failure to create it
- * (read-only volume) is reported once per directory instead of failing the
- * spawn — startAgyProcess will surface the real spawn error anyway.
+ * (read-only volume) is logged instead of failing the spawn —
+ * startAgyProcess will surface the real spawn error anyway.
  */
-function mkdirWarnOnce(deps: EngineDeps, dir: string): void {
-  void import('node:fs').then(({ mkdirSync }) => {
-    try {
-      mkdirSync(dir, { recursive: true })
-    } catch (err) {
-      deps.log?.('WARNING: workspace dir could not be created (' + dir + '): ' + brief(String(err)))
-    }
-  })
+function ensureWorkspaceDir(log: ((msg: string) => void) | undefined, dir: string): void {
+  try {
+    mkdirSync(dir, { recursive: true })
+  } catch (err) {
+    log?.('WARNING: workspace dir could not be created (' + dir + '): ' + brief(String(err)))
+  }
 }
 
 /**

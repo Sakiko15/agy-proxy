@@ -129,18 +129,19 @@ describe('runner line streaming + argv recording (fake-agy)', () => {
     const { startAgyProcess } = await import('../src/host/runner.ts')
     const p = startAgyProcess({
       bin: NODE,
-      args: [FAKE],
+      args: [FAKE, '-p', 'hi'],
       env: { ...process.env, FAKE_AGY_MODE: 'ok', FAKE_AGY_ARGS_FILE: argsFile } as NodeJS.ProcessEnv,
       onLine: (l) => lines.push(l),
     })
     const out = await p.outcome
     expect(out.code).toBe(0)
-    expect(lines.length).toBe(4)
+    // ok mode: init + 2 thinking + 2 tool + 2 text + result envelopes
+    expect(lines.length).toBe(8)
     expect(lines[0]).toContain('"event":"init"')
-    // fake-agy appends one JSON argv array per line; the last run passed no
-    // arguments (the default `ok` mode run).
+    // fake-agy appends one JSON argv array per line; the last run passed the
+    // -p prompt shown above.
     const recorded = readFileSync(argsFile, 'utf8').trim().split('\n')
-    expect(JSON.parse(recorded.at(-1) ?? '[]')).toEqual([])
+    expect(JSON.parse(recorded.at(-1) ?? '[]')).toEqual(['-p', 'hi'])
     rmSync(dir, { recursive: true, force: true })
   }, 30_000)
 
