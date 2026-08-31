@@ -23,6 +23,7 @@ import {
   openAiError,
   anthropicError,
   isAnthropicPath,
+  type OpenAiErrorBody,
 } from './errors.ts'
 import {
   assembleCompletion,
@@ -216,7 +217,8 @@ async function streamOpenAiChat(args: {
       if (ch.type === 'finish') finishKind = ch.reason.kind === 'max-tokens' ? 'max-tokens' : ch.reason.kind
       if (ch.type === 'finish' && (ch.reason.kind === 'error' || ch.reason.kind === 'aborted')) {
         const failure = engineFailureToHttp(ch.reason.failure.message, ch.reason.failure.code)
-        await sse.data(openAiError(failure.body.error.message, failure.body.error.type, failure.body.error.code))
+        const body = failure.body as OpenAiErrorBody
+        await sse.data(openAiError(body.error.message, body.error.type, body.error.code))
         await sse.data('[DONE]')
         finishKind = ch.reason.kind
         return
@@ -245,7 +247,8 @@ async function streamOpenAiChat(args: {
     if (err instanceof GatewayHttpError) {
       message = err.body.error.message
       type = err.body.error.type
-      code = err.body.error.code
+      const maybeCode = (err.body as OpenAiErrorBody).error as { code?: string }
+      code = maybeCode.code ?? 'api_error'
     } else if (err instanceof Error && err.name === 'EngineError') {
       const ec = (err as { code?: string }).code ?? 'AGY_ERROR'
       const mapped = engineFailureToHttp(redactLine(err.message), ec)

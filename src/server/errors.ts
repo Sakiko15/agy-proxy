@@ -18,9 +18,9 @@ export function openAiError(message: string, type: string, code: string): OpenAi
 
 export class GatewayHttpError extends Error {
   readonly statusCode: number
-  readonly body: OpenAiErrorBody
+  readonly body: OpenAiErrorBody | AnthropicErrorBody
 
-  constructor(statusCode: number, body: OpenAiErrorBody) {
+  constructor(statusCode: number, body: OpenAiErrorBody | AnthropicErrorBody) {
     super(body.error.message)
     this.name = 'GatewayHttpError'
     this.statusCode = statusCode
