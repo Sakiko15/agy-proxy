@@ -2,6 +2,35 @@
 
 All notable changes to agy-proxy are documented here. Format based on Keep a Changelog; versions follow semver.
 
+## [Unreleased] (M3 池与记账)
+
+### Added
+- **SQLite storage** (src/server/db.ts, commit a05a56d): `openDb()` — WAL + `synchronous=FULL` + `busy_timeout=5000` + `foreign_keys=ON`, `user_version`-gated idempotent schema v1 (`api_keys`, `usage` with `request_id UNIQUE`, `admin_sessions`, `admin_settings`), `checkpointAndClose()` (`wal_checkpoint(TRUNCATE)` + close). Charter §6 崩溃恢复 row: WAL+FULL survives SIGKILL with at most the last 1s ledger buffer lost (≤ ±1 request, MA5 tolerance).
+- **Key management** (src/server/key-store.ts, commit 9d9b56d): `KeyStore` — plaintext format `sk-agy-` + 24B base64url, returned **exactly once** at creation; the DB stores a sha256 hex hash (UNIQUE) plus an 8-char prefix for display (LiteLLM pattern; high-entropy keys need no slow hash). `verify()` verdicts ok/unknown/disabled; day-token budgets and RPM limits per key; `touch()` best-effort last-used refresh.
+- **Usage ledger** (src/server/usage-ledger.ts, commit 85781fa): `UsageLedger` — record() is an O(1) in-memory push (never blocks the stream); 1s unref'd flush timer, 500-row opportunistic flush, transaction-batched `INSERT OR IGNORE` for **request-id idempotent replay**; `tokensUsedToday(keyId)` sums since local midnight (day-budget enforcement); `summarizeToday()`/`query()` (limit ≤ 500); `close()` = flush → checkpoint → close, post-close record() is a one-warn no-op.
+- **Auth hook v2** (src/server/auth.ts, commit 5574d4a): verdict order = auth-disabled posture FIRST (no env key AND no managed keys → open) → missing header 401 (bodies byte-identical to M2) → root env key (unlimited, keyId=null) → managed keys: unknown → 401, disabled → 403 `key_disabled`, RPM over limit → 429 + `retry-after` (rate-limiter-flexible Memory, keyed `keyId:rpm`), day-token budget over → 429 with used/limit/reset message. Budget and RPM checks run **pre-engine**: a rejected request never spawns agy and never books a ledger row. `request.agyKey={id,name}` annotates the request for call meta.
+- **Admin API (JSON)** (src/server/admin-api.ts + admin-session.ts, commit bf86bd9): guard chain per request — CIDR allowlist (`adminAllowCidr` re-read per request, `::ffff:`/::1 normalized) → session cookie (opaque 32B token, sha256 in `admin_sessions`, HttpOnly SameSite=Lax, TTL 7d) → CSRF (mutating methods require a non-empty `x-requested-with` header). Routes: login (300ms damping on failure)/logout/me, status, pool CRUD + cooldown-clear + quota-refresh + mode + reorder, paste-URL auth flow (begin/status/complete/cancel) + **QR PNG rendering** (qrcode; 404 unless `phase === 'waiting'`, `Cache-Control: no-store`), key lifecycle, usage query/summary. `ensureAdminPassword`: env password wins and re-hashes (argon2id, @node-rs/argon2 — **used ONLY for the admin password**) at boot; otherwise stored hash; otherwise a random password is generated and logged exactly once (`@node-rs/argon2` native dep purpose).
+- **Engine hardening** (src/host/engine.ts, commit eb40fde):
+  - `Err.POOL_EXHAUSTED`: an all-cooling/quarantined pool → 429 `rate_limit_error` with `Retry-After` from `earliestResetMs(family)` (min of live cooldowns and future 5h/weekly quota reset times, message carries the reset countdown). Replaces the old AGY_ERROR→502 for this case.
+  - `Err.VALIDATION_REQUIRED`: narrow regex on stderr/result-error only (`/VALIDATION_REQUIRED/i`); `extractValidationUrl` appends `(validation_url: …)` to the passthrough message → 403 `permission_error`; the account is quarantined via `markAuthRequired`.
+  - **Hard-rate-limit in-flight semantics (user decision, charter §6 amended)**: an in-flight hard 429 fails THAT request (real upstream error passed through, 502 family) and cools the account down; the NEXT request auto-switches accounts. No in-flight transparent replay in v1 (agy has no partial continuation; M5 revisits).
+  - **Per-account serial queue** (p-queue concurrency:1): pool-selected spawns serialize per account — fixes the same-account concurrent-conversation-binding race that pool wiring would otherwise expose. Continuations (tool-result resumes) bypass the queue.
+  - **Enriched `onRun` + `EngineCall.meta`**: `{…, usage, accountId, family, conversationId, meta}` where meta = `{reqId (x-request-id ?? fastify req.id), keyId, protocol}`. One hook fire per actual agy spawn (settlement; continuations bypass; pre-flight rejects never fire) → `ledger.record()`.
+- **M3 wiring** (src/index.ts, commit 019ff23): openDb → keys/ledger/sessions → `ensureAdminPassword` → pool/quota/poolAuth with redacted logs → boot sweeps (`sweepStaleStaging`, `sweepOldLogs`) → engine gets the pool + ledger-writing onRun → server mounts `/admin` → 5s boot quota refresh + `setInterval(max(60s, quotaPollIntervalMs))` poller → shutdown teardown (clear timers → `poolAuth.cancel()` → `ledger.close()` flush+checkpoint).
+- **Config**: `AGY_PROXY_DB_PATH` (`dbPath`, default `<dataDir>/agy-proxy.db`), `AGY_PROXY_ADMIN_SESSION_TTL_MS` (7d, clamped ≥ 60s); README config table completed (ADMIN_ALLOW_CIDR / ADMIN_PASSWORD / TRUSTED_PROXIES / QUOTA_POLL_INTERVAL_MS / LOG_RETENTION_DAYS had been parsed since M0 but undocumented).
+- **fake-agy**: `rate-limit` mode (stderr `429 RESOURCE_EXHAUSTED … Resets in 21m25s` + ERROR envelope, exit 1), `validation` mode (403 VALIDATION_REQUIRED + Google challenge URL), `FAKE_AGY_FAIL_HOME` (fails only the account whose isolated HOME matches — enables switch drills).
+- **Tests**: 292 total (was 249, +43): db/key-store/usage-ledger unit suites, auth-keys MA4/MA5 dual-protocol matrix (root key unchanged, disabled 403, RPM 429, day-budget 429, cross-key isolation), admin-api 12-case suite (guards/CSRF/CIDR/keys/auth-flow/QR), pool-gateway drills (DoD ③ 429-switch + exhaustion 429, DoD ④ 403 validation_url + quarantine).
+
+### Changed
+- `GatewayHttpError` carries optional `headers`; the app error handler forwards them (Retry-After now actually reaches clients).
+- `tsdown.config.ts`: `better-sqlite3` / `@node-rs/argon2` externalized (native modules never inlined).
+- `installShutdown` accepts `teardown?` — runs after `app.close()`, before exit; errors still exit 1.
+
+### Deliberate semantics (M3)
+- The root env key has no day budget and no RPM limit by design (bootstrap key).
+- A crash loses at most the last ~1s of ledger buffer (bounded by MA5 tolerance); WAL+FULL recovers everything else.
+- Key plaintext exists only in the POST /admin/keys response body; the string `sk-agy-` never appears in logs (G4-checked) or in the DB.
+
 ## [Unreleased] (M2 双协议完整)
 
 ### Added

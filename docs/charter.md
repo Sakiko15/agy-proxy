@@ -143,7 +143,8 @@ agy-proxy 是自托管的 LLM 网关：把 Google Antigravity 官方 `agy` CLI �
 - **SSE 心跳**：反代/Cloudflare 存活（OpenAI 端发注释行 `: ping`，Anthropic 端发 `ping` 事件）
 - **优雅停机**：SIGTERM → 停止接新 → 等待在跑 agy（带上限，docker `stop_grace_period: 30s`）→ kill 残留进程组 → SQLite checkpoint → 关闭 DB
 - **崩溃恢复**：SQLite `journal_mode=WAL; synchronous=FULL; busy_timeout`；usage 记账以请求 id 幂等去重；pool.json/sessions.json 损坏时自动备份重建
-- **并发防护**：每账号串行队列（p-queue `concurrency:1`）+ 全局队列深度上限（超出即 429 BUSY）+ 中途失败重放到其他账号（重放整个请求——agy 无部分续传）；客户端断连（AbortSignal）级联取消 agy 进程
+- **并发防护**：每账号串行队列（p-queue `concurrency:1`，已实现——同时消除同账号并发互踩会话绑定的竞态）+ 全局队列深度上限（超出即 429 BUSY）+ 客户端断连（AbortSignal）级联取消 agy 进程
+- **硬限流语义（M3 修订，用户定案）**：in-flight 请求遇上游硬限流 = 该请求失败（上游真实错误透传），账号进冷却；**自下一个请求起自动切换**到池内其他账号——请求粒度的透明切换，而非中途透明重放（agy 无部分续传，跨进程重放需重新计费且会破坏会话绑定；M5 复议）。全池冷却/隔离时返回 429 `POOL_EXHAUSTED` + `Retry-After`（取最早重置时刻倒计时）
 - **版本锁定**：Docker 构建期固定 agy 版本 + `AGY_CLI_DISABLE_AUTO_UPDATE=true`；启动探测 `agy --version`（最低版本可配置）
 - **PID 1**：容器内 tini（或 `docker run --init`）——转发 SIGTERM + 回收 zombie（每请求 spawn 短命子进程，zombie 回收不可省）
 
@@ -164,7 +165,7 @@ agy-proxy 是自托管的 LLM 网关：把 Google Antigravity 官方 `agy` CLI �
 | 请求校验 | **TypeBox** | ^0.34 | Fastify 原生 JSON Schema 编译（校验+序列化双用）；zod-type-provider 备选 |
 | WebUI | **React 19 + Vite 8 + TanStack Router/Query + shadcn/ui + Tailwind v4** | 19.2 / 8.2 / — / — / 4.3 | new-api（46.8k★）同款栈，LLM 网关面板已验证；antd 6.6 作备选（致密中文表格开箱即用，代价 CSS-in-JS 运行时） |
 | 持久化 | **better-sqlite3 + WAL** | ^13 | node:sqlite 在 Node 24 LTS 仍实验性（RC），密钥/账本库不冒险；命名卷，禁网络 FS 挂载 |
-| 进程编排 | **p-queue 每账号一队列** | ^9 | concurrency:1 + intervalCap（RPM）+ AbortSignal 贯通；p-limit 作最小备选 |
+| 进程编排 | **p-queue 每账号一队列** | ^9 | M3 实际落地为 concurrency:1 + AbortSignal 贯通；RPM 限流改由 auth hook 的 rate-limiter-flexible 承担（未用 intervalCap）；p-limit 作最小备选 |
 | key 限流 | **rate-limiter-flexible (Memory)** | ^11 | 固定窗口够用；Retry-After/X-RateLimit 头现成；Redis 升级路径预留 |
 | API key 存储 | **sha256 哈希 + 前缀明文**（LiteLLM 模式） | — | 高熵 key 无需慢哈希；argon2 仅用于管理员登录密码 |
 | Admin 会话 | **DB opaque session（自研 ~50 行）** | — | Lucia 已弃用（2025-03）；httpOnly+SameSite=Lax cookie；jose JWT 备选 |
