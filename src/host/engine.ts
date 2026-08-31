@@ -19,11 +19,12 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Err, looksLikeAuthFailure, looksLikeHardRateLimit, looksLikeRateLimit, type GatewayConfig } from '../common/types.ts'
-import { modelFamilyOf } from '../common/pool-types.ts'
+import PQueue from 'p-queue'
+import { Err, extractValidationUrl, looksLikeAuthFailure, looksLikeHardRateLimit, looksLikeRateLimit, looksLikeValidationRequired, type GatewayConfig } from '../common/types.ts'
+import { modelFamilyOf, type ModelFamily } from '../common/pool-types.ts'
 import type { AccountPoolManager } from './pool.ts'
 import { diffConversations, snapshotConversations } from './discovery.ts'
-import { EventMapper } from './mapper.ts'
+import { EventMapper, usageFromRaw } from './mapper.ts'
 import { parseMirrorCallId, type RunRecording, type RunRegistry } from './recording.ts'
 import { defaultEffortFor, findEntry, ModelCatalog, resolveModelSlug } from './models.ts'
 import { StreamJsonParser } from './parser.ts'
@@ -36,10 +37,13 @@ import type { StreamChunk, TokenUsage } from './stream-types.ts'
 /** Engine failure with a stable routing code (maps 1:1 onto the Err table). */
 export class EngineError extends Error {
   readonly code: string
-  constructor(message: string, code: string) {
+  /** Seconds the client should wait before retrying (POOL_EXHAUSTED → Retry-After). */
+  readonly retryAfterSec?: number
+  constructor(message: string, code: string, retryAfterSec?: number) {
     super(message)
     this.name = 'EngineError'
     this.code = code
+    this.retryAfterSec = retryAfterSec
   }
 }
 
@@ -88,6 +92,12 @@ export interface EngineCall {
   jsonSchema?: unknown
   /** Per-call image byte reader; wins over deps.readImage (request-scoped). */
   readImage?: (ref: ImageRefLike) => Promise<Uint8Array | null>
+  /**
+   * Server-provided observability passthrough (request id, key id, protocol),
+   * echoed verbatim in the settle-time onRun callback so a single enriched
+   * hook can write the usage ledger for every spawn without per-route wiring.
+   */
+  meta?: Readonly<Record<string, unknown>>
 }
 
 export interface EngineDeps {
@@ -108,8 +118,23 @@ export interface EngineDeps {
   log?: (msg: string) => void
   /** Recordings shared with the agy_tool mirror (continuation spans). */
   runs: RunRegistry
-  /** Last-run telemetry surfaced by the admin status panel. */
-  onRun?: (info: { ok: boolean; code: string; durationMs: number; model: string }) => void
+  /** Last-run telemetry + usage-ledger input, fired once per actual agy
+   *  spawn (settle time — never for continuation spans, so tool round trips
+   *  do not double count). Pre-flight throws (POOL_EXHAUSTED/BUSY/…) do not
+   *  fire it: no upstream consumption, no ledger row. */
+  onRun?: (info: {
+    ok: boolean
+    code: string
+    durationMs: number
+    model: string
+    /** Model slug actually driven (after fallback-model resolution). */
+    providerModel: string
+    usage: TokenUsage | null
+    accountId?: string
+    family?: string
+    conversationId?: string
+    meta?: Readonly<Record<string, unknown>>
+  }) => void
   /** Reads image bytes from protocol-layer attachment storage. */
   readImage?: (ref: ImageRefLike) => Promise<Uint8Array | null>
   /**
@@ -202,8 +227,42 @@ export class AgyEngine {
   private readonly minSpawnIntervalMs = 500
   /** Global sliding window timestamps for batch rate-limiting protection */
   private readonly requestTimestamps: number[] = []
+  /** accountId -> serial queue (concurrency:1, charter §6) around the agy
+   *  spawn→outcome segment: two concurrent requests on the same sticky account
+   *  must not interleave on one conversation binding. Continuations bypass the
+   *  queue (no spawn). Inactive without a pool. */
+  private readonly accountQueues = new Map<string, PQueue>()
 
   constructor(private readonly deps: EngineDeps) {}
+
+  /**
+   * Earliest reset signal for a family across the pool: min over live cooldown
+   * clocks and future quota reset times (5h + weekly). Feeds the
+   * POOL_EXHAUSTED message and its Retry-After; null = every clock unknown.
+   */
+  private earliestResetMs(family: ModelFamily): number | null {
+    const pool = this.deps.pool
+    if (!pool) return null
+    let earliest: number | null = null
+    const consider = (isoMs: number | null): void => {
+      if (isoMs !== null && (earliest === null || isoMs < earliest)) earliest = isoMs
+    }
+    const countdown = pool.getEarliestResetCountdown(family)
+    if (countdown !== null) consider(Date.now() + countdown)
+    for (const acc of pool.getAccounts()) {
+      if (!acc.enabled) continue
+      const fq = acc.quotas?.[family]
+      if (fq?.resetTime) {
+        const t = Date.parse(fq.resetTime)
+        if (Number.isFinite(t) && t > Date.now()) consider(t)
+      }
+      if (fq?.weeklyResetTime) {
+        const t = Date.parse(fq.weeklyResetTime)
+        if (Number.isFinite(t) && t > Date.now()) consider(t)
+      }
+    }
+    return earliest !== null ? Math.max(0, earliest - Date.now()) : null
+  }
 
   /** Build the agy argv for one call. Exported for tests. */
   buildArgs(opts: {
@@ -280,7 +339,12 @@ export class AgyEngine {
     // abort it first.
     if (sessionKey !== '') {
       const prev = this.activeRuns.get(sessionKey)
-      if (prev !== undefined && !prev.isSettled) prev.requestAbort?.()
+      if (prev !== undefined && !prev.isSettled) {
+        if (prev.requestAbort != null) prev.requestAbort()
+        // A queued (not yet spawned) run has no process to abort — settle it
+        // so the per-account queue task skips the spawn entirely.
+        else prev.settle({ kind: 'aborted', code: 'ABORTED', message: 'agy run aborted by caller' })
+      }
     }
     const catalog = this.deps.catalog.get()
     const rawModel = call.model
@@ -351,9 +415,16 @@ export class AgyEngine {
         }
       }
       if (!account) {
-        const countdown = this.deps.pool.getEarliestResetCountdown(family)
-        const waitStr = countdown ? ` (earliest reset in ${Math.ceil(countdown / 1000)}s)` : ''
-        throw new EngineError(`All Antigravity accounts in pool are in cooldown for ${family}${waitStr}. Add an account or wait for reset.`, Err.AGY_ERROR)
+        // MA4 / M3 DoD: an exhausted pool is a rate-limit condition (429 +
+        // Retry-After), not an upstream failure (502). The countdown covers
+        // both cooldown clocks and future quota reset times.
+        const countdownMs = this.earliestResetMs(family)
+        const waitStr = countdownMs !== null ? ` (earliest reset in ${Math.ceil(countdownMs / 1000)}s)` : ''
+        throw new EngineError(
+          `All Antigravity accounts in pool are in cooldown for ${family}${waitStr}. Add an account or wait for reset.`,
+          Err.POOL_EXHAUSTED,
+          countdownMs !== null ? Math.max(1, Math.ceil(countdownMs / 1000)) : undefined,
+        )
       }
     }
 
@@ -524,46 +595,61 @@ export class AgyEngine {
         : {}),
     }
 
-    // Per-account burst spacing throttle with randomized jitter (prevents high-frequency flood to Google endpoints)
-    if (account) {
-      const lastSpawn = this.lastAccountSpawnTime.get(account.id) ?? 0
-      const elapsed = Date.now() - lastSpawn
-      const jitter = Math.floor(Math.random() * 300) // 100~400ms organic jitter
-      const targetInterval = this.minSpawnIntervalMs + jitter
-      if (elapsed < targetInterval) {
-        await new Promise((r) => setTimeout(r, targetInterval - elapsed))
-      }
-      this.lastAccountSpawnTime.set(account.id, Date.now())
-    }
+    // ---- per-account serial queue (charter §6, p-queue concurrency:1) ----
+    // One agy process per account at a time: two concurrent requests on the
+    // same sticky account would race the per-HOME conversation discovery
+    // (two fresh .db files → ambiguous diff) and interleave on one session
+    // binding. The queue task spans the whole spawn→outcome window, so the
+    // next same-account spawn waits for the previous process to exit.
+    // Pool-off behavior is unchanged (the task runs immediately).
+    let proc: ReturnType<typeof startAgyProcess> | undefined
+    let spawnError: unknown = null
+    let gateResolve!: () => void
+    const spawnGate = new Promise<void>((r) => { gateResolve = r })
 
-    let proc: ReturnType<typeof startAgyProcess>
-    try {
-      proc = startAgyProcess({
-      bin,
-      args: [...(this.deps.binArgs ?? []), ...args],
-      cwd: workspaceRoot,
-      timeoutMs: cfg.timeoutMs,
-      signal: call.signal,
-      env,
-      onLine: (line) => {
-        for (const ev of parser.feed(line + '\n')) {
-          if (ev.kind === 'init' && ev.conversationId) streamCid = ev.conversationId
-          if (ev.kind === 'result' && ev.conversationId !== '') streamCid = ev.conversationId
-          rec.append(ev)
+    const runTask = async (): Promise<void> => {
+      // Superseded while queued (steer settled the recording) — don't spawn.
+      if (rec.isSettled) { releaseOnce(); return }
+      // Per-account burst spacing throttle with randomized jitter (prevents high-frequency flood to Google endpoints)
+      if (account) {
+        const lastSpawn = this.lastAccountSpawnTime.get(account.id) ?? 0
+        const elapsed = Date.now() - lastSpawn
+        const jitter = Math.floor(Math.random() * 300) // 100~400ms organic jitter
+        const targetInterval = this.minSpawnIntervalMs + jitter
+        if (elapsed < targetInterval) {
+          await new Promise((r) => setTimeout(r, targetInterval - elapsed))
         }
-      },
-      })
-      if (sessionKey !== '') {
-        rec.requestAbort = () => proc.kill('abort')
-        this.activeRuns.set(sessionKey, rec)
+        this.lastAccountSpawnTime.set(account.id, Date.now())
       }
-    } catch (e) {
-      releaseOnce()
-      throw new EngineError('failed to spawn agy: ' + brief(String(e)), Err.PROCESS_EXIT)
-    }
 
-    void (async () => {
-      const outcome = await proc.outcome
+      try {
+        proc = startAgyProcess({
+        bin,
+        args: [...(this.deps.binArgs ?? []), ...args],
+        cwd: workspaceRoot,
+        timeoutMs: cfg.timeoutMs,
+        signal: call.signal,
+        env,
+        onLine: (line) => {
+          for (const ev of parser.feed(line + '\n')) {
+            if (ev.kind === 'init' && ev.conversationId) streamCid = ev.conversationId
+            if (ev.kind === 'result' && ev.conversationId !== '') streamCid = ev.conversationId
+            rec.append(ev)
+          }
+        },
+        })
+        if (sessionKey !== '') {
+          rec.requestAbort = () => proc!.kill('abort')
+          this.activeRuns.set(sessionKey, rec)
+        }
+      } catch (e) {
+        spawnError = e
+        releaseOnce()
+        gateResolve()
+        return
+      }
+      gateResolve()
+      const outcome = await proc!.outcome
       releaseOnce()
       if (this.activeRuns.get(sessionKey) === rec) this.activeRuns.delete(sessionKey)
       if (sessionKey !== '') this.activeSessionPrompts.delete(sessionKey)
@@ -597,6 +683,12 @@ export class AgyEngine {
         failure = { kind: 'error', code: Err.TIMEOUT, message: 'agy run was idle for ' + cfg.timeoutMs + 'ms without output' }
       } else if (sawAuthFailure(parser, outcome)) {
         failure = { kind: 'error', code: Err.AUTH, message: 'agy is not signed in — add a Google account to the pool (admin UI) to login' }
+      } else if (looksLikeValidationRequired(rawErrText)) {
+        // Google 403 re-validation: surface the challenge URL verbatim
+        // (M3 DoD) and quarantine the account like an expired login.
+        const detail = parser.stats.lastResultError ?? (outcome.stderrTail !== '' ? brief(outcome.stderrTail) : 'upstream requires re-validation (VALIDATION_REQUIRED)')
+        const url = extractValidationUrl(detail)
+        failure = { kind: 'error', code: Err.VALIDATION_REQUIRED, message: url !== undefined ? detail + ' (validation_url: ' + url + ')' : detail }
       } else if (isRateLimit) {
         const bestMsg = parser.stats.lastResultError || (outcome.stderrTail ? brief(outcome.stderrTail) : 'Rate limit or quota reached')
         failure = { kind: 'error', code: Err.AGY_ERROR, message: 'Google Antigravity quota / rate limit reached: ' + bestMsg }
@@ -638,7 +730,7 @@ export class AgyEngine {
         if (account && looksLikeHardRateLimit(rawErrText)) {
           this.deps.pool?.recordFailure(account.id, family, failure.message)
         }
-        if (account && (failure.code === Err.AUTH || /invalid_grant|not signed in|auth/i.test(failure.message))) {
+        if (account && (failure.code === Err.AUTH || failure.code === Err.VALIDATION_REQUIRED || /invalid_grant|not signed in|auth/i.test(failure.message))) {
           this.deps.pool?.markAuthRequired(account.id, failure.message)
         }
         if (sessionAccountKey !== '') {
@@ -652,16 +744,40 @@ export class AgyEngine {
           }
         }
       }
+      const rawUsage = rec.getResultRawUsage()
       this.deps.onRun?.({
         ok: failure === null,
         code: failure !== null ? failure.code : 'OK',
         durationMs: outcome.durationMs,
         model,
+        providerModel: activeModel === '' ? cfg.defaultModel : activeModel,
+        usage: rawUsage !== null ? usageFromRaw(rec.finalUsage(rawUsage)) : null,
+        ...(account != null ? { accountId: account.id } : {}),
+        ...(family !== undefined ? { family } : {}),
+        ...(conversationId != null && conversationId !== '' ? { conversationId } : {}),
+        ...(call.meta !== undefined ? { meta: call.meta } : {}),
       })
-    })().catch((err) => {
+    }
+
+    const runFailed = (err: unknown): void => {
       releaseOnce()
       rec.settle({ kind: 'error', code: Err.PROCESS_EXIT, message: 'internal error: ' + brief(String(err)) })
-    })
+    }
+    if (account != null) {
+      let q = this.accountQueues.get(account.id)
+      if (q === undefined) {
+        q = new PQueue({ concurrency: 1 })
+        this.accountQueues.set(account.id, q)
+      }
+      void q.add(runTask).catch(runFailed)
+    } else {
+      void runTask().catch(runFailed)
+    }
+    // A queued spawn failure surfaces synchronously (pre-queue parity).
+    await spawnGate
+    if (spawnError !== null) {
+      throw new EngineError('failed to spawn agy: ' + brief(String(spawnError)), Err.PROCESS_EXIT)
+    }
 
     // First span of the run: stream recorded events until the first
     // completed tool step cuts it (or the result finishes it).

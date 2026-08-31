@@ -115,6 +115,19 @@ export class RunRecording {
     return null
   }
 
+  /** The last result envelope's raw usage snapshot, for the settle-time
+   *  ledger hook (finalUsage applies the per-call step-sample preference but
+   *  needs the raw envelope's sample as fallback). */
+  getResultRawUsage(): RawUsage | null {
+    for (let i = this.events.length - 1; i >= 0; i--) {
+      const ev = this.events[i]
+      if (ev !== undefined && ev.kind === 'result') {
+        return ev.usage && Object.keys(ev.usage).length > 0 ? ev.usage : null
+      }
+    }
+    return null
+  }
+
   /** Event at an absolute index (bounds-checked). */
   eventAt(index: number): AgyEvent | undefined {
     return this.events[index]

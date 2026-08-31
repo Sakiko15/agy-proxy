@@ -145,6 +145,10 @@ export const Err = {
   UNKNOWN_MODEL: 'UNKNOWN_MODEL',
   UNSUPPORTED_REASONING_EFFORT: 'UNSUPPORTED_REASONING_EFFORT',
   BUSY: 'BUSY',
+  /** Every pool account is cooling down or quota-empty for the family → 429. */
+  POOL_EXHAUSTED: 'POOL_EXHAUSTED',
+  /** Upstream 403 re-validation (validation_url rides the message) → 403. */
+  VALIDATION_REQUIRED: 'VALIDATION_REQUIRED',
 } as const
 
 // Raw usage object as emitted by agy stream-json (snake_case).
@@ -258,6 +262,24 @@ export function looksLikeRateLimit(text?: string): boolean {
   return (
     looksLikeHardRateLimit(text) || /model overloaded|experiencing high traffic/i.test(text)
   )
+}
+
+/**
+ * Google's 403 pre-launch / anti-abuse re-validation shape ("your account
+ * requires additional verification"): the account cannot serve until the
+ * user completes the challenge, so the gateway quarantines it (same
+ * markAuthRequired path as an expired login) and surfaces validation_url.
+ * Narrow match — never scrapes URLs out of unrelated failures.
+ */
+export function looksLikeValidationRequired(text?: string): boolean {
+  return !!text && /VALIDATION_REQUIRED/i.test(text)
+}
+
+/** Extract the https challenge URL from a VALIDATION_REQUIRED failure text. */
+export function extractValidationUrl(text?: string): string | undefined {
+  if (text === undefined || !looksLikeValidationRequired(text)) return undefined
+  const m = text.match(/https:\/\/[^\s"'`<>\\]+/)
+  return m ? m[0].replace(/[)\]>.,;]+$/, '') : undefined
 }
 
 /**
