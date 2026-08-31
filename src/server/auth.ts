@@ -16,6 +16,21 @@ export function bearerToken(header: string | undefined): string | null {
   return m?.[1] ?? null
 }
 
+/**
+ * Extract the API key from either auth header style. `x-api-key` is the
+ * Anthropic client convention (MA4); Authorization: Bearer is OpenAI's.
+ * Both are honored on every /v1 route.
+ */
+export function apiKeyFrom(headers: { authorization?: string | undefined; 'x-api-key'?: string | string[] | undefined }): string | null {
+  const xKey = headers['x-api-key']
+  if (typeof xKey === 'string' && xKey.trim() !== '') return xKey.trim()
+  if (Array.isArray(xKey)) {
+    const first = xKey.find((v) => typeof v === 'string' && v.trim() !== '')
+    if (first !== undefined) return first.trim()
+  }
+  return bearerToken(headers.authorization)
+}
+
 export function keyMatches(expected: string, provided: string): boolean {
   const a = createHash('sha256').update(expected, 'utf8').digest()
   const b = createHash('sha256').update(provided, 'utf8').digest()
@@ -26,11 +41,18 @@ export function buildAuthHook(deps: { getConfig: () => GatewayConfig }): preHand
   return async (request, reply) => {
     const expected = deps.getConfig().apiKey
     if (expected === '') return // auth disabled (boot warning covers the posture)
-    const provided = bearerToken(request.headers.authorization)
+    const provided = apiKeyFrom(request.headers)
     if (provided === null) {
       await reply
         .code(401)
-        .send(httpError(401, 'Missing API key. Pass it as `Authorization: Bearer <key>`.', 'authentication_error', 'invalid_api_key').body)
+        .send(
+          httpError(
+            401,
+            'Missing API key. Pass it as `Authorization: Bearer <key>` or `x-api-key: <key>`.',
+            'authentication_error',
+            'invalid_api_key',
+          ).body,
+        )
       return
     }
     if (!keyMatches(expected, provided)) {

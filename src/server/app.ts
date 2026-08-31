@@ -36,6 +36,17 @@ import {
 import type { EngineCall } from '../host/engine.ts'
 import { SseWriter } from './sse.ts'
 import { InFlightTracker } from './shutdown.ts'
+import {
+  assembleMessage,
+  collectChunks as collectAnthropicChunks,
+  estimateInputTokens,
+  anthropicStreamEvents,
+  mapMessagesRequest,
+  newMessageId,
+  type AnthropicRequestMeta,
+} from './anthropic-adapter.ts'
+import { engineFailureToAnthropic } from './errors.ts'
+import { registerModelRoutes } from './models-routes.ts'
 
 import type { ModelCatalog } from '../host/models.ts'
 
@@ -183,7 +194,177 @@ export function buildServer(deps: ServerDeps): BuiltServer {
     }
   })
 
+  // ---- Anthropic Messages (charter §4.1: POST /v1/messages, stream + non-stream)
+
+  const messagesRequestSchema = {
+    schema: {
+      body: Type.Object(
+        {
+          model: Type.Optional(Type.String({ minLength: 1 })),
+          max_tokens: Type.Optional(Type.Number()),
+          stream: Type.Optional(Type.Boolean()),
+          messages: Type.Optional(
+            Type.Array(Type.Object({}, { additionalProperties: true }), { minItems: 1 }),
+          ),
+        },
+        { additionalProperties: true },
+      ),
+    },
+  }
+
+  app.post('/v1/messages', { preHandler: authHook, ...messagesRequestSchema }, async (request, reply) => {
+    const cfg = deps.getConfig()
+    if (!cfg.enabled) {
+      throw new GatewayHttpError(503, anthropicError('api_error', 'gateway is disabled by config (enabled=false)'))
+    }
+
+    const { call, meta } = await mapMessagesRequest(request.body, cfg, deps.catalog.get())
+    for (const w of meta.warnings) request.log.info({ warning: w }, 'request-mapping warning')
+
+    const abort = new AbortController()
+    inFlight.add(abort)
+    request.raw.on('close', () => {
+      if (!reply.sent) abort.abort(new Error('client disconnected'))
+    })
+
+    try {
+      if (meta.stream === true) {
+        await streamAnthropicMessages({ deps, request, reply, call, meta, abort, inFlight })
+        return
+      }
+      const chunks: StreamChunk[] = []
+      for await (const ch of deps.engine.stream({ ...call, signal: abort.signal })) {
+        chunks.push(ch)
+      }
+      const collected = collectAnthropicChunks(chunks)
+      const finish = collected.finish
+      if (finish !== null && (finish.kind === 'error' || finish.kind === 'aborted')) {
+        const mapped = engineFailureToAnthropic(finish.failure.message, finish.failure.code)
+        throw new GatewayHttpError(mapped.statusCode, mapped.body)
+      }
+      const body = assembleMessage({
+        id: newMessageId(),
+        requestModel: call.model,
+        collected,
+        stop: meta.stop,
+        ...(meta.maxTokens !== undefined ? { maxTokens: meta.maxTokens } : {}),
+      })
+      request.log.info(
+        {
+          model: call.model,
+          promptTokens: body.usage.input_tokens,
+          completionTokens: body.usage.output_tokens,
+          finishKind: finish?.kind ?? 'stop',
+        },
+        'request complete',
+      )
+      return reply.code(200).send(body)
+    } catch (err) {
+      if (err instanceof GatewayHttpError) throw err
+      if (err instanceof Error && err.name === 'EngineError') {
+        const code = (err as { code?: string }).code ?? 'AGY_ERROR'
+        const mapped = engineFailureToAnthropic(redactLine(err.message), code)
+        throw new GatewayHttpError(mapped.statusCode, mapped.body)
+      }
+      throw err
+    } finally {
+      inFlight.remove(abort)
+    }
+  })
+
+  // count_tokens (AN7): deterministic heuristic; response notes non-exactness.
+  const countTokensSchema = {
+    schema: {
+      body: Type.Object(
+        {
+          model: Type.Optional(Type.String()),
+          messages: Type.Optional(Type.Array(Type.Object({}, { additionalProperties: true }))),
+        },
+        { additionalProperties: true },
+      ),
+    },
+  }
+  app.post('/v1/messages/count_tokens', { preHandler: authHook, ...countTokensSchema }, async (request, reply) => {
+    const cfg = deps.getConfig()
+    if (!cfg.enabled) {
+      throw new GatewayHttpError(503, anthropicError('api_error', 'gateway is disabled by config (enabled=false)'))
+    }
+    const inputTokens = estimateInputTokens(request.body)
+    void cfg
+    return reply
+      .code(200)
+      .header('x-agy-proxy-token-estimate', 'heuristic')
+      .send({ input_tokens: inputTokens })
+  })
+
+  registerModelRoutes(app, { getConfig: deps.getConfig, catalog: deps.catalog, authHook: authHook as never })
+
   return { app, inFlight }
+}
+
+/** SSE leg of POST /v1/messages (AN2/AN3/AN5): Anthropic event sequences. */
+async function streamAnthropicMessages(args: {
+  deps: ServerDeps
+  request: import('fastify').FastifyRequest
+  reply: import('fastify').FastifyReply
+  call: EngineCall
+  meta: AnthropicRequestMeta
+  abort: AbortController
+  inFlight: InFlightTracker
+}): Promise<void> {
+  const { deps, request, reply, call, meta, abort, inFlight } = args
+  const cfg = deps.getConfig()
+  const sse = new SseWriter(reply, {
+    heartbeatMs: cfg.sseHeartbeatMs,
+    keepalive: () => 'event: ping\ndata: {"type":"ping"}\n\n',
+  })
+  const id = newMessageId()
+  const state = { messageStarted: false, blockIndex: 0, openType: null as 'text' | 'thinking' | 'tool_use' | null }
+  let usage: TokenUsage | undefined
+  let finishKind: string = 'stop'
+  try {
+    sse.open()
+    for await (const ch of deps.engine.stream({ ...call, signal: abort.signal })) {
+      if (ch.type === 'usage') {
+        usage = ch.usage
+        continue
+      }
+      if (ch.type === 'finish') finishKind = ch.reason.kind
+      for (const ev of anthropicStreamEvents({ id, model: call.model, chunk: ch, state, usage })) {
+        await sse.event(ev.event, ev.data)
+      }
+      if (ch.type === 'finish' && (ch.reason.kind === 'error' || ch.reason.kind === 'aborted')) {
+        finishKind = ch.reason.kind
+        return
+      }
+    }
+    request.log.info(
+      { model: call.model, promptTokens: usage?.inputTokens ?? 0, completionTokens: usage?.outputTokens ?? 0, finishKind },
+      'request complete',
+    )
+  } catch (err) {
+    // Mid-stream failures surface as an `error` event per charter §4.3.
+    let message = 'Internal server error'
+    let type = 'api_error'
+    if (err instanceof GatewayHttpError) {
+      message = err.body.error.message
+      type = err.body.error.type
+    } else if (err instanceof Error && err.name === 'EngineError') {
+      const ec = (err as { code?: string }).code ?? 'AGY_ERROR'
+      const mapped = engineFailureToAnthropic(redactLine(err.message), ec)
+      message = mapped.body.error.message
+      type = mapped.body.error.type
+    } else if (err instanceof Error) {
+      message = 'Internal server error: ' + redactLine(err.message)
+    }
+    request.log.error({ finishKind: 'error' }, 'stream failed')
+    if (!sse['closed']) {
+      await sse.event('error', { type: 'error', error: { type, message } })
+    }
+  } finally {
+    inFlight.remove(abort)
+    await sse.close()
+  }
 }
 
 /** SSE leg of POST /v1/chat/completions (OA2–OA4): hijack + direct frames. */
