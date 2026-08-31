@@ -1,174 +1,182 @@
-// Ported from dsh-agy-link test/models.test.ts @ 46984db (converted:
-// node:test/assert → vitest describe/it/expect; PluginConfig → GatewayConfig).
-import { describe, it, expect } from 'vitest'
-import { buildFallbackCatalog, defaultEffortFor, findEntry, foldEfforts, parseModelsOutput } from '../src/host/models.ts'
-import { DEFAULT_FALLBACK_MODELS, defaultConfig, type GatewayConfig } from '../src/common/types.ts'
+// /v1/models routes (MA1–MA3): dual-shape listing, header sniffing, single
+// model lookup, and Anthropic-style pagination — through the real
+// ModelCatalog (fallback defs; discovery is not exercised here).
+import { describe, it, expect, afterEach } from 'vitest'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { defaultConfig, type GatewayConfig } from '../src/common/types.ts'
+import { AgyEngine } from '../src/host/engine.ts'
+import { ModelCatalog } from '../src/host/models.ts'
+import { SessionStore } from '../src/host/sessions.ts'
+import { RunRegistry } from '../src/host/recording.ts'
+import { buildServer } from '../src/server/app.ts'
+import { buildLogger } from '../src/server/logger.ts'
+import { GatewaySemaphore } from '../src/server/semaphore.ts'
+import {
+  MODEL_CREATED,
+  MODELS_PAGE_DEFAULT,
+  MODELS_PAGE_MAX,
+  paginateModels,
+  toAnthropicEntries,
+  toOpenAiEntries,
+} from '../src/server/models-routes.ts'
 
-describe('models', () => {
-  it('parseModelsOutput reads the JSON array shape', () => {
-    const raw = JSON.stringify([
-      { id: 'gemini-3-6-flash', display_name: 'Gemini 3.6 Flash' },
-      { id: 'claude-sonnet-4-6', display_name: 'Claude Sonnet 4.6' },
-    ])
-    const out = parseModelsOutput(raw)
-    expect(out.length).toBe(2)
-    expect(out[0]?.slug).toBe('gemini-3-6-flash')
-    expect(out[0]?.label).toBe('Gemini 3.6 Flash')
+let lastWorkDir: string | null = null
+
+function makeServer(cfgOverrides: Partial<GatewayConfig> = {}) {
+  const cfg: GatewayConfig = { ...defaultConfig(), permissionMode: 'plan', timeoutMs: 20_000, ...cfgOverrides }
+  const workDir = mkdtempSync(join(tmpdir(), 'agy-models-'))
+  process.env.AGY_PROXY_CONVERSATIONS_DIR = join(workDir, 'convs')
+  const catalog = new ModelCatalog(async () => { throw new Error('no discovery in tests') }, cfg.fallbackModels, 300_000)
+  const sem = new GatewaySemaphore(() => cfg.maxConcurrent, () => cfg.maxQueueDepth)
+  const engine = new AgyEngine({
+    getConfig: () => cfg,
+    catalog,
+    store: new SessionStore(join(workDir, 'sessions.json')),
+    bin: () => null,
+    acquire: () => sem.acquire(),
+    runs: new RunRegistry(),
   })
+  const built = buildServer({ getConfig: () => cfg, engine, catalog, log: buildLogger({ AGY_PROXY_LOG_LEVEL: 'warn' }) })
+  lastWorkDir = workDir
+  return { built, catalog }
+}
 
-  it('parseModelsOutput reads the TAB-separated agy 1.1.15 table and folds efforts', () => {
-    // Captured verbatim from a live `agy models` (1.1.15, signed in)
-    const table = [
-      'gemini-3.7-flash-high\tGemini 3.7 Flash (High)',
-      'gemini-3.7-flash-medium\tGemini 3.7 Flash (Medium)',
-      'gemini-3.7-flash-low\tGemini 3.7 Flash (Low)',
-      'gemini-3.6-flash-high\tGemini 3.6 Flash (High)',
-      'claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)',
-    ].join('\n')
-    const out = parseModelsOutput(table)
-    expect(out.length).toBe(5)
-    expect(out[0]?.slug).toBe('gemini-3.7-flash-high')
-    expect(out[0]?.label).toBe('Gemini 3.7 Flash (High)')
-    const folded = foldEfforts(out)
-    const base = findEntry({ source: 'discovered', models: folded, discoveredAt: 0 }, 'gemini-3.7-flash')
-    expect(base).toBeTruthy()
-    expect(base?.efforts).toEqual(['low', 'medium', 'high'])
-  })
+afterEach(() => {
+  rmSync(lastWorkDir ?? '', { recursive: true, force: true })
+})
 
-  it('parseModelsOutput reads the two-column text shape', () => {
-    const out = parseModelsOutput('gemini-3-6-flash    Gemini 3.6 Flash\nclaude-sonnet-4-6    Claude Sonnet 4.6\n')
-    expect(out.length).toBe(2)
-    expect(out[1]?.slug).toBe('claude-sonnet-4-6')
-  })
+const FIVE = ['m1', 'm2', 'm3', 'm4', 'm5'].map((id) => ({ id, name: id.toUpperCase(), efforts: null }))
 
-  it('parseModelsOutput handles dotted current-gen slugs', () => {
-    // agy 1.1.13 prints gemini-3.7-flash(-medium) etc. (dots, not dashes)
-    const out = parseModelsOutput('gemini-3.7-flash    Gemini 3.7 Flash\ngemini-3.7-flash-medium    Gemini 3.7 Flash (Medium)\ngemini-3.6-flash    Gemini 3.6 Flash\n')
-    expect(out.map((r) => r.slug)).toEqual(['gemini-3.7-flash', 'gemini-3.7-flash-medium', 'gemini-3.6-flash'])
-    const folded = foldEfforts(out)
-    const base = findEntry({ source: 'discovered', models: folded, discoveredAt: 0 }, 'gemini-3.7-flash')
-    expect(base).toBeTruthy()
-    expect(base?.efforts).toEqual(['medium'])
-  })
-
-  it('fallback catalog carries the current model line-up incl. 3.7', () => {
-    const cat = buildFallbackCatalog(DEFAULT_FALLBACK_MODELS)
-    const ids = cat.map((e) => e.id)
+describe('MA1: OpenAI list shape', () => {
+  it('returns {object:list, data:[{id,object:model,created,owned_by}]} with unique ids', async () => {
+    const { built } = makeServer()
+    const res = await built.app.inject({ method: 'GET', url: '/v1/models' })
+    expect(res.statusCode).toBe(200)
+    const body = res.json() as { object: string; data: Array<Record<string, unknown>> }
+    expect(body.object).toBe('list')
+    const ids = body.data.map((m) => m.id)
+    expect(new Set(ids).size).toBe(ids.length)
+    for (const m of body.data) {
+      expect(m).toEqual({ id: m.id, object: 'model', created: MODEL_CREATED, owned_by: 'antigravity' })
+    }
+    // The default fallback catalog carries the gemini/claude/gpt-oss lines.
     expect(ids).toContain('gemini-3.7-flash')
-    expect(ids).toContain('gemini-3.6-flash')
-    expect(ids).toContain('claude-opus-4-6-thinking')
-    expect(ids).toContain('gpt-oss-120b-medium')
-    const f37 = findEntry({ source: 'fallback', models: cat, discoveredAt: 0 }, 'gemini-3.7-flash')
-    expect(f37?.efforts).toEqual(['low', 'medium', 'high'])
-  })
-
-  it('parseModelsOutput skips banners and error lines', () => {
-    const out = parseModelsOutput('Fetching models...\nError: hmm\ngemini-3-6-flash    Flash\n')
-    expect(out.length).toBe(1)
-  })
-
-  it('foldEfforts folds gemini effort suffixes into a base entry', () => {
-    const folded = foldEfforts([
-      { slug: 'gemini-3-6-flash', label: 'Gemini 3.6 Flash' },
-      { slug: 'gemini-3-6-flash-high', label: 'Gemini 3.6 Flash High' },
-      { slug: 'gemini-3-6-flash-low', label: 'Gemini 3.6 Flash Low' },
-      { slug: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6' },
-    ])
-    const ids = folded.map((e) => e.id)
-    expect(ids).toContain('gemini-3-6-flash')
-    expect(ids).not.toContain('gemini-3-6-flash-high')
-    const base = findEntry({ source: 'discovered', models: folded, discoveredAt: 0 }, 'gemini-3-6-flash')
-    expect(base?.efforts).toEqual(['low', 'high'])
-    const claude = findEntry({ source: 'discovered', models: folded, discoveredAt: 0 }, 'claude-sonnet-4-6')
-    expect(claude?.efforts).toBeNull()
-  })
-
-  it('foldEfforts emits no duplicate ids when agy lists the bare base plus one variant (issue #1)', () => {
-    // agy 1.1.13 shape: the bare base IS a catalog member next to its
-    // variants. Folding must absorb the bare entry into the folded base
-    // instead of emitting the id twice — protocol layers must not see the
-    // same model id twice in the /v1/models listing.
-    const folded = foldEfforts([
-      { slug: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash' },
-      { slug: 'gemini-3.7-flash-medium', label: 'Gemini 3.7 Flash (Medium)' },
-      { slug: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
-    ])
-    const ids = folded.map((e) => e.id)
-    expect(new Set(ids).size).toBe(ids.length)
-    const base = folded.filter((e) => e.id === 'gemini-3.7-flash')
-    expect(base.length).toBe(1)
-    expect(base[0]?.efforts).toEqual(['medium'])
-    // Unrelated bare entries stay verbatim.
-    expect(ids).toContain('gemini-3.6-flash')
-  })
-
-  it('foldEfforts emits no duplicate ids when the bare base is listed alongside every variant', () => {
-    const folded = foldEfforts([
-      { slug: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash' },
-      { slug: 'gemini-3.7-flash-high', label: 'Gemini 3.7 Flash (High)' },
-      { slug: 'gemini-3.7-flash-medium', label: 'Gemini 3.7 Flash (Medium)' },
-      { slug: 'gemini-3.7-flash-low', label: 'Gemini 3.7 Flash (Low)' },
-      { slug: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6 (Thinking)' },
-    ])
-    const ids = folded.map((e) => e.id)
-    expect(new Set(ids).size).toBe(ids.length)
-    const base = folded.filter((e) => e.id === 'gemini-3.7-flash')
-    expect(base.length).toBe(1)
-    expect(base[0]?.efforts).toEqual(['low', 'medium', 'high'])
     expect(ids).toContain('claude-sonnet-4-6')
+    await built.app.close()
   })
 
-  it('parseModelsOutput dedupes repeated slugs', () => {
-    // Some agy builds print the same row twice (e.g. overlapping sections);
-    // duplicate raw slugs would become duplicate catalog ids downstream.
-    const out = parseModelsOutput([
-      'gemini-3.7-flash-high\tGemini 3.7 Flash (High)',
-      'gemini-3.7-flash-high\tGemini 3.7 Flash (High)',
-      'claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)',
-    ].join('\n'))
-    expect(out.map((r) => r.slug)).toEqual(['gemini-3.7-flash-high', 'claude-sonnet-4-6'])
+  it('requires auth when configured (x-api-key or Bearer both accepted)', async () => {
+    const { built } = makeServer({ apiKey: 'sekrit' })
+    expect((await built.app.inject({ method: 'GET', url: '/v1/models' })).statusCode).toBe(401)
+    expect((await built.app.inject({ method: 'GET', url: '/v1/models', headers: { 'x-api-key': 'sekrit' } })).statusCode).toBe(200)
+    expect((await built.app.inject({ method: 'GET', url: '/v1/models', headers: { authorization: 'Bearer sekrit' } })).statusCode).toBe(200)
+    await built.app.close()
+  })
+})
+
+describe('header sniffing + dedicated path (MA4 half)', () => {
+  it('anthropic-version header switches /v1/models to the Anthropic shape', async () => {
+    const { built } = makeServer()
+    const res = await built.app.inject({ method: 'GET', url: '/v1/models', headers: { 'anthropic-version': '2023-06-01' } })
+    expect(res.statusCode).toBe(200)
+    const body = res.json() as { data: Array<{ type?: string }> }
+    expect(body.data[0]?.type).toBe('model')
+    expect(body.data[0]).toHaveProperty('display_name')
+    expect(body.data[0]).toHaveProperty('created_at')
+    await built.app.close()
   })
 
-  it('bare gemini base without siblings gets no efforts', () => {
-    const folded = foldEfforts([{ slug: 'gemini-3-1-pro', label: 'Gemini 3.1 Pro' }])
-    expect(folded[0]?.efforts).toBeNull()
+  it('/v1/anthropic/models is always the Anthropic shape', async () => {
+    const { built } = makeServer()
+    const plain = await built.app.inject({ method: 'GET', url: '/v1/anthropic/models' })
+    expect(plain.statusCode).toBe(200)
+    const body = plain.json() as { data: Array<{ type?: string }> }
+    expect(body.data[0]?.type).toBe('model')
+    await built.app.close()
+  })
+})
+
+describe('single model lookup', () => {
+  it('GET /v1/models/:id returns the OpenAI object; unknown → 404 model_not_found', async () => {
+    const { built } = makeServer()
+    const ok = await built.app.inject({ method: 'GET', url: '/v1/models/gemini-3.7-flash' })
+    expect(ok.statusCode).toBe(200)
+    expect(ok.json()).toEqual({ id: 'gemini-3.7-flash', object: 'model', created: MODEL_CREATED, owned_by: 'antigravity' })
+    const missing = await built.app.inject({ method: 'GET', url: '/v1/models/no-such-model' })
+    expect(missing.statusCode).toBe(404)
+    const body = missing.json() as { error: { type: string; code: string } }
+    expect(body.error.type).toBe('invalid_request_error')
+    expect(body.error.code).toBe('model_not_found')
+    await built.app.close()
+  })
+})
+
+describe('MA2: Anthropic pagination', () => {
+  it('paginateModels defaults to 20 and caps at 1000', () => {
+    expect(MODELS_PAGE_DEFAULT).toBe(20)
+    expect(MODELS_PAGE_MAX).toBe(1000)
+    const page = paginateModels(FIVE, {})
+    expect(page.data).toHaveLength(5)
+    expect(page.first_id).toBe('m1')
+    expect(page.last_id).toBe('m5')
+    expect(page.has_more).toBe(false)
+    const limited = paginateModels(FIVE, { limit: 2 })
+    expect(limited.data.map((m) => m.id)).toEqual(['m1', 'm2'])
+    expect(limited.has_more).toBe(true)
+    const capped = paginateModels(FIVE, { limit: 5000 })
+    expect(capped.data).toHaveLength(5)
   })
 
-  it('buildFallbackCatalog carries configurable efforts', () => {
-    const cat = buildFallbackCatalog(DEFAULT_FALLBACK_MODELS)
-    expect(cat.length).toBe(7)
-    const flash = cat.find((e) => e.id === 'gemini-3.7-flash')
-    expect(flash?.efforts).toEqual(['low', 'medium', 'high'])
-    const claude = cat.find((e) => e.id === 'claude-sonnet-4-6')
-    expect(claude?.efforts).toBeNull()
+  it('after_id / before_id slice the stable order; unknown anchors give empty pages', () => {
+    const after = paginateModels(FIVE, { after_id: 'm2', limit: 2 })
+    expect(after.data.map((m) => m.id)).toEqual(['m3', 'm4'])
+    expect(after.first_id).toBe('m3')
+    expect(after.has_more).toBe(true)
+    // before_id ends BEFORE the anchor; the page window starts at the list
+    // head, so the first `limit` entries before 'm4' are m1..m2.
+    const before = paginateModels(FIVE, { before_id: 'm4', limit: 2 })
+    expect(before.data.map((m) => m.id)).toEqual(['m1', 'm2'])
+    expect(paginateModels(FIVE, { after_id: 'nope' }).data).toEqual([])
+    expect(paginateModels(FIVE, { before_id: 'nope' }).data).toEqual([])
+    expect(paginateModels(FIVE, { after_id: 'm4' }).data.map((m) => m.id)).toEqual(['m5'])
+    expect(paginateModels(FIVE, { after_id: 'm4' }).has_more).toBe(false)
   })
 
-  it('defaultEffortFor prefers config override then high first', () => {
-    const cfg: GatewayConfig = { ...defaultConfig(), defaultEffort: 'low' }
-    const cat = buildFallbackCatalog(DEFAULT_FALLBACK_MODELS)
-    const flash = findEntry({ source: 'discovered', models: cat, discoveredAt: 0 }, 'gemini-3.7-flash')
-    expect(flash && defaultEffortFor(flash, cfg)).toBe('low')
-    // No config override: default is the highest available effort.
-    const cfg2: GatewayConfig = { ...defaultConfig(), defaultEffort: '' }
-    expect(flash && defaultEffortFor(flash, cfg2)).toBe('high')
-    // pro line-up has no medium; high still wins.
-    const pro = findEntry({ source: 'discovered', models: cat, discoveredAt: 0 }, 'gemini-3.1-pro')
-    expect(pro && defaultEffortFor(pro, cfg2)).toBe('high')
+  it('rejects non-positive limits with 400', () => {
+    expect(() => paginateModels(FIVE, { limit: 0 })).toThrow(/positive integer/)
+    expect(() => paginateModels(FIVE, { limit: -3 })).toThrow(/positive integer/)
   })
 
-  it('effort suffix ids still resolve to their base entry', () => {
-    const folded = foldEfforts([
-      { slug: 'gemini-3-6-flash', label: 'F' },
-      { slug: 'gemini-3-6-flash-high', label: 'FH' },
-    ])
-    const cat = { source: 'discovered' as const, models: folded, discoveredAt: 0 }
-    expect(findEntry(cat, 'gemini-3-6-flash')?.id).toBe('gemini-3-6-flash')
+  it('end-to-end: /v1/anthropic/models honors limit and after_id', async () => {
+    const { built } = makeServer()
+    const p1 = await built.app.inject({ method: 'GET', url: '/v1/anthropic/models?limit=2' })
+    const b1 = p1.json() as { data: Array<{ id: string }>; first_id: string; has_more: boolean }
+    expect(b1.data).toHaveLength(2)
+    expect(b1.has_more).toBe(true)
+    const p2 = await built.app.inject({ method: 'GET', url: `/v1/anthropic/models?limit=2&after_id=${b1.data[1]?.id}` })
+    const b2 = p2.json() as { data: Array<{ id: string }>; first_id: string }
+    expect(b2.data[0]?.id).not.toBe(b1.data[0]?.id)
+    expect(b2.first_id).not.toBe(b1.first_id)
+    await built.app.close()
   })
+})
 
-  it('findEntry resolves aliases via resolveModelSlug', () => {
-    const cat = { source: 'fallback' as const, models: buildFallbackCatalog(DEFAULT_FALLBACK_MODELS), discoveredAt: 0 }
-    expect(findEntry(cat, 'claude-opus-4-6')?.id).toBe('claude-opus-4-6-thinking')
-    expect(findEntry(cat, 'claude-opus')?.id).toBe('claude-opus-4-6-thinking')
-    expect(findEntry(cat, 'gpt-oss-120b')?.id).toBe('gpt-oss-120b-medium')
+describe('MA3: effort folding holds on both shapes', () => {
+  it('folded gemini entries appear once; entries derive from the shared catalog', async () => {
+    const { built, catalog } = makeServer()
+    const res = await built.app.inject({ method: 'GET', url: '/v1/models' })
+    const ids = (res.json() as { data: Array<{ id: string }> }).data.map((m) => m.id)
+    // The fallback defs carry bare ids (no -low/-medium/-high slugs), so no
+    // duplicates: each id appears exactly once on both shapes.
+    expect(new Set(ids).size).toBe(ids.length)
+    expect(ids).toEqual(catalog.get().models.map((m) => m.id))
+    const an = await built.app.inject({ method: 'GET', url: '/v1/anthropic/models' })
+    const anIds = (an.json() as { data: Array<{ id: string }> }).data.map((m) => m.id)
+    expect(anIds).toEqual(ids)
+    expect(toOpenAiEntries(catalog.get().models)).toHaveLength(ids.length)
+    expect(toAnthropicEntries(catalog.get().models)).toHaveLength(ids.length)
+    await built.app.close()
   })
 })
