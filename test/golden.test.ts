@@ -74,6 +74,17 @@ function diffFields(expected: Json, actual: Json, path: string, out: string[]): 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i
 
 /**
+ * Scrub embedded run UUIDs out of the RAW payload text before parsing: mirror
+ * tool-call arguments embed the run id inside a JSON STRING, and string-level
+ * replacement keeps the rest of that string intact (object-level normalization
+ * would have to replace the whole string). Expected files carry `__UUID__` at
+ * the same positions.
+ */
+function scrubRaw(text: string): string {
+  return text.replace(UUID_RE, '__UUID__')
+}
+
+/**
  * Replace dynamic values with sentinels. Id strings are matched by SHAPE so a
  * malformed id would fail the diff instead of being silently rewritten.
  * `zeroChatCreated` zeroes the OpenAI `created` epoch (Date.now()-based on
@@ -100,8 +111,8 @@ function normalizeJson(v: Json, zeroChatCreated: boolean): Json {
 }
 
 /** OpenAI SSE body → array of normalized data payloads ('[DONE]' kept as a string). */
-function openAiFrames(body: string): Json[] {
-  return body
+function openAiFrames(rawBody: string): Json[] {
+  return scrubRaw(rawBody)
     .split('\n\n')
     .map((b) => b.trim())
     .filter((b) => b !== '')
@@ -113,8 +124,8 @@ function openAiFrames(body: string): Json[] {
 }
 
 /** Anthropic SSE body → normalized {event, data} pairs. */
-function anthropicFrames(body: string): Json[] {
-  return body
+function anthropicFrames(rawBody: string): Json[] {
+  return scrubRaw(rawBody)
     .split('\n\n')
     .map((b) => b.trim())
     .filter((b) => b !== '')
@@ -189,14 +200,15 @@ for (const protocol of PROTOCOLS) {
             if (caseCfg.fakeAgyExitCode !== undefined) process.env.FAKE_AGY_EXIT_CODE = String(caseCfg.fakeAgyExitCode)
           }
           const qs = request.query !== undefined ? '?' + new URLSearchParams(request.query).toString() : ''
+          const isPost = method === 'POST'
           const res = await app.inject({
-            method,
+            method: method as 'GET' | 'POST',
             url: url0 + qs,
-            headers: { ...(method === 'POST' ? { 'content-type': 'application/json' } : {}), ...(request.headers ?? {}) },
-            ...(method === 'POST' ? { payload: body as object } : {}),
+            headers: { ...(isPost ? { 'content-type': 'application/json' } : {}), ...(request.headers ?? {}) },
+            ...(isPost ? { payload: body as object } : {}),
           })
 
-          const isSse = String(res.headers['content-type'] ?? '').includes('text/event-stream')
+          const isSse = String((res.headers as Record<string, unknown>)['content-type'] ?? '').includes('text/event-stream')
           const diffs: string[] = []
           if (isSse) {
             expect(res.statusCode).toBe(200)
@@ -206,7 +218,8 @@ for (const protocol of PROTOCOLS) {
           } else {
             const expectedStatus = typeof expected._status === 'number' ? expected._status : 200
             expect(res.statusCode).toBe(expectedStatus)
-            const actualRaw = res.body !== '' ? (JSON.parse(res.body) as unknown) : {}
+            const body0: string = res.body
+            const actualRaw = body0 !== '' ? (JSON.parse(scrubRaw(body0)) as unknown) : {}
             const actual = normalizeJson(actualRaw as Json, url0.startsWith('/v1/chat/completions'))
             const expectedBody: Record<string, unknown> = { ...expected }
             delete expectedBody._provenance
