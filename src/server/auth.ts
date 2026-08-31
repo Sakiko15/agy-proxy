@@ -8,7 +8,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto'
 import type { preHandlerHookHandler } from 'fastify'
 import type { GatewayConfig } from '../common/types.ts'
-import { httpError } from './errors.ts'
+import { authErrorFor } from './errors.ts'
 
 export function bearerToken(header: string | undefined): string | null {
   if (header === undefined) return null
@@ -46,17 +46,15 @@ export function buildAuthHook(deps: { getConfig: () => GatewayConfig }): preHand
       await reply
         .code(401)
         .send(
-          httpError(
-            401,
+          authErrorFor(
+            request.url,
             'Missing API key. Pass it as `Authorization: Bearer <key>` or `x-api-key: <key>`.',
-            'authentication_error',
-            'invalid_api_key',
           ).body,
         )
       return
     }
     if (!keyMatches(expected, provided)) {
-      await reply.code(401).send(httpError(401, 'Invalid API key provided.', 'authentication_error', 'invalid_api_key').body)
+      await reply.code(401).send(authErrorFor(request.url, 'Invalid API key provided.').body)
       return
     }
   }

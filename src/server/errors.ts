@@ -125,3 +125,15 @@ export function engineFailureToAnthropic(message: string, code: string): { statu
   const { statusCode, type } = anthropicStatusFor(code, message)
   return { statusCode, body: anthropicError(type, message) }
 }
+
+/**
+ * Auth failures thrown by the shared hook: the Anthropic paths must receive
+ * the Anthropic error shape ({type:'error',error:{...}}), OpenAI paths keep
+ * {error:{...}}. Same status/type rows as anthropicStatusFor for AUTH.
+ */
+export function authErrorFor(url: string, message: string): GatewayHttpError {
+  if (isAnthropicPath(url)) {
+    return new GatewayHttpError(401, anthropicError('authentication_error', message))
+  }
+  return httpError(401, message, 'authentication_error', 'invalid_api_key')
+}
