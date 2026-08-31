@@ -1,0 +1,11 @@
+{
+  "method": "POST",
+  "url": "/v1/chat/completions",
+  "body": {
+    "model": "gemini-3.7-flash",
+    "messages": [
+      { "role": "user", "content": "hi" }
+    ],
+    "functions": []
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "_provenance": "test/golden/openai/oa8c-auth-401/PROVENANCE.md — missing key → 401 authentication_error / invalid_api_key (OpenAI body shape; Anthropic paths get their own body shape, see an8a). No agy spawn.",
+  "_status": 401,
+  "error": {
+    "message": "Missing API key. Pass it as `Authorization: Bearer <key>` or `x-api-key: <key>`.",
+    "type": "authentication_error",
+    "code": "invalid_api_key"
+  }
+}

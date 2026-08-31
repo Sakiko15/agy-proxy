@@ -1,0 +1,4 @@
+{"event":"init","conversation_id":"conv-oa4","model":"gemini-3.7-flash"}
+{"event":"step_update","step_update":{"conversation_id":"conv-oa4","step_index":0,"state":"DONE","step_type":"user_input"}}
+{"event":"step_update","step_update":{"conversation_id":"conv-oa4","step_index":1,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"ls"}}}}
+{"event":"step_update","step_update":{"conversation_id":"conv-oa4","step_index":1,"state":"DONE","step_type":"tool","duration_seconds":0.3,"tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"ls"},"output":"note1.txt\nnote2.txt\n"}}}

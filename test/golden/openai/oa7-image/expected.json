@@ -1,0 +1,25 @@
+{
+  "_provenance": "test/golden/openai/oa7-image/PROVENANCE.md — data: image accepted and answered (the image itself rides to agy as a staged FILE, never in the prompt or the JSON body — charter §4.2 path-based multimodal). Staged-file + --add-dir argv assertions live in test/openai-chat.test.ts. Sentinels: __ID__, created → 0.",
+  "id": "__ID__",
+  "object": "chat.completion",
+  "created": 0,
+  "model": "gemini-3.7-flash",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "PONG"
+      },
+      "finish_reason": "stop",
+      "logprobs": null
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 12,
+    "completion_tokens": 5,
+    "total_tokens": 17,
+    "prompt_tokens_details": { "cached_tokens": 0 },
+    "completion_tokens_details": { "reasoning_tokens": 0 }
+  }
+}

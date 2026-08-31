@@ -1,0 +1,9 @@
+{
+  "_provenance": "test/golden/openai/oa8a-model-404/PROVENANCE.md — a DISCOVERED catalog rejects unknown ids up front (404 model_not_found + available list); the fallback catalog stays advisory (M2 decision, charter §4.4). No agy spawn occurs, so events.ndjson is empty.",
+  "_status": 404,
+  "error": {
+    "message": "model 'no-such-model' was not found by this gateway — available models: gemini-3-7-flash, claude-sonnet-4-6",
+    "type": "invalid_request_error",
+    "code": "model_not_found"
+  }
+}

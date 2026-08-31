@@ -1,0 +1,7 @@
+{
+  "model": "gemini-3.7-flash",
+  "messages": [
+    { "role": "user", "content": "hi" }
+  ],
+  "stream": true
+}

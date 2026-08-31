@@ -1,0 +1,4 @@
+{"event":"init","conversation_id":"conv-oa6","model":"gemini-3.7-flash"}
+{"event":"step_update","step_update":{"conversation_id":"conv-oa6","step_index":0,"state":"DONE","step_type":"user_input"}}
+{"event":"step_update","step_update":{"conversation_id":"conv-oa6","step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"PONG","duration_seconds":0.4,"usage":{"input_tokens":12,"output_tokens":5,"thinking_tokens":3,"cache_read_tokens":0,"total_tokens":17}}}
+{"event":"result","result":{"conversation_id":"conv-oa6","status":"DONE","response":"PONG","duration_seconds":0.5,"num_turns":1,"usage":{"input_tokens":12,"output_tokens":5,"thinking_tokens":3,"cache_read_tokens":0,"total_tokens":17}}}

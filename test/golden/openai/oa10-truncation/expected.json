@@ -1,0 +1,26 @@
+{
+  "_provenance": "test/golden/openai/oa10-truncation/PROVENANCE.md — max_completion_tokens=3 against a 100-output-token sample: keepChars = floor(19*3/100) = 0 → empty text, finish 'length'. Proportional cut is approximate by design (no tokenizer; outputTokens includes thinking).",
+  "_status": 200,
+  "id": "__ID__",
+  "object": "chat.completion",
+  "created": 0,
+  "model": "gemini-3.7-flash",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": ""
+      },
+      "finish_reason": "length",
+      "logprobs": null
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 10,
+    "completion_tokens": 100,
+    "total_tokens": 110,
+    "prompt_tokens_details": { "cached_tokens": 3 },
+    "completion_tokens_details": { "reasoning_tokens": 2 }
+  }
+}

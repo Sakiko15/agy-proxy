@@ -1,0 +1,9 @@
+{
+  "_provenance": "test/golden/openai/oa4-tool-stream/PROVENANCE.md — completed tool step cuts the span: tool_calls delta carries index 0, a stable agytc- id and the COMPLETE arguments JSON in one frame; ACTIVE announcements never surface. Continuation (no re-spawn) is asserted in test/openai-stream.test.ts OA4 — argv counting, not reproducible through a single inject. Sentinels: __ID__, __AGYTC__, __UUID__, created → 0.",
+  "sse": [
+    { "id": "__ID__", "object": "chat.completion.chunk", "created": 0, "model": "gemini-3.7-flash", "choices": [{ "index": 0, "delta": { "role": "assistant", "content": "" }, "finish_reason": null }] },
+    { "id": "__ID__", "object": "chat.completion.chunk", "created": 0, "model": "gemini-3.7-flash", "choices": [{ "index": 0, "delta": { "tool_calls": [{ "index": 0, "id": "__AGYTC__", "type": "function", "function": { "name": "agy_tool", "arguments": "{\"run\":\"__UUID__\",\"step\":3,\"tool\":\"run_command\",\"input\":{\"CommandLine\":\"ls\"}}" } }] }, "finish_reason": null }] },
+    { "id": "__ID__", "object": "chat.completion.chunk", "created": 0, "model": "gemini-3.7-flash", "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }] },
+    "[DONE]"
+  ]
+}

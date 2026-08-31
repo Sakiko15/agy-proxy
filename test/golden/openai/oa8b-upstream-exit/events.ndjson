@@ -1,0 +1,1 @@
+{"event":"result","result":{"conversation_id":"","status":"ERROR","response":"","error":"upstream request failed while generating (request id 8f3ac2)","duration_seconds":8.2,"num_turns":0,"usage":{"input_tokens":0,"output_tokens":0}}}

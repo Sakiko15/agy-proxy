@@ -1,0 +1,12 @@
+{
+  "model": "gemini-3.7-flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "what is this?" },
+        { "type": "image_url", "image_url": { "url": "data:image/png;base64,iVBORw0KGgoAAAABAAAAAQAAAAEAAAABAAAAAQAAAAEAAAABAAAAAQAAAAEAAAABAAAAAQ==" } }
+      ]
+    }
+  ]
+}

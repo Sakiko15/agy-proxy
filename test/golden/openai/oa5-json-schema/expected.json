@@ -1,0 +1,25 @@
+{
+  "_provenance": "test/golden/openai/oa5-json-schema/PROVENANCE.md — json_schema passthrough: the completion body carries the raw JSON string; argv assertion (--json-schema <file> with the exact schema) lives in test/openai-chat.test.ts. Sentinels: __ID__, created → 0.",
+  "id": "__ID__",
+  "object": "chat.completion",
+  "created": 0,
+  "model": "gemini-3.7-flash",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "{\"answer\":\"Hello from fake agy\"}"
+      },
+      "finish_reason": "stop",
+      "logprobs": null
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 10,
+    "completion_tokens": 5,
+    "total_tokens": 15,
+    "prompt_tokens_details": { "cached_tokens": 3 },
+    "completion_tokens_details": { "reasoning_tokens": 2 }
+  }
+}

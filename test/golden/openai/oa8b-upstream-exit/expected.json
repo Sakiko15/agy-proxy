@@ -1,0 +1,9 @@
+{
+  "_provenance": "test/golden/openai/oa8b-upstream-exit/PROVENANCE.md — the real silent-failure shape: ERROR envelope on stdout + exit 1 + EMPTY stderr. agy's real error text rides `message` verbatim (dsh-agy-link v0.4.21 lesson: a bare 'exited with code 1' hid the cause).",
+  "_status": 502,
+  "error": {
+    "message": "agy exited with code 1: upstream request failed while generating (request id 8f3ac2)",
+    "type": "api_error",
+    "code": "PROCESS_EXIT"
+  }
+}

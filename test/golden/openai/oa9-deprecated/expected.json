@@ -1,0 +1,9 @@
+{
+  "_provenance": "test/golden/openai/oa9-deprecated/PROVENANCE.md — the legacy functions API is rejected with a pointer to tools; tools/tool_choice themselves are ACCEPTED with a warning (M2 decision). No agy spawn.",
+  "_status": 400,
+  "error": {
+    "message": "the legacy functions API is not supported — use tools",
+    "type": "invalid_request_error",
+    "code": "invalid_request"
+  }
+}
