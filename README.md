@@ -4,9 +4,9 @@ Self-hosted LLM gateway: Google Antigravity (official `agy` CLI) as the upstream
 exposed as OpenAI Chat Completions + Anthropic Messages compatible HTTP APIs with per-key
 quotas and a management WebUI. Runs in Docker on a VPS behind a reverse proxy.
 
-**Status: M2 (dual-protocol + streaming) — under active development.** Streaming SSE, the
-Anthropic Messages endpoint, models routes, count_tokens, the widened request surface and
-the golden-case matrix are in; next is M3 (account pool, key management, SQLite accounting).
+**Status: M3 (account pool + key management + SQLite accounting) — under active development.**
+The account pool, the paste-URL login flow with QR, per-key quotas and the SQLite usage
+ledger, and the JSON admin API are in; the WebUI pages (M4) ride on the same admin routes.
 See [docs/charter.md](docs/charter.md) (立项文档), [docs/development.md](docs/development.md),
 [docs/acceptance.md](docs/acceptance.md).
 
@@ -67,6 +67,34 @@ convention, not an official field) and a usage-only trailing frame with
 `message_start → content_block_* → message_delta → message_stop` sequence. Idle heartbeats
 (`: ping` / `ping` event) fire per `AGY_PROXY_SSE_HEARTBEAT_MS` when the engine is silent.
 
+### Admin API (JSON, M3; the M4 WebUI rides on these routes)
+
+All `/admin/*` routes sit behind the guard chain: CIDR allowlist (`AGY_PROXY_ADMIN_ALLOW_CIDR`,
+re-read per request) → session cookie (`POST /admin/login` exempt) → CSRF (mutating methods
+must carry a non-empty `x-requested-with` header). Session cookie: `HttpOnly; SameSite=Lax`.
+
+| Route | Notes |
+|---|---|
+| `POST /admin/login` | `{password}` → session cookie; wrong password answers 401 after a 300ms damping delay |
+| `POST /admin/logout` · `GET /admin/me` | Drop the session · remaining TTL |
+| `GET /admin/status` | Gateway posture, catalog, key count, today's usage summary, pool overview — never token/key material |
+| `GET /admin/pool` | Account pool data (aliases, dirs, cooldowns, quota, auth state) |
+| `POST /admin/pool/auth/begin` | `{alias?}` → paste-URL login flow state (`phase`/`url`/`mode`) |
+| `GET /admin/pool/auth/status` | Current flow state |
+| `GET /admin/pool/auth/qr` | PNG of the flow URL (`Cache-Control: no-store`); 404 unless `phase === 'waiting'` |
+| `POST /admin/pool/auth/complete` | `{code}` — the full callback URL or a bare code |
+| `POST /admin/pool/auth/cancel` | Abort the flow |
+| `PATCH`/`DELETE /admin/pool/accounts/{id}` | Alias / enable / proxy changes · remove the account |
+| `POST /admin/pool/accounts/{id}/clear-cooldown` · `/refresh-quota` | Manual pool maintenance |
+| `POST /admin/pool/quota/refresh` · `/admin/pool/mode` · `/admin/pool/reorder` | Pool-wide refresh, selection mode, sticky order |
+| `GET/POST/PATCH/DELETE /admin/keys` | Key lifecycle — `POST` returns the `sk-agy-` plaintext **exactly once**; it is never logged |
+| `GET /admin/usage` · `/admin/usage/summary` | Ledger query (`keyId`,`model`,`family`,`from`,`to`,`limit`≤500,`offset`) and today's totals |
+
+Usage accounting: one ledger row per actual agy spawn, keyed by the caller's `x-request-id`
+header (or the request id) — replaying the same id does not double-count. Per-key day
+budgets and RPM limits are enforced pre-engine; a rejected request never reaches agy and
+never books a row.
+
 ## Configuration
 
 Layering: `AGY_PROXY_*` environment variables > `~/.agy-proxy/gateway/runtime-overrides.json`
@@ -74,7 +102,7 @@ Layering: `AGY_PROXY_*` environment variables > `~/.agy-proxy/gateway/runtime-ov
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `AGY_PROXY_API_KEY` | *(unset)* | Static bearer key for `/v1/*`. Unset/empty = auth disabled (a warning is logged at boot). Environment-only by design — a plaintext key never rests in the overrides file. Accepted as `Authorization: Bearer` or `x-api-key`. |
+| `AGY_PROXY_API_KEY` | *(unset)* | Bootstrap root key for `/v1/*`. Unset/empty = auth disabled (a warning is logged at boot). Environment-only by design — a plaintext key never rests in the overrides file. Accepted as `Authorization: Bearer` or `x-api-key`. Managed keys (day budgets, RPM limits) live in SQLite and are created via `POST /admin/keys`; the root key itself is unlimited and keyless. |
 | `AGY_PROXY_PORT` | `8080` | HTTP listen port. |
 | `AGY_PROXY_HOST` | `0.0.0.0` | Bind address; set `127.0.0.1` when a same-host reverse proxy fronts the gateway. |
 | `AGY_PROXY_LOG_LEVEL` | `info` | pino log level (`AGY_PROXY_LOG_LEVEL` is read by the logger layer). |
@@ -91,6 +119,13 @@ Layering: `AGY_PROXY_*` environment variables > `~/.agy-proxy/gateway/runtime-ov
 | `AGY_PROXY_SSE_HEARTBEAT_MS` | `60000` | Idle SSE heartbeat interval; `0` disables heartbeats. |
 | `AGY_PROXY_WORKSPACE_ROOT` | `<dataDir>/workspace` | Workspace agy tools operate in. |
 | `AGY_PROXY_CONVERSATIONS_DIR` | *(agy default)* | Override for agy conversation discovery. |
+| `AGY_PROXY_DB_PATH` | `<dataDir>/agy-proxy.db` | SQLite file for API keys, the usage ledger and admin sessions. WAL mode. |
+| `AGY_PROXY_ADMIN_SESSION_TTL_MS` | `604800000` (7d) | Admin session cookie lifetime (clamped ≥ 60s). |
+| `AGY_PROXY_ADMIN_ALLOW_CIDR` | *(empty = any)* | CIDR allowlist gating every `/admin/*` route, re-read per request. Comma-separated; IPv4 (v6-mapped forms normalized). Empty allows all — always narrow this on a VPS. |
+| `AGY_PROXY_ADMIN_PASSWORD` | *(generated)* | Admin password; env wins over the stored hash and re-hashes (argon2id) at boot. Unset + no stored hash → a random password is generated and printed exactly once. |
+| `AGY_PROXY_TRUSTED_PROXIES` | *(empty)* | Comma-separated proxy IPs/CIDRs; when the client IP is in this set, `X-Forwarded-For` decides the admin-CIDR client address. |
+| `AGY_PROXY_QUOTA_POLL_INTERVAL_MS` | `900000` (15min) | Background per-account quota poll interval (clamped ≥ 60s). |
+| `AGY_PROXY_LOG_RETENTION_DAYS` | `7` | Account-pool auth-log retention before the boot sweep prunes. |
 
 Authorization headers and cookies are never written to logs (pino redaction + metadata-only
 log sites). To verify: send a request with a fake key, then grep the log output for the key.
