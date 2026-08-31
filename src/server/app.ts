@@ -15,7 +15,8 @@ import type { AgyEngine } from '../host/engine.ts'
 import type { StreamChunk, TokenUsage } from '../host/stream-types.ts'
 import type { GatewayConfig } from '../common/types.ts'
 import { redactLine } from '../host/diagnostics.ts'
-import { buildAuthHook } from './auth.ts'
+import { buildAuthHook, requestKey } from './auth.ts'
+import { registerAdminApi, type AdminDeps } from './admin-api.ts'
 import {
   GatewayHttpError,
   engineFailureToHttp,
@@ -47,6 +48,8 @@ import {
 } from './anthropic-adapter.ts'
 import { engineFailureToAnthropic } from './errors.ts'
 import { registerModelRoutes } from './models-routes.ts'
+import type { KeyStore } from './key-store.ts'
+import type { UsageLedger } from './usage-ledger.ts'
 
 import type { ModelCatalog } from '../host/models.ts'
 
@@ -56,6 +59,10 @@ export interface ServerDeps {
   /** Model catalog for the OA8 model pre-validation (advisory when fallback). */
   catalog: ModelCatalog
   log: PinoLogger
+  /** M3 optional subsystems; absent → M2 behavior (env key only, no /admin, no ledger). */
+  keys?: KeyStore
+  ledger?: UsageLedger
+  admin?: AdminDeps
 }
 
 export interface BuiltServer {
@@ -74,6 +81,39 @@ export interface BuiltServer {
 function stagedImageReader(meta: { imageBytes: Map<string, Uint8Array> }): NonNullable<EngineCall['readImage']> | undefined {
   if (meta.imageBytes.size === 0) return undefined
   return (ref) => Promise.resolve(meta.imageBytes.get(ref.attachmentId) ?? null)
+}
+
+/**
+ * Merge the server-side observability meta into an outgoing EngineCall: the
+ * ledger request id (client x-request-id wins — it is the replay-idempotency
+ * key, DoD ⑥), the authenticated key id (null = bootstrap root key), and the
+ * protocol surface. The enriched settle-time onRun echoes it back.
+ */
+function withCallMeta(
+  request: Pick<import('fastify').FastifyRequest, 'headers' | 'id'>,
+  call: EngineCall,
+  protocol: 'openai' | 'anthropic',
+  readImage?: EngineCall['readImage'],
+): EngineCall {
+  const hdr = request.headers['x-request-id']
+  return {
+    ...call,
+    ...(readImage !== undefined ? { readImage } : {}),
+    meta: {
+      reqId: typeof hdr === 'string' && hdr.trim() !== '' ? hdr.trim() : request.id,
+      keyId: requestKey(request as import('fastify').FastifyRequest)?.id ?? null,
+      protocol,
+    },
+  }
+}
+
+/**
+ * Retry-After headers for engine failures that carry one (POOL_EXHAUSTED's
+ * EngineError.retryAfterSec). SSE legs ignore it — by then the headers are
+ * already sent and the countdown text rides the error payload itself.
+ */
+function retryHeaders(retryAfterSec?: number): Record<string, string> | undefined {
+  return retryAfterSec !== undefined ? { 'retry-after': String(Math.max(1, Math.ceil(retryAfterSec))) } : undefined
 }
 
 // Permissive on purpose: OpenAI-compatible gateways in the wild accept extra
@@ -98,10 +138,20 @@ const chatRequestSchema = {
 }
 
 export function buildServer(deps: ServerDeps): BuiltServer {
+  const cfg0 = deps.getConfig()
+  // TRUSTED_PROXIES → real client IP for the admin CIDR allowlist (charter
+  // §10 transport row). An empty list keeps inject()/local behavior intact.
+  const trusted = new Set(
+    cfg0.trustedProxies
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s !== ''),
+  )
   const app = Fastify({
     loggerInstance: deps.log,
     bodyLimit: 32 * 1024 * 1024,
     genReqId: () => randomUUID(),
+    ...(trusted.size > 0 ? { trustProxy: (addr: string) => trusted.has(addr) } : {}),
   })
 
   const inFlight = new InFlightTracker()
@@ -109,7 +159,7 @@ export function buildServer(deps: ServerDeps): BuiltServer {
 
   app.setErrorHandler((err: unknown, request, reply) => {
     if (err instanceof GatewayHttpError) {
-      void reply.code(err.statusCode).send(err.body)
+      void reply.code(err.statusCode).headers(err.headers ?? {}).send(err.body)
       return
     }
     // TypeBox/Fastify validation and malformed-JSON bodies.
@@ -166,11 +216,11 @@ export function buildServer(deps: ServerDeps): BuiltServer {
 
     try {
       if (meta.stream === true) {
-        await streamOpenAiChat({ deps, request, reply, call: { ...call, ...(readImage !== undefined ? { readImage } : {}) }, meta, abort, inFlight })
+        await streamOpenAiChat({ deps, request, reply, call: withCallMeta(request, call, 'openai', readImage), meta, abort, inFlight })
         return
       }
       const chunks: StreamChunk[] = []
-      for await (const ch of deps.engine.stream({ ...call, ...(readImage !== undefined ? { readImage } : {}), signal: abort.signal })) {
+      for await (const ch of deps.engine.stream(withCallMeta(request, call, 'openai', readImage))) {
         chunks.push(ch)
       }
       const collected = collectChunks(chunks)
@@ -200,7 +250,7 @@ export function buildServer(deps: ServerDeps): BuiltServer {
       if (err instanceof GatewayHttpError) throw err
       if (err instanceof Error && err.name === 'EngineError') {
         const code = (err as { code?: string }).code ?? 'AGY_ERROR'
-        throw engineFailureToHttp(redactLine(err.message), code)
+        throw engineFailureToHttp(redactLine(err.message), code, retryHeaders((err as { retryAfterSec?: number }).retryAfterSec))
       }
       throw err
     } finally {
@@ -244,18 +294,18 @@ export function buildServer(deps: ServerDeps): BuiltServer {
 
     try {
       if (meta.stream === true) {
-        await streamAnthropicMessages({ deps, request, reply, call: { ...call, ...(readImage !== undefined ? { readImage } : {}) }, meta, abort, inFlight })
+        await streamAnthropicMessages({ deps, request, reply, call: withCallMeta(request, call, 'anthropic', readImage), meta, abort, inFlight })
         return
       }
       const chunks: StreamChunk[] = []
-      for await (const ch of deps.engine.stream({ ...call, ...(readImage !== undefined ? { readImage } : {}), signal: abort.signal })) {
+      for await (const ch of deps.engine.stream(withCallMeta(request, call, 'anthropic', readImage))) {
         chunks.push(ch)
       }
       const collected = collectAnthropicChunks(chunks)
       const finish = collected.finish
       if (finish !== null && (finish.kind === 'error' || finish.kind === 'aborted')) {
         const mapped = engineFailureToAnthropic(finish.failure.message, finish.failure.code)
-        throw new GatewayHttpError(mapped.statusCode, mapped.body)
+        throw new GatewayHttpError(mapped.statusCode, mapped.body, mapped.headers)
       }
       const body = assembleMessage({
         id: newMessageId(),
@@ -278,8 +328,8 @@ export function buildServer(deps: ServerDeps): BuiltServer {
       if (err instanceof GatewayHttpError) throw err
       if (err instanceof Error && err.name === 'EngineError') {
         const code = (err as { code?: string }).code ?? 'AGY_ERROR'
-        const mapped = engineFailureToAnthropic(redactLine(err.message), code)
-        throw new GatewayHttpError(mapped.statusCode, mapped.body)
+        const mapped = engineFailureToAnthropic(redactLine(err.message), code, retryHeaders((err as { retryAfterSec?: number }).retryAfterSec))
+        throw new GatewayHttpError(mapped.statusCode, mapped.body, mapped.headers)
       }
       throw err
     } finally {
@@ -313,6 +363,12 @@ export function buildServer(deps: ServerDeps): BuiltServer {
   })
 
   registerModelRoutes(app, { getConfig: deps.getConfig, catalog: deps.catalog, authHook: authHook as never })
+
+  // M3 admin surface (JSON): mounted only when the admin subsystem is wired
+  // (index.ts). Tests/goldens without deps.admin keep the M2 route set.
+  if (deps.admin !== undefined) {
+    registerAdminApi(app as unknown as Parameters<typeof registerAdminApi>[0], deps.admin)
+  }
 
   return { app, inFlight }
 }
