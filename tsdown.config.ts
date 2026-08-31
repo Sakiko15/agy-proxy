@@ -13,5 +13,8 @@ export default defineConfig([
     dts: true,
     clean: true,
     fixedExtension: false,
+    // Native modules ship .node binaries — they must stay external (require'd
+    // from node_modules at runtime), never be inlined by rolldown.
+    external: ["better-sqlite3", "@node-rs/argon2"],
   },
 ]);

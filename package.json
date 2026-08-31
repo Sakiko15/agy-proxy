@@ -27,7 +27,9 @@
     "node": ">=24.0.0"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^24.13.3",
+    "@types/qrcode": "^1.5.6",
     "tsdown": "^0.22.14",
     "tsx": "^4.23.13",
     "typescript": "^5.9.3",
@@ -38,9 +40,14 @@
     "url": "git+https://github.com/amlyczz/agy-proxy.git"
   },
   "dependencies": {
+    "@node-rs/argon2": "^2.2.0",
     "@sinclair/typebox": "^0.34.52",
+    "better-sqlite3": "^13.0.3",
     "fastify": "^5.12.1",
+    "p-queue": "^9.3.3",
     "pino": "^10.3.1",
+    "qrcode": "^1.5.4",
+    "rate-limiter-flexible": "^11.2.0",
     "undici": "^7.29.0"
   }
 }
