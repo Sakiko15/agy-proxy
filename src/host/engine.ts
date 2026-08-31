@@ -86,6 +86,8 @@ export interface EngineCall {
   sessionKey?: string
   /** JSON schema enforcing the final result (--json-schema). */
   jsonSchema?: unknown
+  /** Per-call image byte reader; wins over deps.readImage (request-scoped). */
+  readImage?: (ref: ImageRefLike) => Promise<Uint8Array | null>
 }
 
 export interface EngineDeps {
@@ -110,6 +112,10 @@ export interface EngineDeps {
   onRun?: (info: { ok: boolean; code: string; durationMs: number; model: string }) => void
   /** Reads image bytes from protocol-layer attachment storage. */
   readImage?: (ref: ImageRefLike) => Promise<Uint8Array | null>
+  /**
+   * Call-level override for readImage (see EngineCall.readImage): protocol
+   * adapters stage request-scoped byte buffers without shared mutable state.
+   */
   /** Called with each run's parser so the host keeps the last stdout ring for the doctor report. */
   onParser?: (parser: StreamJsonParser) => void
 }
@@ -414,23 +420,28 @@ export class AgyEngine {
         })
       }
     }
-    if (imageRefs.length > 0 && this.deps.readImage) {
-      const dir = cfg.mediaDir !== '' ? cfg.mediaDir : defaultMediaDir(stateDir())
-      const key = (sessionKey !== '' ? sessionKey.replace(/[^a-zA-Z0-9_-]+/g, '_') : 'anon') + '-' + messages.length
-      const res = await stageImages({
-        dir,
-        key,
-        images: imageRefs,
-        readImage: this.deps.readImage,
-        maxImages: cfg.mediaMaxImages,
-        maxBytes: cfg.mediaMaxBytes,
-      })
-      if (res.promptSuffix !== '') {
-        prompt = prompt === ''
-          ? (res.promptSuffix + '\n\n[Please inspect the attached image(s) using view_file and assist the user.]')
-          : (prompt + '\n\n' + res.promptSuffix)
+    if (imageRefs.length > 0) {
+      // Call-level reader wins: protocol adapters stage request-scoped
+      // byte buffers (data: URLs) without shared mutable state.
+      const readImage = call.readImage ?? this.deps.readImage
+      if (readImage) {
+        const dir = cfg.mediaDir !== '' ? cfg.mediaDir : defaultMediaDir(stateDir())
+        const key = (sessionKey !== '' ? sessionKey.replace(/[^a-zA-Z0-9_-]+/g, '_') : 'anon') + '-' + messages.length
+        const res = await stageImages({
+          dir,
+          key,
+          images: imageRefs,
+          readImage,
+          maxImages: cfg.mediaMaxImages,
+          maxBytes: cfg.mediaMaxBytes,
+        })
+        if (res.promptSuffix !== '') {
+          prompt = prompt === ''
+            ? (res.promptSuffix + '\n\n[Please inspect the attached image(s) using view_file and assist the user.]')
+            : (prompt + '\n\n' + res.promptSuffix)
+        }
+        if (res.staged.length > 0) stagedDirs = [dir]
       }
-      if (res.staged.length > 0) stagedDirs = [dir]
     }
     if (prompt.trim() === '') {
       throw new EngineError('request carries no user text or images to forward to agy', Err.AGY_ERROR)

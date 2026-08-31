@@ -175,7 +175,7 @@ export function classifyEvent(obj: unknown, seq: number): AgyEvent | undefined {
     const inner = r && typeof r === 'object' ? r : {}
     const cid = pick(inner, ['conversation_id', 'conversationId'])
     const status = pick(inner, ['status'])
-    const response = pick(inner, ['response', 'text', 'content'])
+    const response = pick(inner, ['structured_output', 'response', 'text', 'content'])
     const error = pick(inner, ['error', 'error_message', 'errorMessage'])
     const ok = status === undefined ? !error : String(status).toUpperCase() !== 'ERROR'
     return {
