@@ -25,8 +25,10 @@
 //                   short text + result (SSE heartbeat verification)
 //
 // FAKE_AGY_EVENTS_FILE (any mode): when set, every line of that file is
-// written to stdout verbatim and the process exits 0 — the golden-case
-// runner replays recorded event sequences through this hook.
+// written to stdout verbatim — the golden-case runner replays recorded event
+// sequences through this hook. FAKE_AGY_EXIT_CODE (default 0) sets the exit
+// code of the replay, so upstream-failure goldens (oa8b) reproduce the real
+// silent-failure shape: ERROR envelope on stdout + exit 1 + empty stderr.
 //
 // Records its argv (JSON, one per line) to FAKE_AGY_ARGS_FILE when set;
 // records cwd to FAKE_AGY_CWD_FILE when set.
@@ -109,7 +111,7 @@ if (process.env.FAKE_AGY_EVENTS_FILE) {
     const lines = readFileSync(process.env.FAKE_AGY_EVENTS_FILE, 'utf8').split('\n').filter((l) => l.trim() !== '')
     for (const line of lines) process.stdout.write(line + '\n')
   } catch {}
-  process.exit(0)
+  process.exit(Number(process.env.FAKE_AGY_EXIT_CODE ?? '0'))
 }
 
 if (mode === 'auth') {
