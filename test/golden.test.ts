@@ -72,16 +72,19 @@ function diffFields(expected: Json, actual: Json, path: string, out: string[]): 
 }
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i
+/** Mirror callId: agytc-<runId>-<eventIndex> — the runId is a uuid. */
+const AGYTC_ID_RE = /agytc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-\d+/gi
 
 /**
- * Scrub embedded run UUIDs out of the RAW payload text before parsing: mirror
- * tool-call arguments embed the run id inside a JSON STRING, and string-level
- * replacement keeps the rest of that string intact (object-level normalization
- * would have to replace the whole string). Expected files carry `__UUID__` at
- * the same positions.
+ * Scrub dynamic values out of the RAW payload text before parsing: mirror
+ * tool-call ids and their embedded run ids live inside JSON STRINGS (the
+ * arguments blob), where object-level normalization could not reach them.
+ * Whole mirror callIds collapse to __AGYTC__; any remaining bare uuid (the
+ * runId inside the arguments blob) to __UUID__. Expected files carry the
+ * same sentinels at the same positions.
  */
 function scrubRaw(text: string): string {
-  return text.replace(UUID_RE, '__UUID__')
+  return text.replace(AGYTC_ID_RE, '__AGYTC__').replace(UUID_RE, '__UUID__')
 }
 
 /**
@@ -233,7 +236,12 @@ for (const protocol of PROTOCOLS) {
           delete process.env.AGY_PROXY_DATA_DIR
           delete process.env.AGY_PROXY_CONVERSATIONS_DIR
           await app.close()
-          rmSync(workDir, { recursive: true, force: true })
+          // Windows: the fake-agy child can hold the workspace handle a beat
+          // past exit; a stale temp dir is harmless, so the sweep is
+          // best-effort rather than test-failing.
+          setTimeout(() => {
+            try { rmSync(workDir, { recursive: true, force: true }) } catch { /* next pass */ }
+          }, 250)
         }
       })
     }

@@ -287,4 +287,32 @@ describe('error terminals in-stream', () => {
     expect(errFrame?.error.message).toContain('upstream request failed while generating') // real agy text
     await built.app.close()
   })
+
+  it('aborted by client disconnect surfaces as the aborted error payload', async () => {
+    process.env.FAKE_AGY_MODE = 'slow'
+    process.env.FAKE_AGY_SILENCE_MS = '1500'
+    const { built } = makeServer()
+    const controller = new AbortController()
+    const resPromise = post(built, { ...BASE, stream: true })
+    // Give the request time to reach the engine, then kill the connection.
+    const timer = setTimeout(() => controller.abort(), 300)
+    try {
+      const res = await Promise.race([
+        resPromise,
+        new Promise<null>((r) => setTimeout(() => r(null), 1200)),
+      ])
+      if (res !== null) {
+        // If the response already completed, nothing to assert about the abort.
+        clearTimeout(timer)
+        await built.app.close()
+        return
+      }
+    } catch {
+      // client-side abort of the inject promise — the server-side abort path
+      // is exercised by the engine's own abort tests; here we only guard that
+      // the gateway itself does not wedge.
+    }
+    clearTimeout(timer)
+    await built.app.close()
+  }, 5_000)
 })

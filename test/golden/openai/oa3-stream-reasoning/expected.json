@@ -1,0 +1,14 @@
+{
+  "_provenance": "test/golden/openai/oa3-stream-reasoning/PROVENANCE.md — real-shape run (thinking-only turn + streamed text). The leading 80-token annotation is the thinking-only turn (annotated BEFORE any text); the trailing 15-token one rides the text step's DONE tail (the mapper's deferral rule). Usage is the per-call step sample (900/60/200/15) — NOT the cumulative result envelope. Sentinels: __ID__, created → 0.",
+  "sse": [
+    { "id": "__ID__", "object": "chat.completion.chunk", "created": 0, "model": "gemini-3.7-flash", "choices": [{ "index": 0, "delta": { "role": "assistant", "content": "" }, "finish_reason": null }] },
+    { "id": "__ID__", "object": "chat.completion.chunk", "created": 0, "model": "gemini-3.7-flash", "choices": [{ "index": 0, "delta": { "reasoning_content": "[agy thinking turn · 80 thinking tokens]\n" }, "finish_reason": null }] },
+    { "id": "__ID__", "object": "chat.completion.chunk", "created": 0, "model": "gemini-3.7-flash", "choices": [{ "index": 0, "delta": { "content": "There are " }, "finish_reason": null }] },
+    { "id": "__ID__", "object": "chat.completion.chunk", "created": 0, "model": "gemini-3.7-flash", "choices": [{ "index": 0, "delta": { "content": "2 files, " }, "finish_reason": null }] },
+    { "id": "__ID__", "object": "chat.completion.chunk", "created": 0, "model": "gemini-3.7-flash", "choices": [{ "index": 0, "delta": { "content": "6 words total." }, "finish_reason": null }] },
+    { "id": "__ID__", "object": "chat.completion.chunk", "created": 0, "model": "gemini-3.7-flash", "choices": [{ "index": 0, "delta": { "reasoning_content": "[agy thinking turn · 15 thinking tokens]\n" }, "finish_reason": null }] },
+    { "id": "__ID__", "object": "chat.completion.chunk", "created": 0, "model": "gemini-3.7-flash", "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] },
+    { "id": "__ID__", "object": "chat.completion.chunk", "created": 0, "model": "gemini-3.7-flash", "choices": [], "usage": { "prompt_tokens": 900, "completion_tokens": 60, "total_tokens": 960, "prompt_tokens_details": { "cached_tokens": 200 }, "completion_tokens_details": { "reasoning_tokens": 15 } } },
+    "[DONE]"
+  ]
+}
