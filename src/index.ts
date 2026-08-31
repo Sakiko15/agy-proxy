@@ -116,7 +116,7 @@ async function main(): Promise<void> {
     onRun: (i) => log.info({ ...i }, 'agy run finished'),
   })
 
-  const built = buildServer({ getConfig, engine, log })
+  const built = buildServer({ getConfig, engine, catalog, log })
   void catalog.refreshIfNeeded().catch(() => undefined)
   await built.app.listen({ port: getConfig().port, host: getConfig().host })
   log.info({ port: getConfig().port, host: getConfig().host }, 'agy-proxy listening')

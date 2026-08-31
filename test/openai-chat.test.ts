@@ -15,6 +15,8 @@ import { RunRegistry } from '../src/host/recording.ts'
 import { buildServer } from '../src/server/app.ts'
 import { buildLogger } from '../src/server/logger.ts'
 import { GatewaySemaphore } from '../src/server/semaphore.ts'
+import { GatewayHttpError } from '../src/server/errors.ts'
+import type { Catalog } from '../src/host/models.ts'
 import {
   assembleCompletion,
   collectChunks,
@@ -44,8 +46,8 @@ function makeServer(cfgOverrides: Partial<GatewayConfig> = {}, deps: Partial<Eng
     runs: new RunRegistry(),
     ...deps,
   })
-  const built = buildServer({ getConfig: () => cfg, engine, log: buildLogger({ AGY_PROXY_LOG_LEVEL: 'warn' }) })
-  return { built, argsFile }
+  const built = buildServer({ getConfig: () => cfg, engine, catalog, log: buildLogger({ AGY_PROXY_LOG_LEVEL: 'warn' }) })
+  return { built, argsFile, catalog }
 }
 
 function post(built: ReturnType<typeof makeServer>['built'], payload: unknown, headers: Record<string, string> = {}) {
@@ -108,111 +110,158 @@ describe('mapEffort', () => {
 
 describe('mapChatRequest', () => {
   const cfg = defaultConfig()
+  const map = (body: unknown, c = cfg) => mapChatRequest(body, c)
+  const mapThrows = (body: unknown, re: RegExp, c = cfg) =>
+    expect(mapChatRequest(body, c)).rejects.toThrow(re)
 
-  it('maps a basic text request', () => {
-    const { call, meta } = mapChatRequest(BASE, cfg)
+  it('maps a basic text request', async () => {
+    const { call, meta } = await map(BASE)
     expect(call.model).toBe('gemini-3.7-flash')
     expect(call.messages).toEqual([{ role: 'user', text: 'hi' }])
     expect(meta.warnings).toEqual([])
   })
 
-  it('joins system and developer messages in arrival order', () => {
-    const { call } = mapChatRequest({
+  it('joins system and developer messages in arrival order', async () => {
+    const { call } = await map({
       ...BASE,
       messages: [
         { role: 'system', content: 'be brief' },
         { role: 'developer', content: 'no slang' },
         { role: 'user', content: 'hi' },
       ],
-    }, cfg)
+    })
     expect(call.system).toBe('be brief\n\nno slang')
     expect(call.messages).toEqual([{ role: 'user', text: 'hi' }])
   })
 
-  it('joins text parts; rejects image and audio parts', () => {
-    const { call } = mapChatRequest({
+  it('joins text parts; stages data: images; rejects audio and http URLs', async () => {
+    const { call } = await map({
       ...BASE,
       messages: [{ role: 'user', content: [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }] }],
-    }, cfg)
+    })
     expect(call.messages[0]?.text).toBe('ab')
-    expect(() => mapChatRequest({
+    // 1x1 PNG (data: URL) stages as an image ref with real bytes.
+    const pngB64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+    const withImg = await map({
       ...BASE,
-      messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,x' } }] }],
-    }, cfg)).toThrow(/M2/)
-    expect(() => mapChatRequest({
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'look' }, { type: 'image_url', image_url: { url: 'data:image/png;base64,' + pngB64 } }] }],
+    })
+    expect(withImg.call.messages[0]?.images).toHaveLength(1)
+    expect(withImg.call.messages[0]?.images?.[0]?.mediaType).toBe('image/png')
+    expect(withImg.call.messages[0]?.images?.[0]?.bytes).toBeGreaterThan(0)
+    expect(withImg.meta.imageBytes.size).toBe(1)
+    mapThrows({
+      ...BASE,
+      messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/tiff;base64,AA' } }] }],
+    }, /unsupported image media type/)
+    mapThrows({
+      ...BASE,
+      messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'https://example.com/x.png' } }] }],
+    }, /data: URL/)
+    mapThrows({
       ...BASE,
       messages: [{ role: 'user', content: [{ type: 'input_audio', input_audio: { data: 'x', format: 'wav' } }] }],
-    }, cfg)).toThrow(/audio/)
+    }, /audio/)
   })
 
-  it('assistant turns become foreign digest turns; assistant tool_calls rejected', () => {
-    const { call } = mapChatRequest({
+  it('assistant turns become foreign digest turns; assistant tool_calls kept as context', async () => {
+    const { call } = await map({
       ...BASE,
       messages: [
         { role: 'user', content: 'q' },
         { role: 'assistant', content: 'a' },
         { role: 'user', content: 'next' },
       ],
-    }, cfg)
+    })
     expect(call.messages[1]).toEqual({ role: 'assistant', text: 'a' })
-    expect(() => mapChatRequest({
+    // M2: an assistant turn carrying tool_calls is accepted as history
+    // context (the tool_calls array itself is not forwarded — only text).
+    const withTc = await map({
       ...BASE,
-      messages: [{ role: 'assistant', content: null, tool_calls: [{ id: 'c', type: 'function', function: { name: 'f', arguments: '{}' } }] }],
-    }, cfg)).toThrow(/M2/)
+      messages: [
+        { role: 'assistant', content: null, tool_calls: [{ id: 'c', type: 'function', function: { name: 'f', arguments: '{}' } }] },
+        { role: 'user', content: 'go on' },
+      ],
+    })
+    expect(withTc.call.messages[0]).toEqual({ role: 'assistant', text: '' })
   })
 
-  it('accepts tool results only with our agytc- cursor', () => {
-    const { call } = mapChatRequest({
+  it('accepts tool results only with our agytc- cursor', async () => {
+    const { call } = await map({
       ...BASE,
       messages: [
         { role: 'user', content: 'q' },
         { role: 'tool', content: 'out', tool_call_id: 'agytc-run1-3' },
       ],
-    }, cfg)
+    })
     expect(call.messages[1]).toEqual({ role: 'tool', text: 'out', toolCallId: 'agytc-run1-3' })
-    expect(() => mapChatRequest({
+    mapThrows({
       ...BASE,
       messages: [{ role: 'tool', content: 'out', tool_call_id: 'call_abc123' }],
-    }, cfg)).toThrow(/agytc-/)
-    expect(() => mapChatRequest({
+    }, /agytc-/)
+    mapThrows({
       ...BASE,
       messages: [{ role: 'tool', content: 'out' }],
-    }, cfg)).toThrow(/agytc-/)
+    }, /agytc-/)
   })
 
-  it('rejects tools, legacy functions, n>1, and stream:true with explicit 400s', () => {
-    expect(() => mapChatRequest({ ...BASE, tools: [{ type: 'function', function: { name: 'f', parameters: {} } }] }, cfg)).toThrow(/M2/)
-    expect(() => mapChatRequest({ ...BASE, tool_choice: 'auto' }, cfg)).toThrow(/M2/)
-    expect(() => mapChatRequest({ ...BASE, functions: [] }, cfg)).toThrow(/legacy functions/)
-    expect(() => mapChatRequest({ ...BASE, n: 2 }, cfg)).toThrow(/n > 1/)
-    expect(() => mapChatRequest({ ...BASE, stream: true }, cfg)).toThrow(/M2/)
+  it('accepts tools/tool_choice with a warning; rejects legacy functions; stream parses', async () => {
+    const withTools = await map({ ...BASE, tools: [{ type: 'function', function: { name: 'f', parameters: {} } }] })
+    expect(withTools.meta.warnings.some((w) => w.includes('not executed'))).toBe(true)
+    const withChoice = await map({ ...BASE, tool_choice: 'auto' })
+    expect(withChoice.meta.warnings.some((w) => w.includes('tool_choice'))).toBe(true)
+    mapThrows({ ...BASE, functions: [] }, /legacy functions/)
+    mapThrows({ ...BASE, function_call: 'auto' }, /legacy functions/)
+    mapThrows({ ...BASE, n: 2 }, /n > 1/)
+    const streamed = await map({ ...BASE, stream: true })
+    expect(streamed.meta.stream).toBe(true)
   })
 
-  it('validates stop and max-token fields; warns on deprecations', () => {
-    const { call: _c, meta } = mapChatRequest({
+  it('validates stop and max-token fields; warns on deprecations', async () => {
+    const { call: _c, meta } = await map({
       ...BASE,
       max_tokens: 100,
       temperature: 0.7,
-    }, cfg)
+    })
     expect(meta.maxTokens).toBe(100)
     expect(meta.warnings.some((w) => w.includes('max_tokens is deprecated'))).toBe(true)
     expect(meta.warnings.some((w) => w.includes('temperature'))).toBe(true)
 
-    expect(() => mapChatRequest({ ...BASE, max_tokens: 0 }, cfg)).toThrow(/positive integer/)
-    expect(() => mapChatRequest({ ...BASE, max_completion_tokens: -1 }, cfg)).toThrow(/positive integer/)
-    expect(() => mapChatRequest({ ...BASE, stop: 'END' }, cfg)).not.toThrow()
-    expect(() => mapChatRequest({ ...BASE, stop: ['a', 'b', 'c', 'd', 'e'] }, cfg)).toThrow(/at most 4/)
-    expect(() => mapChatRequest({ ...BASE, stop: [''] }, cfg)).toThrow(/non-empty/)
+    mapThrows({ ...BASE, max_tokens: 0 }, /positive integer/)
+    mapThrows({ ...BASE, max_completion_tokens: -1 }, /positive integer/)
+    await expect(map({ ...BASE, stop: 'END' })).resolves.toBeTruthy()
+    mapThrows({ ...BASE, stop: ['a', 'b', 'c', 'd', 'e'] }, /at most 4/)
+    mapThrows({ ...BASE, stop: [''] }, /non-empty/)
   })
 
-  it('json_object injects a system instruction; json_schema passes through natively', () => {
-    const rf = mapChatRequest({ ...BASE, response_format: { type: 'json_object' } }, cfg)
+  it('json_object injects a system instruction; json_schema passes through natively', async () => {
+    const rf = await map({ ...BASE, response_format: { type: 'json_object' } })
     expect(rf.call.system).toContain('valid JSON')
     const schema = { type: 'object', properties: { a: { type: 'number' } }, required: ['a'] }
-    const rs = mapChatRequest({ ...BASE, response_format: { type: 'json_schema', json_schema: { name: 'r', schema } } }, cfg)
+    const rs = await map({ ...BASE, response_format: { type: 'json_schema', json_schema: { name: 'r', schema } } })
     expect(rs.call.jsonSchema).toEqual(schema)
-    expect(() => mapChatRequest({ ...BASE, response_format: { type: 'yaml' } }, cfg)).toThrow(/response_format/)
-    expect(() => mapChatRequest({ ...BASE, response_format: { type: 'json_schema', json_schema: {} } }, cfg)).toThrow(/schema/)
+    mapThrows({ ...BASE, response_format: { type: 'yaml' } }, /response_format/)
+    mapThrows({ ...BASE, response_format: { type: 'json_schema', json_schema: {} } }, /schema/)
+  })
+
+  it('OA8: unknown model 404s against a discovered catalog; fallback stays advisory', async () => {
+    const discovered: Catalog = {
+      source: 'discovered',
+      models: [{ id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', efforts: ['low', 'medium', 'high'] }],
+      discoveredAt: Date.now(),
+    }
+    await expect(mapChatRequest({ ...BASE, model: 'no-such-model' }, cfg, discovered)).rejects.toMatchObject({ statusCode: 404 })
+    // Known ids (and alias-resolvable ones) pass the pre-check.
+    await expect(mapChatRequest(BASE, cfg, discovered)).resolves.toBeTruthy()
+    await expect(mapChatRequest(BASE, cfg)).resolves.toBeTruthy() // fallback catalog: advisory, no pre-check
+  })
+
+  it('stream_options.include_usage parses; invalid shape 400s', async () => {
+    const ok = await map({ ...BASE, stream: true, stream_options: { include_usage: true } })
+    expect(ok.meta.includeUsage).toBe(true)
+    const off = await map({ ...BASE, stream_options: {} })
+    expect(off.meta.includeUsage).toBe(false)
+    mapThrows({ ...BASE, stream_options: { include_usage: 'yes' } }, /stream_options/)
   })
 })
 
@@ -404,13 +453,30 @@ describe('POST /v1/chat/completions end-to-end (fake agy)', () => {
       { model: 'm', messages: [] },
       { messages: [{ role: 'user', content: 'hi' }] },
       { model: 'm', messages: [{ role: 'user', content: 'hi' }], n: 3 },
-      { model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: true },
+      { model: 'm', messages: [{ role: 'user', content: 'hi' }], functions: [] },
       { model: 'm', messages: [{ role: 'user', content: 'hi' }], reasoning_effort: 'ultra' },
     ]) {
       const res = await post(built, payload)
       expect(res.statusCode).toBe(400)
       expect(res.json().error.type).toBe('invalid_request_error')
     }
+    await built.app.close()
+  })
+
+  it('stream:true now returns an SSE response (M2)', async () => {
+    process.env.FAKE_AGY_MODE = 'ok'
+    const { built } = makeServer()
+    const res = await post(built, { ...BASE, stream: true, stream_options: { include_usage: true } })
+    expect(res.statusCode).toBe(200)
+    expect(res.headers['content-type']).toContain('text/event-stream')
+    const text = res.body
+    expect(text).toContain('"chat.completion.chunk"')
+    // fake-agy ok mode contains a completed tool step: the span cuts on it
+    // (mirror round trip) — expect the tool_calls finish + usage + [DONE].
+    expect(text).toContain('finish_reason":"tool_calls"')
+    expect(text).toContain('"choices":[]') // usage frame
+    expect(text).toContain('"id":"agytc-') // stable mirror call id
+    expect(text.trim().endsWith('data: [DONE]')).toBe(true)
     await built.app.close()
   })
 })

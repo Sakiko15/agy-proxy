@@ -7,6 +7,7 @@ import type { InjectOptions } from 'light-my-request'
 import { defaultConfig, type GatewayConfig } from '../src/common/types.ts'
 import { buildServer } from '../src/server/app.ts'
 import { buildLogger } from '../src/server/logger.ts'
+import { ModelCatalog } from '../src/host/models.ts'
 import { redactLine } from '../src/host/diagnostics.ts'
 import { GatewayHttpError, openAiError } from '../src/server/errors.ts'
 import type { AgyEngine } from '../src/host/engine.ts'
@@ -28,7 +29,8 @@ function stubEngine(overrides: Partial<AgyEngine> = {}): AgyEngine {
 function makeServer(overrides: Partial<GatewayConfig> = {}, engine: AgyEngine = stubEngine()) {
   const cfg: GatewayConfig = { ...defaultConfig(), ...overrides }
   const log = buildLogger({ AGY_PROXY_LOG_LEVEL: 'warn' })
-  const built = buildServer({ getConfig: () => cfg, engine, log })
+  const catalog = new ModelCatalog(async () => { throw new Error('no discovery in tests') }, cfg.fallbackModels, 300_000)
+  const built = buildServer({ getConfig: () => cfg, engine, catalog, log })
   return { built, cfg }
 }
 

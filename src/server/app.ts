@@ -12,7 +12,7 @@ import type { Logger as PinoLogger } from 'pino'
 /** Fastify instance bound to our concrete pino logger type (loggerInstance). */
 export type AppInstance = FastifyInstance<any, any, any, PinoLogger, any>
 import type { AgyEngine } from '../host/engine.ts'
-import type { StreamChunk } from '../host/stream-types.ts'
+import type { StreamChunk, TokenUsage } from '../host/stream-types.ts'
 import type { GatewayConfig } from '../common/types.ts'
 import { redactLine } from '../host/diagnostics.ts'
 import { buildAuthHook } from './auth.ts'
@@ -21,18 +21,28 @@ import {
   engineFailureToHttp,
   httpError,
   openAiError,
+  anthropicError,
+  isAnthropicPath,
 } from './errors.ts'
 import {
   assembleCompletion,
   collectChunks,
   mapChatRequest,
   newCompletionId,
+  openAiStreamFrames,
+  type RequestMeta,
 } from './openai-adapter.ts'
+import type { EngineCall } from '../host/engine.ts'
+import { SseWriter } from './sse.ts'
 import { InFlightTracker } from './shutdown.ts'
+
+import type { ModelCatalog } from '../host/models.ts'
 
 export interface ServerDeps {
   getConfig: () => GatewayConfig
   engine: AgyEngine
+  /** Model catalog for the OA8 model pre-validation (advisory when fallback). */
+  catalog: ModelCatalog
   log: PinoLogger
 }
 
@@ -70,6 +80,7 @@ export function buildServer(deps: ServerDeps): BuiltServer {
   })
 
   const inFlight = new InFlightTracker()
+  const authHook = buildAuthHook(deps)
 
   app.setErrorHandler((err: unknown, request, reply) => {
     if (err instanceof GatewayHttpError) {
@@ -81,29 +92,41 @@ export function buildServer(deps: ServerDeps): BuiltServer {
     const validation = err instanceof Error && 'validation' in err ? (err as { validation?: unknown }).validation : undefined
     if (validation !== undefined || status === 400 || status === 413) {
       const message = err instanceof Error ? err.message : String(err)
-      void reply
-        .code(status ?? 400)
-        .send(openAiError(message, 'invalid_request_error', 'invalid_request'))
+      if (isAnthropicPath(request.url)) {
+        void reply.code(status ?? 400).send(anthropicError('invalid_request_error', message))
+      } else {
+        void reply
+          .code(status ?? 400)
+          .send(openAiError(message, 'invalid_request_error', 'invalid_request'))
+      }
       return
     }
     const detail = redactLine(err instanceof Error ? err.message : String(err))
     request.log.error({ err: detail }, 'internal error')
-    void reply.code(500).send(openAiError('Internal server error: ' + detail, 'api_error', 'internal_error'))
+    if (isAnthropicPath(request.url)) {
+      void reply.code(500).send(anthropicError('api_error', 'Internal server error: ' + detail))
+    } else {
+      void reply.code(500).send(openAiError('Internal server error: ' + detail, 'api_error', 'internal_error'))
+    }
   })
 
-  app.setNotFoundHandler((_request, reply) => {
-    void reply.code(404).send(httpError(404, 'Not found.', 'invalid_request_error', 'not_found').body)
+  app.setNotFoundHandler((request, reply) => {
+    if (isAnthropicPath(request.url)) {
+      void reply.code(404).send(anthropicError('not_found_error', 'Not found.'))
+    } else {
+      void reply.code(404).send(httpError(404, 'Not found.', 'invalid_request_error', 'not_found').body)
+    }
   })
 
   app.get('/healthz', async () => ({ ok: true }))
 
-  app.post('/v1/chat/completions', { preHandler: buildAuthHook(deps), ...chatRequestSchema }, async (request, reply) => {
+  app.post('/v1/chat/completions', { preHandler: authHook, ...chatRequestSchema }, async (request, reply) => {
     const cfg = deps.getConfig()
     if (!cfg.enabled) {
       throw httpError(503, 'gateway is disabled by config (enabled=false)', 'api_error', 'gateway_disabled')
     }
 
-    const { call, meta } = mapChatRequest(request.body, cfg)
+    const { call, meta } = await mapChatRequest(request.body, cfg, deps.catalog.get())
     for (const w of meta.warnings) request.log.info({ warning: w }, 'request-mapping warning')
 
     const abort = new AbortController()
@@ -116,6 +139,10 @@ export function buildServer(deps: ServerDeps): BuiltServer {
     })
 
     try {
+      if (meta.stream === true) {
+        await streamOpenAiChat({ deps, request, reply, call, meta, abort, inFlight })
+        return
+      }
       const chunks: StreamChunk[] = []
       for await (const ch of deps.engine.stream({ ...call, signal: abort.signal })) {
         chunks.push(ch)
@@ -130,7 +157,8 @@ export function buildServer(deps: ServerDeps): BuiltServer {
         created: Math.floor(Date.now() / 1000),
         requestModel: call.model,
         collected,
-        stop: [],
+        stop: meta.stop,
+        ...(meta.maxTokens !== undefined ? { maxTokens: meta.maxTokens } : {}),
       })
       request.log.info(
         {
@@ -155,4 +183,85 @@ export function buildServer(deps: ServerDeps): BuiltServer {
   })
 
   return { app, inFlight }
+}
+
+/** SSE leg of POST /v1/chat/completions (OA2–OA4): hijack + direct frames. */
+async function streamOpenAiChat(args: {
+  deps: ServerDeps
+  request: import('fastify').FastifyRequest
+  reply: import('fastify').FastifyReply
+  call: EngineCall
+  meta: RequestMeta
+  abort: AbortController
+  inFlight: InFlightTracker
+}): Promise<void> {
+  const { deps, request, reply, call, meta, abort, inFlight } = args
+  const cfg = deps.getConfig()
+  const sse = new SseWriter(reply, {
+    heartbeatMs: cfg.sseHeartbeatMs,
+    keepalive: () => ': ping\n\n',
+  })
+  const id = newCompletionId()
+  const created = Math.floor(Date.now() / 1000)
+  const state = { firstSent: false, toolIndex: 0, sawToolThisSpan: false }
+  let usage: TokenUsage | undefined
+  let finishKind: string = 'stop'
+  try {
+    sse.open()
+    for await (const ch of deps.engine.stream({ ...call, signal: abort.signal })) {
+      if (ch.type === 'usage') {
+        usage = ch.usage
+        continue
+      }
+      if (ch.type === 'finish') finishKind = ch.reason.kind === 'max-tokens' ? 'max-tokens' : ch.reason.kind
+      if (ch.type === 'finish' && (ch.reason.kind === 'error' || ch.reason.kind === 'aborted')) {
+        const failure = engineFailureToHttp(ch.reason.failure.message, ch.reason.failure.code)
+        await sse.data(openAiError(failure.body.error.message, failure.body.error.type, failure.body.error.code))
+        await sse.data('[DONE]')
+        finishKind = ch.reason.kind
+        return
+      }
+      for (const frame of openAiStreamFrames({
+        id,
+        created,
+        model: call.model,
+        chunk: ch,
+        state,
+        includeUsage: meta.includeUsage,
+        usage,
+      })) {
+        await sse.data(frame)
+      }
+    }
+    request.log.info(
+      { model: call.model, promptTokens: usage?.inputTokens ?? 0, completionTokens: usage?.outputTokens ?? 0, finishKind },
+      'request complete',
+    )
+  } catch (err) {
+    // Mid-stream failures surface inside the SSE envelope per charter §4.3.
+    let message = 'Internal server error'
+    let type = 'api_error'
+    let code = 'internal_error'
+    if (err instanceof GatewayHttpError) {
+      message = err.body.error.message
+      type = err.body.error.type
+      code = err.body.error.code
+    } else if (err instanceof Error && err.name === 'EngineError') {
+      const ec = (err as { code?: string }).code ?? 'AGY_ERROR'
+      const mapped = engineFailureToHttp(redactLine(err.message), ec)
+      message = mapped.body.error.message
+      type = mapped.body.error.type
+      code = ec
+    } else if (err instanceof Error) {
+      message = 'Internal server error: ' + redactLine(err.message)
+    }
+    request.log.error({ code, finishKind: 'error' }, 'stream failed')
+    if (!sse['closed']) {
+      await sse.data(openAiError(message, type, code))
+      await sse.data('[DONE]')
+    }
+  } finally {
+    inFlight.remove(abort)
+    await sse.close()
+  }
 }

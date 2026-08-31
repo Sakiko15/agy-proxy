@@ -6,14 +6,16 @@
 import { randomBytes } from 'node:crypto'
 import { Err, type GatewayConfig } from '../common/types.ts'
 import { parseMirrorCallId } from '../host/recording.ts'
-import type { EngineCall, EngineMessage } from '../host/engine.ts'
+import { findEntry, resolveModelSlug } from '../host/models.ts'
+import type { EngineCall, EngineMessage, EngineMessageImage } from '../host/engine.ts'
 import type {
   FinishReason,
   StreamChunk,
   TokenUsage,
   ToolCallBlock,
 } from '../host/stream-types.ts'
-import { GatewayHttpError, httpError } from './errors.ts'
+import { GatewayHttpError, httpError, openAiError } from './errors.ts'
+import { estimateTokens } from './tokens.ts'
 
 // ---- response body shapes (only what this adapter emits) ----
 
@@ -48,8 +50,16 @@ export interface OpenAiChatCompletion {
 export interface RequestMeta {
   requestId: string
   warnings: string[]
-  /** Validated max-token cap; M1 carries it for accounting only (OA10, M2). */
+  /** Validated max-token cap; drives OA10 gateway-side truncation. */
   maxTokens?: number
+  /** Stop sequences (post-truncation on the assembled text). */
+  stop: string[]
+  /** Images staged from data: URLs (media.ts writes the bytes to disk). */
+  imageBytes: Map<string, Uint8Array>
+  /** streaming_options.include_usage — the usage chunk rides the final frames. */
+  includeUsage: boolean
+  /** The request asked for SSE. */
+  stream?: boolean
 }
 
 /** chatcmpl- + 24 base64url chars (openai-node examples use the same shape). */
@@ -95,7 +105,7 @@ function contentToText(content: unknown, role: string): string {
         parts.push(p.text)
         continue
       }
-      if (p.type === 'image_url') throw bad('image inputs arrive in M2 — this gateway accepts text only for now')
+      if (p.type === 'image_url') throw bad(role + ' image_url parts are only supported on user messages')
       if (p.type === 'input_audio') throw bad('audio input is not supported by this gateway')
       throw bad('unsupported ' + role + ' content part type: ' + String(p.type))
     }
@@ -104,23 +114,118 @@ function contentToText(content: unknown, role: string): string {
   throw bad(role + ' content must be a string or an array of content parts')
 }
 
+const IMAGE_MIME: Record<string, EngineMessageImage['mediaType']> = {
+  'image/png': 'image/png',
+  'image/jpeg': 'image/jpeg',
+  'image/webp': 'image/webp',
+  'image/gif': 'image/gif',
+}
+
+/**
+ * Decode one data:/base64 image_url into staging bytes. Only data: URLs are
+ * accepted in M2 (user decision): http(s) fetching from a VPS-resident
+ * gateway is an SSRF surface deferred to the M5 hardening pass.
+ */
+function decodeDataImageUrl(url: string, imageBytes: Map<string, Uint8Array>): EngineMessageImage {
+  let rest: string
+  if (url.startsWith('data:')) {
+    rest = url.slice(5)
+  } else {
+    // Bare base64 without the data: prefix (some clients send it).
+    if (!/^[A-Za-z0-9+/=\s]+$/.test(url)) {
+      throw bad('image_url must be a data: URL (http(s) URLs are not fetched by this gateway — see docs)')
+    }
+    rest = 'image/png;base64,' + url.replace(/\s+/g, '')
+  }
+  const comma = rest.indexOf(',')
+  if (comma < 0) throw bad('image_url data: URL must carry base64 payload')
+  const meta = rest.slice(0, comma).toLowerCase()
+  const payload = rest.slice(comma + 1)
+  const mime = meta.split(';')[0] ?? ''
+  const mediaType = IMAGE_MIME[mime]
+  if (mediaType === undefined) {
+    throw bad(`unsupported image media type '${mime}' — supported: image/png, image/jpeg, image/webp, image/gif`)
+  }
+  if (!meta.includes('base64')) throw bad('image_url data: URL must be base64-encoded')
+  let bytes: Uint8Array
+  try {
+    bytes = new Uint8Array(Buffer.from(payload, 'base64'))
+  } catch {
+    throw bad('image_url base64 payload is malformed')
+  }
+  if (bytes.length === 0) throw bad('image_url base64 payload is empty')
+  const name = 'img-' + String(imageBytes.size + 1)
+  imageBytes.set(name, bytes)
+  return { name, mediaType, bytes: bytes.length }
+}
+
+async function contentToTextAndImages(
+  content: unknown,
+  imageBytes: Map<string, Uint8Array>,
+): Promise<{ text: string; images: EngineMessageImage[] }> {  if (content === null || content === undefined) return { text: '', images: [] }
+  if (typeof content === 'string') return { text: content, images: [] }
+  if (Array.isArray(content)) {
+    const parts: string[] = []
+    const images: EngineMessageImage[] = []
+    for (const part of content) {
+      if (part === null || typeof part !== 'object') throw bad('user content part must be an object')
+      const p = part as { type?: unknown; text?: unknown; image_url?: unknown }
+      if (p.type === 'text') {
+        if (typeof p.text !== 'string') throw bad('user text part must carry a string `text`')
+        parts.push(p.text)
+        continue
+      }
+      if (p.type === 'image_url') {
+        const iu = p.image_url as { url?: unknown } | undefined
+        if (iu === null || typeof iu !== 'object' || typeof iu.url !== 'string') {
+          throw bad('image_url part must carry image_url.url')
+        }
+        images.push(decodeDataImageUrl(iu.url, imageBytes))
+        continue
+      }
+      if (p.type === 'input_audio') throw bad('audio input is not supported by this gateway')
+      throw bad('unsupported user content part type: ' + String(p.type))
+    }
+    return { text: parts.join(''), images }
+  }
+  throw bad('user content must be a string or an array of content parts')
+}
+
 /** Map one OpenAI request body onto an EngineCall (throws 400s). */
-export function mapChatRequest(
+export async function mapChatRequest(
   body: unknown,
   cfg: GatewayConfig,
-): { call: EngineCall; meta: RequestMeta } {
+  catalog?: Parameters<typeof findEntry>[0],
+): Promise<{ call: EngineCall; meta: RequestMeta }> {
   if (body === null || typeof body !== 'object') throw bad('request body must be a JSON object')
   const b = body as Record<string, unknown>
   const warnings: string[] = []
+  const imageBytes = new Map<string, Uint8Array>()
 
-  if (b.stream === true) {
-    throw bad('streaming support arrives in M2 — use stream:false')
-  }
   if (b.stream !== undefined && typeof b.stream !== 'boolean') throw bad('stream must be a boolean')
 
   const model = typeof b.model === 'string' && b.model.trim() !== '' ? b.model : cfg.defaultModel
   if (model === '') throw bad('model is required')
   if (typeof b.model !== 'string' && b.model !== undefined) throw bad('model must be a string')
+
+  // OA8: when a LIVE catalog was discovered, an unknown id is rejected up
+  // front with the list of available models. With only the fallback catalog
+  // (signed out / offline) the advisory M1 behavior stays: forward and let
+  // agy surface its real error (the fallback list may be stale).
+  if (catalog !== undefined && catalog.source === 'discovered') {
+    const resolved = resolveModelSlug(model)
+    if (findEntry(catalog, model) === undefined && resolved === model) {
+      const available = catalog.models.map((m) => m.id).join(', ')
+      throw new GatewayHttpError(
+        404,
+        openAiError(
+          `model '${model}' was not found by this gateway — available models: ${available}`,
+          'invalid_request_error',
+          'model_not_found',
+        ),
+      )
+    }
+  }
 
   const rawMessages = b.messages
   if (!Array.isArray(rawMessages) || rawMessages.length === 0) throw bad('messages must be a non-empty array')
@@ -137,12 +242,16 @@ export function mapChatRequest(
     }
     if (role === 'user') {
       if (m.tool_calls !== undefined) throw bad('user messages cannot carry tool_calls')
-      messages.push({ role: 'user', text: contentToText(m.content, 'user') })
+      const { text, images } = await contentToTextAndImages(m.content, imageBytes)
+      messages.push({ role: 'user', text, ...(images.length > 0 ? { images } : {}) })
       continue
     }
     if (role === 'assistant') {
-      if (m.tool_calls !== undefined) throw bad('assistant tool_calls round trips arrive in M2')
-      messages.push({ role: 'assistant', text: contentToText(m.content, 'assistant') })
+      // Assistant turns carrying tool_calls are kept as foreign context turns:
+      // the engine's digest treats unmarked assistant text as history agy has
+      // not seen. (Our own mirror round trips arrive as role:'tool' below.)
+      const text = contentToText(m.content, 'assistant')
+      messages.push({ role: 'assistant', text })
       continue
     }
     if (role === 'tool') {
@@ -159,11 +268,18 @@ export function mapChatRequest(
     throw bad('unsupported message role: ' + String(role))
   }
 
-  if (Array.isArray(b.tools) || b.tool_choice !== undefined) {
-    throw bad('tool calling round trips arrive in M2 — this gateway accepts text requests only for now')
+  // Client tool definitions are ACCEPTED BUT IGNORED (M2 decision, charter
+  // §4.2): agy runs its own tool loop and the gateway mirrors that activity
+  // as tool_calls/tool_use. Definitions are never forwarded nor executed —
+  // clients that always send them (Cursor, agent frameworks) keep working.
+  if (Array.isArray(b.tools) && b.tools.length > 0) {
+    warnings.push('tools were accepted but are not executed by this gateway (agy runs its own tool loop); tool_calls in responses mirror agy activity')
+  }
+  if (b.tool_choice !== undefined) {
+    warnings.push('tool_choice is accepted but not forwarded (client tool definitions are not executed)')
   }
   if (b.functions !== undefined || b.function_call !== undefined) {
-    throw bad('the legacy functions API is not supported — use tools (arrives in M2)')
+    throw bad('the legacy functions API is not supported — use tools')
   }
   if (typeof b.n === 'number' && b.n > 1) {
     throw bad('n > 1 is not supported (single candidate only)')
@@ -244,7 +360,29 @@ export function mapChatRequest(
     ...(system !== undefined ? { system } : {}),
     ...(jsonSchema !== undefined ? { jsonSchema } : {}),
   }
-  return { call, meta: { requestId: '', warnings, ...(maxTokens !== undefined ? { maxTokens } : {}) } }
+  // stream_options.include_usage: the usage frame rides the end of the SSE
+  // stream (choices:[]) instead of the body.
+  let includeUsage = false
+  if (b.stream_options !== undefined) {
+    const so = b.stream_options as Record<string, unknown>
+    if (so === null || typeof so !== 'object' || (so.include_usage !== undefined && typeof so.include_usage !== 'boolean')) {
+      throw bad('stream_options must be an object with an optional boolean include_usage')
+    }
+    if (so.include_usage === true) includeUsage = true
+  }
+  const stream = b.stream === true
+  return {
+    call,
+    meta: {
+      requestId: '',
+      warnings,
+      stop,
+      imageBytes,
+      includeUsage,
+      ...(stream ? { stream: true } : {}),
+      ...(maxTokens !== undefined ? { maxTokens } : {}),
+    },
+  }
 }
 
 // ---- response mapping ------------------------------------------------------
@@ -290,20 +428,52 @@ export function mapUsage(u: TokenUsage): OpenAiUsage {
   }
 }
 
-/** Truncate at the earliest stop-sequence match, if any. finish stays 'stop'. */
-function applyStop(text: string, stop: readonly string[]): string {
-  let cut = -1
-  for (const s of stop) {
-    const i = text.indexOf(s)
-    if (i >= 0 && (cut === -1 || i < cut)) cut = i
-  }
-  return cut >= 0 ? text.slice(0, cut) : text
-}
-
 function finishReasonOf(kind: 'stop' | 'tool-calls' | 'max-tokens'): 'stop' | 'tool_calls' | 'length' {
   if (kind === 'tool-calls') return 'tool_calls'
   if (kind === 'max-tokens') return 'length'
   return 'stop'
+}
+
+/**
+ * OA10 gateway-side max_tokens truncation. There is no tokenizer at the
+ * gateway: outputTokens from agy INCLUDES thinking tokens, so the visible
+ * text is cut proportionally — text.length * (max / outputTokens) — and the
+ * finish becomes 'length'. Best-effort by design (documented); tool-call
+ * spans are never truncated (their finish semantics differ).
+ */
+export function applyMaxTokens(collected: CollectedChunks, maxTokens: number | undefined): CollectedChunks {
+  if (maxTokens === undefined || collected.finish === null || collected.finish.kind !== 'stop') return collected
+  const output = collected.usage?.outputTokens ?? 0
+  if (output <= 0 || output <= maxTokens || collected.text === '') return collected
+  const keepChars = Math.max(0, Math.floor((collected.text.length * maxTokens) / output))
+  if (keepChars >= collected.text.length) return collected
+  return { ...collected, text: collected.text.slice(0, keepChars), finish: { kind: 'max-tokens' } }
+}
+
+/**
+ * AN10 / OA10 shared: cut at the earliest stop-sequence match and report the
+ * hit. The stop_sequence value is echoed back on the Anthropic side
+ * (stop_sequence field); OpenAI keeps finish 'stop' per its own contract.
+ */
+export function applyStopWithHit(
+  text: string,
+  stop: readonly string[],
+): { text: string; hit: string | null } {
+  let cut = -1
+  let hit: string | null = null
+  for (const s of stop) {
+    const i = text.indexOf(s)
+    if (i >= 0 && (cut === -1 || i < cut)) {
+      cut = i
+      hit = s
+    }
+  }
+  return { text: cut >= 0 ? text.slice(0, cut) : text, hit }
+}
+
+/** Truncate at the earliest stop-sequence match, if any. finish stays 'stop'. */
+function applyStop(text: string, stop: readonly string[]): string {
+  return applyStopWithHit(text, stop).text
 }
 
 export function assembleCompletion(args: {
@@ -312,8 +482,10 @@ export function assembleCompletion(args: {
   requestModel: string
   collected: CollectedChunks
   stop: readonly string[]
+  maxTokens?: number
 }): OpenAiChatCompletion {
-  const { id, created, requestModel, collected, stop } = args
+  const { id, created, requestModel, collected: raw, stop, maxTokens } = args
+  const collected = applyMaxTokens(raw, maxTokens)
   const finish = collected.finish
   // error/aborted finishes never reach here — the route converts them into
   // HTTP error bodies first (charter §4.4); stop without a finish is not a
@@ -351,3 +523,107 @@ export function assembleCompletion(args: {
 
 /** Re-export for the route handler's Err-based error path. */
 export { Err }
+
+// ---- streaming mapping (charter §4.3, OpenAI leg) ---------------------------
+
+export interface OpenAiChunk {
+  id: string
+  object: 'chat.completion.chunk'
+  created: number
+  model: string
+  choices: Array<{
+    index: number
+    delta: {
+      role?: 'assistant'
+      content?: string
+      reasoning_content?: string
+      tool_calls?: Array<{ index: number; id?: string; type?: 'function'; function?: { name?: string; arguments?: string } }>
+    }
+    finish_reason: 'stop' | 'length' | 'tool_calls' | null
+  }>
+  usage?: OpenAiUsage | null
+}
+
+/** One chunk per call; the route serializes frames as they are produced. */
+export function openAiChunkOf(id: string, created: number, model: string, chunk: OpenAiChunk['choices'][0]): OpenAiChunk {
+  return { id, object: 'chat.completion.chunk', created, model, choices: [chunk] }
+}
+
+/**
+ * Map one StreamChunk onto 0..n OpenAI SSE frames. The first frame of a span
+ * carries delta:{role:'assistant',content:''} (OA2); tool-call blocks are
+ * emitted from block-end so id/name/arguments land complete in one frame;
+ * usage is emitted only at finish and only when include_usage was set.
+ */
+export function* openAiStreamFrames(args: {
+  id: string
+  created: number
+  model: string
+  chunk: StreamChunk
+  state: { firstSent: boolean; toolIndex: number; sawToolThisSpan: boolean }
+  includeUsage: boolean
+  /** Usage from the preceding usage chunk (protocol invariant: arrives before finish). */
+  usage?: TokenUsage
+}): Generator<OpenAiChunk | '[DONE]'> {
+  const { id, created, model, chunk, state, includeUsage, usage } = args
+  if (!state.firstSent) {
+    state.firstSent = true
+    yield openAiChunkOf(id, created, model, { index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null })
+  }
+  switch (chunk.type) {
+    case 'text-delta':
+      if (chunk.text !== '') {
+        yield openAiChunkOf(id, created, model, { index: 0, delta: { content: chunk.text }, finish_reason: null })
+      }
+      return
+    case 'reasoning-delta':
+      // reasoning_content: an established ecosystem convention (official
+      // OpenAI docs define no such field — documented deviation, charter §4.3).
+      if (chunk.text !== '') {
+        yield openAiChunkOf(id, created, model, { index: 0, delta: { reasoning_content: chunk.text }, finish_reason: null })
+      }
+      return
+    case 'block-end':
+      if (chunk.block.type === 'tool-call') {
+        yield openAiChunkOf(id, created, model, {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index: state.toolIndex,
+                id: chunk.block.id,
+                type: 'function',
+                function: { name: chunk.block.name, arguments: chunk.block.arguments },
+              },
+            ],
+          },
+          finish_reason: null,
+        })
+        state.toolIndex++
+        state.sawToolThisSpan = true
+      }
+      return
+    case 'finish': {
+      const kind = chunk.reason.kind
+      yield openAiChunkOf(id, created, model, {
+        index: 0,
+        delta: {},
+        finish_reason: kind === 'tool-calls' ? 'tool_calls' : kind === 'max-tokens' ? 'length' : 'stop',
+      })
+      if (includeUsage) {
+        yield {
+          id,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          choices: [],
+          usage: mapUsage(usage ?? { inputTokens: 0, outputTokens: 0 }),
+        }
+      }
+      yield '[DONE]'
+      return
+    }
+    default:
+      return
+  }
+}

@@ -64,8 +64,8 @@ function makeServer(cfgOverrides: Partial<GatewayConfig> = {}, deps: Partial<Eng
     runs: new RunRegistry(),
     ...deps,
   })
-  const built = buildServer({ getConfig: () => cfg, engine, log: buildLogger({ AGY_PROXY_LOG_LEVEL: 'warn' }) })
-  return { built, workDir }
+  const built = buildServer({ getConfig: () => cfg, engine, catalog, log: buildLogger({ AGY_PROXY_LOG_LEVEL: 'warn' }) })
+  return { built, workDir, catalog }
 }
 
 afterEach(() => {
