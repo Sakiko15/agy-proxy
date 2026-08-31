@@ -6,7 +6,7 @@
 // logged-in system account) and images arrive in M2.
 import { join } from 'node:path'
 import { resolveConfig, dataDir, stateDir } from './common/config.ts'
-import { resolveAgyBin, probeProcess, MIN_AGY_VERSION } from './host/runner.ts'
+import { resolveAgyBin, probeProcess, startAgyProcess, MIN_AGY_VERSION } from './host/runner.ts'
 import { AgyEngine } from './host/engine.ts'
 import { ModelCatalog } from './host/models.ts'
 import { SessionStore } from './host/sessions.ts'
@@ -92,9 +92,12 @@ async function main(): Promise<void> {
   }
   const catalog = new ModelCatalog(
     async (signal) => {
-      const probe = await probeProcess(bin, ['models'], 30_000, signal)
-      if (!probe.ok) throw new Error(probe.error ?? 'agy models failed')
-      return { stdout: 'version ' + (probe.version ?? '') + '\n', stderr: '' }
+      // probeProcess only exposes the parsed --version string; discovery
+      // needs the raw `agy models` stdout for parseModelsOutput.
+      const run = startAgyProcess({ bin, args: ['models'], timeoutMs: 30_000, signal })
+      const out = await run.outcome
+      if (out.code !== 0) throw new Error(out.stderrTail.trim() !== '' ? out.stderrTail.trim() : `agy models exited with code ${out.code}`)
+      return { stdout: out.stdout, stderr: out.stderrTail }
     },
     getConfig().fallbackModels,
     getConfig().modelsCacheTtlMs,

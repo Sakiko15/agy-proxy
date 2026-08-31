@@ -67,19 +67,21 @@ agy-proxy 是自托管的 LLM 网关：把 Google Antigravity 官方 `agy` CLI �
 | GET /v1/models/{id} | 完整 |
 | POST /v1/messages/count_tokens | 近似（以 agy usage 回推估算，响应注明非精确） |
 
+> **M2 models 路由决策**：`/v1/models` 默认 OpenAI 形状，带 `anthropic-version` 头时返回 Anthropic 形状；新增 `GET /v1/anthropic/models` 恒为 Anthropic 形状（Anthropic SDK base_url 直填主机即可用）。
+
 ### 4.2 请求参数映射
 
 | OpenAI | Anthropic | agy | 说明 |
 |---|---|---|---|
 | model | model | `--model` | 统一别名表；Gemini `-low/-medium/-high` effort 后缀折叠（复用 foldEfforts） |
 | max_completion_tokens | max_tokens | 无直接对应 | 用于截断防护与记账；OpenAI 旧 `max_tokens` 接受但按弃用处理 |
-| reasoning_effort: none/minimal/low/medium/high/xhigh/max | thinking: {type:enabled(budget_tokens)/adaptive/disabled} | `--effort low/medium/high`（仅 Gemini） | 映射：none→不传 effort；minimal/low→low；medium→medium；high/xhigh/max→high；Anthropic enabled(budget) 按预算分档到 low/medium/high；adaptive→模型默认。budget_tokens 档位边界在文档注明 |
+| reasoning_effort: none/minimal/low/medium/high/xhigh/max | thinking: {type:enabled(budget_tokens)/adaptive/disabled} | `--effort low/medium/high`（仅 Gemini） | 映射：none→不传 effort；minimal/low→low；medium→medium；high/xhigh/max→high；Anthropic enabled(budget) 按预算分档到 low/medium/high；adaptive→模型默认。**M2 budget 档位边界：budget_tokens ≤4096→low / ≤16384→medium / >16384→high** |
 | temperature / top_p / top_k | （三者均已弃用，4.6+ 仅接受近似值） | 忽略 | 接受不报错；差异在文档注明 |
 | stop / stop_sequences | stop_sequences | 不支持 | agy 无对应；v1 记日志并后处理截断，finish_reason/stop_reason 如实返回（文档标注"尽力"） |
 | response_format json_object | — | 无 | 系统提示注入 + 网关侧 JSON 校验，文档标注非硬保证 |
 | response_format json_schema{name,description,schema,strict} | output_config.format{type:'json_schema',schema} | `--json-schema`（原生） | 三方直接映射；解析结果取 result 事件的 `structured_output`；strict 仅透传语义 |
-| tools + tool_choice | tools(input_schema) + tool_choice | agy 自有工具循环 | **受控工具执行（已确认）**：agy 工具循环开启；权限模式默认 `plan`；workspace 限定网关专用目录；agy 工具活动经移植的镜像机制切成 tool-call 块，两侧分别呈现为 OpenAI tool_calls（delta.tool_calls）往返 / Anthropic tool_use（content_block + tool_result）往返；`--dangerously-skip-permissions` 默认关闭，设置页显式开启并双重警示（§10） |
-| image_url（detail 忽略）| image(base64) | 文件 staging + `--add-dir` | 复用 media.ts staging |
+| tools + tool_choice | tools(input_schema) + tool_choice | agy 自有工具循环 | **受控工具执行（已确认）**：agy 工具循环开启；权限模式默认 `plan`；workspace 限定网关专用目录；agy 工具活动经移植的镜像机制切成 tool-call 块，两侧分别呈现为 OpenAI tool_calls（delta.tool_calls）往返 / Anthropic tool_use（content_block + tool_result）往返；`--dangerously-skip-permissions` 默认关闭，设置页显式开启并双重警示（§10）。**M2 决策：客户端 tools 定义接受但不执行**（不转发 agy、不注入 prompt，仅 warning），仅 agy 自有工具镜像为往返 |
+| image_url（detail 忽略）| image(base64) | 文件 staging + `--add-dir` | 复用 media.ts staging。**M2 仅支持 `data:`/base64**，http(s) URL → 400 明确报错；SSRF 安全 fetch 列为 M5 候选 |
 | input_audio / audio 输出 | — | — | 不支持 → 400 明确报错 |
 | stream_options.include_usage | usage 内建 | usage 事件 | OpenAI 端默认每块 usage:null，末块带 usage |
 | metadata / safety_identifier / user | metadata.user_id | — | 仅入日志，不上游 |
@@ -101,6 +103,8 @@ agy-proxy 是自托管的 LLM 网关：把 Google Antigravity 官方 `agy` CLI �
 **usage 映射**（agy → 两端）：`input_tokens`→prompt/input；`output_tokens`→completion/output（含 thinking）；`thinking_tokens`→OpenAI `reasoning_tokens` / Anthropic `output_tokens_details.thinking_tokens`；`cache_read_tokens`→OpenAI `prompt_tokens_details.cached_tokens` / Anthropic `cache_read_input_tokens`。无 cache 写入分解（两端对应字段置 0 或省略）。
 
 **Anthropic 多轮 thinking 回放**：assistant 历史中的 thinking/redacted_thinking 块（含 signature）原样透传进上下文映射；网关不校验 signature（由上游处理）。
+
+**M2 补充（signature）**：agy 不产生 thinking signature——thinking 块不带 `signature_delta`；网关亦不校验入站 signature（AN4 篡改腿因此 N/A，见 test/golden/anthropic/an4-thinking-replay/PROVENANCE.md）。
 
 ### 4.4 错误模型
 

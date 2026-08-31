@@ -402,3 +402,17 @@ describe('AN4: thinking replay accepted into context', () => {
     await built.app.close()
   })
 })
+
+describe('SSE heartbeat, Anthropic leg (charter §6)', () => {
+  it('silent stretch longer than the interval emits ping events', async () => {
+    process.env.FAKE_AGY_MODE = 'slow'
+    process.env.FAKE_AGY_SILENCE_MS = '500'
+    const { built } = makeServer({ sseHeartbeatMs: 150 })
+    const res = await post(built, { ...BASE, stream: true })
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toContain('event: ping')
+    // The stream still completes normally.
+    expect(res.body.trim().endsWith('data: {"type":"message_stop"}')).toBe(true)
+    await built.app.close()
+  })
+})
