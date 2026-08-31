@@ -6,7 +6,10 @@
 //
 // Modes via FAKE_AGY_MODE env:
 //   ok | auth | noise | exit12 | exit-error | real | real-error | real-fail
-//   ok            — legacy flat event shapes (kept for compat coverage)
+//   rate-limit    — hard rate-limit signatures on stderr + an ERROR result
+//                   envelope with the same text, exit 1 (M3 429 drill)
+//   validation    — 403 VALIDATION_REQUIRED line + ERROR envelope carrying
+//                   the challenge URL, exit 1 (M3 validation drill)
 //   real          — real agy 1.1.15 stream-json shapes (nested step_update
 //                   envelopes, agent_response text_delta fragments,
 //                   thinking-only turns, tool ACTIVE/DONE/ERROR)
@@ -29,6 +32,9 @@
 // sequences through this hook. FAKE_AGY_EXIT_CODE (default 0) sets the exit
 // code of the replay, so upstream-failure goldens (oa8b) reproduce the real
 // silent-failure shape: ERROR envelope on stdout + exit 1 + empty stderr.
+// FAKE_AGY_FAIL_HOME makes the hard rate-limit branch fire ONLY when the
+// spawned process HOME (USERPROFILE on win32) equals it — the 429 auto-switch
+// drill fails account A while account B keeps serving ok runs.
 //
 // Records its argv (JSON, one per line) to FAKE_AGY_ARGS_FILE when set;
 // records cwd to FAKE_AGY_CWD_FILE when set.
@@ -87,6 +93,29 @@ if (mode === 'slow') {
   emit({ event: 'step_update', step_update: { conversation_id: conv, step_index: 0, state: 'DONE', step_type: 'agent_response', text_delta: ' done', duration_seconds: 1, usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 } } })
   emit({ event: 'result', result: { conversation_id: conv, status: 'DONE', response: 'slow done', duration_seconds: 1, num_turns: 1, usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 } } })
   process.exit(0)
+}
+
+// M3 drills (acceptance M3 DoD ③/④): hard rate limit + upstream 403
+// re-validation. Both texts must trip the engine's NARROW classifiers
+// (looksLikeHardRateLimit / looksLikeValidationRequired) and both shapes are
+// the real silent-failure channel: human error line on stderr + a machine
+// ERROR result envelope on stdout + nonzero exit + nothing usable elsewhere.
+//
+// FAKE_AGY_FAIL_HOME scopes the hard failure to ONE isolated account
+// (engine spawns pool accounts with USERPROFILE/HOME = account.dir), so the
+// 429-switch drill can show account B succeeding while A cools down. The
+// unset value never matches a process HOME, so unset = fail always.
+const home = process.env.USERPROFILE || process.env.HOME || ''
+if (mode === 'rate-limit' || (process.env.FAKE_AGY_FAIL_HOME !== undefined && home !== '' && process.env.FAKE_AGY_FAIL_HOME === home)) {
+  process.stderr.write('Error: 429 RESOURCE_EXHAUSTED - Individual quota reached for model gemini-3-6-flash. Resets in 21m25s.\n')
+  emit({ event: 'result', result: { conversation_id: conv, status: 'ERROR', response: '', error: '429 RESOURCE_EXHAUSTED: Individual quota reached for this model. Resets in 21m25s.', duration_seconds: 0.1, num_turns: 0, usage: { input_tokens: 0, output_tokens: 0 } } })
+  process.exit(Number(process.env.FAKE_AGY_EXIT_CODE ?? '1'))
+}
+
+if (mode === 'validation') {
+  process.stderr.write('Error: 403 VALIDATION_REQUIRED - additional verification is required for this account\n')
+  emit({ event: 'result', result: { conversation_id: conv, status: 'ERROR', response: '', error: '403 VALIDATION_REQUIRED - your account requires additional verification: https://accounts.google.com/signin/v2/challenge/validation?continue=https%3A%2F%2Fantigravity.google', duration_seconds: 0.1, num_turns: 0, usage: { input_tokens: 0, output_tokens: 0 } } })
+  process.exit(1)
 }
 
 if (mode === 'exit12') {
