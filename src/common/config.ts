@@ -111,6 +111,8 @@ export function resolveConfig(
     adminAllowCidr: asString(get('adminAllowCidr')) ?? base.adminAllowCidr,
     adminPassword: asString(get('adminPassword')) ?? base.adminPassword,
     trustedProxies: asString(get('trustedProxies')) ?? base.trustedProxies,
+    dbPath: asString(get('dbPath')) ?? base.dbPath,
+    adminSessionTtlMs: asNum(get('adminSessionTtlMs')) ?? base.adminSessionTtlMs,
   }
   // Env wins last.
   if (env.AGY_PROXY_ENABLED !== undefined) cfg.enabled = asBool(env.AGY_PROXY_ENABLED) ?? cfg.enabled
@@ -163,6 +165,11 @@ export function resolveConfig(
   if (env.AGY_PROXY_ADMIN_ALLOW_CIDR) cfg.adminAllowCidr = env.AGY_PROXY_ADMIN_ALLOW_CIDR
   if (env.AGY_PROXY_ADMIN_PASSWORD) cfg.adminPassword = env.AGY_PROXY_ADMIN_PASSWORD
   if (env.AGY_PROXY_TRUSTED_PROXIES) cfg.trustedProxies = env.AGY_PROXY_TRUSTED_PROXIES
+  if (env.AGY_PROXY_DB_PATH) cfg.dbPath = env.AGY_PROXY_DB_PATH
+  if (env.AGY_PROXY_ADMIN_SESSION_TTL_MS) {
+    const t = asNum(env.AGY_PROXY_ADMIN_SESSION_TTL_MS)
+    if (t && t >= 60_000) cfg.adminSessionTtlMs = t
+  }
   // Static API key: environment-only (never the overrides file) so a
   // plaintext key cannot rest on disk. An explicitly-set empty string
   // disables auth, distinct from leaving it unset.

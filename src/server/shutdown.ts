@@ -42,7 +42,7 @@ export class InFlightTracker {
 
 export function installShutdown(
   built: ShutdownTarget,
-  opts: { log: Logger; graceMs?: number },
+  opts: { log: Logger; graceMs?: number; teardown?: () => Promise<void> },
 ): void {
   const graceMs = opts.graceMs ?? 25_000
   const shutdown = (signal: string): void => {
@@ -52,12 +52,29 @@ export function installShutdown(
       opts.log.warn({ aborted: n }, 'grace window elapsed — aborted in-flight agy runs')
     }, graceMs)
     timer.unref()
+    const finish = (code: number): void => {
+      process.exit(code)
+    }
     built.app
       .close()
-      .then(() => process.exit(0))
+      .then(async () => {
+        // M3 teardown (charter §6): stop the pollers, cancel any OAuth flow,
+        // then flush the usage ledger + WAL checkpoint before exit — rows
+        // written during the drain window must land.
+        if (opts.teardown !== undefined) {
+          try {
+            await opts.teardown()
+          } catch (err: unknown) {
+            opts.log.warn({ err: err instanceof Error ? err.message : String(err) }, 'shutdown teardown error')
+          }
+        }
+        finish(0)
+      })
       .catch((err: unknown) => {
         opts.log.error({ err: err instanceof Error ? err.message : String(err) }, 'error during shutdown')
-        process.exit(1)
+        void (opts.teardown !== undefined ? opts.teardown() : Promise.resolve())
+          .catch(() => undefined)
+          .finally(() => finish(1))
       })
   }
   process.once('SIGTERM', () => shutdown('SIGTERM'))

@@ -80,6 +80,11 @@ export interface GatewayConfig {
    *  OpenAI leg, a `ping` event on the Anthropic leg) so reverse proxies and
    *  Cloudflare keep the connection alive. 0 disables the heartbeat. */
   sseHeartbeatMs: number
+  /** SQLite database path (keys, usage ledger, admin sessions). Empty =
+   *  <dataDir>/agy-proxy.db. Lives on the Docker volume by construction. */
+  dbPath: string
+  /** Admin session lifetime in ms (default 7 days). */
+  adminSessionTtlMs: number
 }
 
 // Fallback line-up, mined from the agy 1.1.13 binary (inherited from
@@ -128,6 +133,8 @@ export function defaultConfig(): GatewayConfig {
     trustedProxies: '',
     apiKey: '',
     sseHeartbeatMs: 60_000,
+    dbPath: '',
+    adminSessionTtlMs: 7 * 86_400_000,
   }
 }
 
