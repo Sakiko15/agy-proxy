@@ -63,6 +63,19 @@ export interface BuiltServer {
   inFlight: InFlightTracker
 }
 
+/**
+ * Per-request image byte reader: the protocol adapters decode data:/base64
+ * payloads into meta.imageBytes; the engine's stager pulls the bytes back
+ * through this closure, keyed by the staged ref's attachmentId (the
+ * adapter-assigned img-N name). Without it the engine finds no reader and
+ * silently skips staging — data: images would never reach the prompt or the
+ * --add-dir argv.
+ */
+function stagedImageReader(meta: { imageBytes: Map<string, Uint8Array> }): NonNullable<EngineCall['readImage']> | undefined {
+  if (meta.imageBytes.size === 0) return undefined
+  return (ref) => Promise.resolve(meta.imageBytes.get(ref.attachmentId) ?? null)
+}
+
 // Permissive on purpose: OpenAI-compatible gateways in the wild accept extra
 // fields, and the mapper decides — with explicit 400s — which known fields
 // are unsupported. Only the shapes we branch on are tightened here.
@@ -140,6 +153,7 @@ export function buildServer(deps: ServerDeps): BuiltServer {
 
     const { call, meta } = await mapChatRequest(request.body, cfg, deps.catalog.get())
     for (const w of meta.warnings) request.log.info({ warning: w }, 'request-mapping warning')
+    const readImage = stagedImageReader(meta)
 
     const abort = new AbortController()
     inFlight.add(abort)
@@ -152,11 +166,11 @@ export function buildServer(deps: ServerDeps): BuiltServer {
 
     try {
       if (meta.stream === true) {
-        await streamOpenAiChat({ deps, request, reply, call, meta, abort, inFlight })
+        await streamOpenAiChat({ deps, request, reply, call: { ...call, ...(readImage !== undefined ? { readImage } : {}) }, meta, abort, inFlight })
         return
       }
       const chunks: StreamChunk[] = []
-      for await (const ch of deps.engine.stream({ ...call, signal: abort.signal })) {
+      for await (const ch of deps.engine.stream({ ...call, ...(readImage !== undefined ? { readImage } : {}), signal: abort.signal })) {
         chunks.push(ch)
       }
       const collected = collectChunks(chunks)
@@ -220,6 +234,7 @@ export function buildServer(deps: ServerDeps): BuiltServer {
 
     const { call, meta } = await mapMessagesRequest(request.body, cfg, deps.catalog.get())
     for (const w of meta.warnings) request.log.info({ warning: w }, 'request-mapping warning')
+    const readImage = stagedImageReader(meta)
 
     const abort = new AbortController()
     inFlight.add(abort)
@@ -229,11 +244,11 @@ export function buildServer(deps: ServerDeps): BuiltServer {
 
     try {
       if (meta.stream === true) {
-        await streamAnthropicMessages({ deps, request, reply, call, meta, abort, inFlight })
+        await streamAnthropicMessages({ deps, request, reply, call: { ...call, ...(readImage !== undefined ? { readImage } : {}) }, meta, abort, inFlight })
         return
       }
       const chunks: StreamChunk[] = []
-      for await (const ch of deps.engine.stream({ ...call, signal: abort.signal })) {
+      for await (const ch of deps.engine.stream({ ...call, ...(readImage !== undefined ? { readImage } : {}), signal: abort.signal })) {
         chunks.push(ch)
       }
       const collected = collectAnthropicChunks(chunks)

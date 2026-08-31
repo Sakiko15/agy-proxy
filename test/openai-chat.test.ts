@@ -3,7 +3,7 @@
 // (binArgs seam, same harness as engine.test.ts). Covers the OA1 acceptance
 // surface plus its immediate error legs (502 with real upstream text).
 import { describe, it, expect, afterEach } from 'vitest'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { defaultConfig, type GatewayConfig } from '../src/common/types.ts'
@@ -461,6 +461,64 @@ describe('POST /v1/chat/completions end-to-end (fake agy)', () => {
       expect(res.json().error.type).toBe('invalid_request_error')
     }
     await built.app.close()
+  })
+
+  it('data: images stage to disk and reach --add-dir + view_file prompt (OA7 leg)', async () => {
+    process.env.FAKE_AGY_MODE = 'ok'
+    // 1x1 transparent PNG.
+    const pngB64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+    const { built, argsFile } = makeServer()
+    process.env.FAKE_AGY_ARGS_FILE = argsFile
+    const res = await postTurn(built, [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'what is this?' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,' + pngB64 } },
+      ],
+    }])
+    expect(res.statusCode).toBe(200)
+    await built.app.close()
+    const lines = readFileSync(argsFile, 'utf8').trim().split('\n')
+    const last = JSON.parse(lines.at(-1) ?? '[]') as string[]
+    const prompt = last[last.indexOf('-p') + 1] ?? ''
+    expect(prompt).toContain('what is this?')
+    expect(prompt).toContain('[image attached: "img-1"')
+    expect(prompt).toContain('view_file')
+    expect(last).toContain('--add-dir')
+    // The staged file itself exists in the media dir (dir rides --add-dir).
+    const dir = last[last.indexOf('--add-dir') + 1] ?? ''
+    expect(dir).not.toBe('')
+    expect(readdirSync(dir).some((f) => f.startsWith('img-1-') || f.includes('-0.png'))).toBe(true)
+  })
+
+  it('Anthropic base64 images stage through /v1/messages the same way', async () => {
+    process.env.FAKE_AGY_MODE = 'ok'
+    const pngB64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+    const { built, argsFile } = makeServer()
+    process.env.FAKE_AGY_ARGS_FILE = argsFile
+    const res = await built.app.inject({
+      method: 'POST',
+      url: '/v1/messages',
+      headers: { 'content-type': 'application/json' },
+      payload: {
+        model: 'gemini-3.7-flash',
+        max_tokens: 1024,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: 'describe' },
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: pngB64 } },
+          ],
+        }],
+      },
+    })
+    expect(res.statusCode).toBe(200)
+    await built.app.close()
+    const lines = readFileSync(argsFile, 'utf8').trim().split('\n')
+    const last = JSON.parse(lines.at(-1) ?? '[]') as string[]
+    const prompt = last[last.indexOf('-p') + 1] ?? ''
+    expect(prompt).toContain('[image attached: "img-1"')
+    expect(last).toContain('--add-dir')
   })
 
   it('stream:true now returns an SSE response (M2)', async () => {
