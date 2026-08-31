@@ -1,0 +1,20 @@
+{
+  "_provenance": "test/golden/anthropic/an10-stop-sequences/PROVENANCE.md — stop_sequences: gateway-side cut BEFORE the match (text 'APONG' + stop 'ON' → 'AP'), stop_reason remaps to stop_sequence and the matched string is echoed back in stop_sequence. Sentinels: __ID__.",
+  "_status": 200,
+  "id": "__ID__",
+  "type": "message",
+  "role": "assistant",
+  "model": "gemini-3.7-flash",
+  "content": [
+    { "type": "thinking", "thinking": "[agy thinking turn · 2 thinking tokens]\n" },
+    { "type": "text", "text": "AP" }
+  ],
+  "stop_reason": "stop_sequence",
+  "stop_sequence": "ON",
+  "usage": {
+    "input_tokens": 10,
+    "output_tokens": 5,
+    "cache_read_input_tokens": 3,
+    "output_tokens_details": { "thinking_tokens": 2 }
+  }
+}

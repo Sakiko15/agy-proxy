@@ -1,0 +1,20 @@
+{
+  "_provenance": "test/golden/anthropic/an9-output-config/PROVENANCE.md — output_config.format json_schema flows to --json-schema exactly like OpenAI's response_format (OA5 equivalence): the completion body carries the raw JSON string 'Hello from fake agy' here (fake-agy ok mode does not echo a schema-shaped payload; the argv assertion lives in test/anthropic.test.ts). Sentinels: __ID__.",
+  "_status": 200,
+  "id": "__ID__",
+  "type": "message",
+  "role": "assistant",
+  "model": "gemini-3.7-flash",
+  "content": [
+    { "type": "thinking", "thinking": "[agy thinking turn · 2 thinking tokens]\n" },
+    { "type": "text", "text": "Hello from fake agy" }
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 10,
+    "output_tokens": 5,
+    "cache_read_input_tokens": 3,
+    "output_tokens_details": { "thinking_tokens": 2 }
+  }
+}

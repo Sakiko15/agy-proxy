@@ -1,0 +1,15 @@
+{
+  "_provenance": "test/golden/models/ma2-anthropic-paginated/PROVENANCE.md — Anthropic /v1/anthropic/models with limit=1 + after_id=gemini-3.7-flash: the page starts AFTER the cursor id; claude-sonnet-4-6 is the next catalog entry (stable alphabetical order), first_id/last_id name it, and has_more=false because it is the final entry. created_at is the fixed MODEL_CREATED ISO timestamp.",
+  "_status": 200,
+  "data": [
+    {
+      "id": "claude-sonnet-4-6",
+      "type": "model",
+      "display_name": "Claude Sonnet 4.6",
+      "created_at": "2026-01-01T00:00:00.000Z"
+    }
+  ],
+  "first_id": "claude-sonnet-4-6",
+  "last_id": "claude-sonnet-4-6",
+  "has_more": false
+}

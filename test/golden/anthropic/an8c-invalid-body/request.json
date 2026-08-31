@@ -1,0 +1,8 @@
+{
+  "method": "POST",
+  "url": "/v1/messages",
+  "body": {
+    "model": "gemini-3.7-flash",
+    "messages": [{ "role": "user", "content": "hi" }]
+  }
+}

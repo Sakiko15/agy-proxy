@@ -1,0 +1,20 @@
+{
+  "_provenance": "test/golden/anthropic/an4-thinking-replay/PROVENANCE.md — history with a thinking block + redacted shapes rides the digest; only the trailing user turn is sent to agy. The tampered-signature leg of AN4 is N/A (charter §4.3): the gateway never validates inbound signatures because agy provides none. Sentinels: __ID__.",
+  "_status": 200,
+  "id": "__ID__",
+  "type": "message",
+  "role": "assistant",
+  "model": "gemini-3.7-flash",
+  "content": [
+    { "type": "thinking", "thinking": "[agy thinking turn · 2 thinking tokens]\n" },
+    { "type": "text", "text": "Hello from fake agy" }
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 10,
+    "output_tokens": 5,
+    "cache_read_input_tokens": 3,
+    "output_tokens_details": { "thinking_tokens": 2 }
+  }
+}

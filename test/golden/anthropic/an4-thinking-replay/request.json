@@ -1,0 +1,14 @@
+{
+  "method": "POST",
+  "url": "/v1/messages",
+  "body": {
+    "model": "gemini-3.7-flash",
+    "max_tokens": 1024,
+    "system": "You are terse.",
+    "messages": [
+      { "role": "user", "content": [{ "type": "text", "text": "hi" }, { "type": "thinking", "thinking": "prior thought" }] },
+      { "role": "assistant", "content": [{ "type": "text", "text": "noted" }] },
+      { "role": "user", "content": "summarize" }
+    ]
+  }
+}

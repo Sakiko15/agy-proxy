@@ -1,0 +1,9 @@
+{
+  "_provenance": "test/golden/models/ma3-single-model/PROVENANCE.md — GET /v1/models/:id with an unknown id on a DISCOVERED catalog → 404 model_not_found (OpenAI body). The success leg of single-model GET is pinned literally in test/models.test.ts; this golden pins the error shape end-to-end.",
+  "_status": 404,
+  "error": {
+    "message": "model 'no-such-model' was not found",
+    "type": "invalid_request_error",
+    "code": "model_not_found"
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "method": "GET",
+  "url": "/v1/anthropic/models",
+  "query": { "limit": "1", "after_id": "gemini-3.7-flash" }
+}

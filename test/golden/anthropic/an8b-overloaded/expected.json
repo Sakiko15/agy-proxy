@@ -1,0 +1,9 @@
+{
+  "_provenance": "test/golden/anthropic/an8b-overloaded/PROVENANCE.md — upstream ERROR envelope whose message matches /overloaded/i → 529 overloaded_error (Anthropic's 'temporarily overloaded'; the narrow /overloaded/ match is the charter's documented soft-rate-limit signature). agy's real error text passes through verbatim. case.json sets fakeAgyExitCode 1 to reproduce the real exit semantics.",
+  "_status": 529,
+  "type": "error",
+  "error": {
+    "type": "overloaded_error",
+    "message": "Google Antigravity quota / rate limit reached: model overloaded"
+  }
+}

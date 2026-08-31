@@ -1,0 +1,15 @@
+{
+  "_provenance": "test/golden/anthropic/an5-tool-use-stream/PROVENANCE.md — agy tool step mirrored as a tool_use content block: input_json_delta carries the full arguments JSON (tool name agy_tool, run __UUID__, step = ABSOLUTE event index 4, original input); the span cuts with stop_reason tool_use. Sentinels: __ID__, __AGYTC__ (tool_use id), __UUID__ (run id inside the input JSON).",
+  "sse": [
+    { "event": "message_start", "data": { "type": "message_start", "message": { "id": "__ID__", "type": "message", "role": "assistant", "model": "gemini-3.7-flash", "content": [], "stop_reason": null, "stop_sequence": null, "usage": { "input_tokens": 0, "output_tokens": 0 } } } },
+    { "event": "content_block_start", "data": { "type": "content_block_start", "index": 0, "content_block": { "type": "thinking", "thinking": "" } } },
+    { "event": "content_block_delta", "data": { "type": "content_block_delta", "index": 0, "delta": { "type": "thinking_delta", "thinking": "Thinking..." } } },
+    { "event": "content_block_delta", "data": { "type": "content_block_delta", "index": 0, "delta": { "type": "thinking_delta", "thinking": " carefully" } } },
+    { "event": "content_block_stop", "data": { "type": "content_block_stop", "index": 0 } },
+    { "event": "content_block_start", "data": { "type": "content_block_start", "index": 1, "content_block": { "type": "tool_use", "id": "__AGYTC__", "name": "agy_tool", "input": {} } } },
+    { "event": "content_block_delta", "data": { "type": "content_block_delta", "index": 1, "delta": { "type": "input_json_delta", "partial_json": "{\"run\":\"__UUID__\",\"step\":4,\"tool\":\"read_file\",\"input\":{\"path\":\"/tmp/x\"}}" } } },
+    { "event": "content_block_stop", "data": { "type": "content_block_stop", "index": 1 } },
+    { "event": "message_delta", "data": { "type": "message_delta", "delta": { "stop_reason": "tool_use", "stop_sequence": null }, "usage": { "output_tokens": 0 } } },
+    { "event": "message_stop", "data": { "type": "message_stop" } }
+  ]
+}

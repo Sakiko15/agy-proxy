@@ -1,0 +1,9 @@
+{
+  "_provenance": "test/golden/anthropic/an8c-invalid-body/PROVENANCE.md — max_tokens is REQUIRED on /v1/messages (Anthropic contract, unlike OpenAI): a request without it → 400 invalid_request_error. No agy spawn.",
+  "_status": 400,
+  "type": "error",
+  "error": {
+    "type": "invalid_request_error",
+    "message": "max_tokens is required"
+  }
+}

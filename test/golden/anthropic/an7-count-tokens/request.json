@@ -1,0 +1,13 @@
+{
+  "method": "POST",
+  "url": "/v1/messages/count_tokens",
+  "body": {
+    "model": "gemini-3.7-flash",
+    "system": "you are terse",
+    "messages": [
+      { "role": "user", "content": [{ "type": "text", "text": "你好世界" }] },
+      { "role": "assistant", "content": "hi" },
+      { "role": "user", "content": "ok" }
+    ]
+  }
+}

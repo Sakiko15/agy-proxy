@@ -1,0 +1,19 @@
+{
+  "_provenance": "test/golden/models/ma1-openai-list/PROVENANCE.md — OpenAI /v1/models list shape; effort-folded catalog (gemini-3.7-flash-low folded into the base entry with an efforts list, no bare duplicate). created pins MODEL_CREATED literally (model listings are not zeroed). No agy spawn.",
+  "_status": 200,
+  "object": "list",
+  "data": [
+    {
+      "id": "gemini-3.7-flash",
+      "object": "model",
+      "created": 1767225600,
+      "owned_by": "antigravity"
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "object": "model",
+      "created": 1767225600,
+      "owned_by": "antigravity"
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "_provenance": "test/golden/anthropic/an8a-auth-401/PROVENANCE.md — missing key on an Anthropic path → 401 authentication_error in the ANTHROPIC body shape ({type:'error',error:{...}}), not OpenAI's {error:{...}} (see oa8c). No agy spawn.",
+  "_status": 401,
+  "type": "error",
+  "error": {
+    "type": "authentication_error",
+    "message": "Missing API key. Pass it as `Authorization: Bearer <key>` or `x-api-key: <key>`."
+  }
+}

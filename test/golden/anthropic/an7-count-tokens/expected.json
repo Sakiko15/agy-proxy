@@ -1,0 +1,5 @@
+{
+  "_provenance": "test/golden/anthropic/an7-count-tokens/PROVENANCE.md — deterministic heuristic estimate: CJK chars count 1 token each (你好世界 = 4), Latin text rounds to chars/4 (\"you are terse\" 13 non-ws → 3, \"hi\" → 1, \"ok\" → 1). Total 3+4+1+1 = 9. Non-exact by design; the x-agy-proxy-token-estimate: heuristic response header says so. No agy spawn.",
+  "_status": 200,
+  "input_tokens": 9
+}

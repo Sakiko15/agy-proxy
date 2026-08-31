@@ -1,0 +1,9 @@
+{
+  "method": "POST",
+  "url": "/v1/messages",
+  "body": {
+    "model": "gemini-3.7-flash",
+    "max_tokens": 1024,
+    "messages": [{ "role": "user", "content": "hi" }]
+  }
+}

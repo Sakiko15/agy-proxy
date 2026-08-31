@@ -1,0 +1,7 @@
+{
+  "discoveredModels": [
+    { "id": "gemini-3.7-flash", "display_name": "Gemini 3.7 Flash" },
+    { "id": "gemini-3.7-flash-low", "display_name": "Gemini 3.7 Flash (low)" },
+    { "id": "claude-sonnet-4-6", "display_name": "Claude Sonnet 4.6" }
+  ]
+}

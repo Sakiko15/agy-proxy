@@ -1,0 +1,20 @@
+{
+  "_provenance": "test/golden/anthropic/an1-basic/PROVENANCE.md — non-streaming /v1/messages: msg_ id, type/role, thinking turn annotation before text, end_turn, usage with cache_read_input_tokens + output_tokens_details.thinking_tokens (gateway extension). Sentinels: __ID__.",
+  "_status": 200,
+  "id": "__ID__",
+  "type": "message",
+  "role": "assistant",
+  "model": "gemini-3.7-flash",
+  "content": [
+    { "type": "thinking", "thinking": "[agy thinking turn · 2 thinking tokens]\n" },
+    { "type": "text", "text": "Hello from fake agy" }
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 10,
+    "output_tokens": 5,
+    "cache_read_input_tokens": 3,
+    "output_tokens_details": { "thinking_tokens": 2 }
+  }
+}
