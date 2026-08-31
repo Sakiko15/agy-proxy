@@ -21,6 +21,8 @@
 //   auth          — stderr sign-in notice + auth URL
 //   hang          — emits nothing, keeps running until killed (watchdog /
 //                   process-tree kill verification)
+//   slow          — init, then FAKE_AGY_SILENCE_MS of pure silence, then a
+//                   short text + result (SSE heartbeat verification)
 //
 // FAKE_AGY_EVENTS_FILE (any mode): when set, every line of that file is
 // written to stdout verbatim and the process exits 0 — the golden-case
@@ -72,6 +74,17 @@ if (mode === 'hang') {
   // tests (process-tree kill must end this process).
   setInterval(() => {}, 1000)
   await new Promise(() => {})
+}
+
+if (mode === 'slow') {
+  // SSE heartbeat drill (acceptance M2 DoD): a long silent stretch after
+  // init, then a normal short run so the stream still completes.
+  emit({ event: 'init', conversation_id: conv, model: 'gemini-3-6-flash' })
+  await sleep(Number(process.env.FAKE_AGY_SILENCE_MS ?? 1000))
+  emit({ event: 'step_update', step_update: { conversation_id: conv, step_index: 0, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'slow' } })
+  emit({ event: 'step_update', step_update: { conversation_id: conv, step_index: 0, state: 'DONE', step_type: 'agent_response', text_delta: ' done', duration_seconds: 1, usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 } } })
+  emit({ event: 'result', result: { conversation_id: conv, status: 'DONE', response: 'slow done', duration_seconds: 1, num_turns: 1, usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 } } })
+  process.exit(0)
 }
 
 if (mode === 'exit12') {
