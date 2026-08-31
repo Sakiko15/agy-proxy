@@ -19,12 +19,15 @@ export function openAiError(message: string, type: string, code: string): OpenAi
 export class GatewayHttpError extends Error {
   readonly statusCode: number
   readonly body: OpenAiErrorBody | AnthropicErrorBody
+  /** Optional response headers (Retry-After on rate-limit rejections). */
+  readonly headers?: Record<string, string>
 
-  constructor(statusCode: number, body: OpenAiErrorBody | AnthropicErrorBody) {
+  constructor(statusCode: number, body: OpenAiErrorBody | AnthropicErrorBody, headers?: Record<string, string>) {
     super(body.error.message)
     this.name = 'GatewayHttpError'
     this.statusCode = statusCode
     this.body = body
+    this.headers = headers
   }
 }
 
@@ -45,7 +48,10 @@ export function errorStatus(code: string): { statusCode: number; type: string } 
     case 'UNKNOWN_MODEL':
       return { statusCode: 404, type: 'invalid_request_error' }
     case 'BUSY':
+    case 'POOL_EXHAUSTED':
       return { statusCode: 429, type: 'rate_limit_error' }
+    case 'VALIDATION_REQUIRED':
+      return { statusCode: 403, type: 'permission_error' }
     case 'UNSUPPORTED_REASONING_EFFORT':
       return { statusCode: 400, type: 'invalid_request_error' }
     case 'AGY_NOT_INSTALLED':
@@ -62,9 +68,9 @@ export function errorStatus(code: string): { statusCode: number; type: string } 
 }
 
 /** Map an engine failure (thrown or terminal) onto an HTTP error response. */
-export function engineFailureToHttp(message: string, code: string): GatewayHttpError {
+export function engineFailureToHttp(message: string, code: string, headers?: Record<string, string>): GatewayHttpError {
   const { statusCode, type } = errorStatus(code)
-  return new GatewayHttpError(statusCode, openAiError(message, type, code))
+  return new GatewayHttpError(statusCode, openAiError(message, type, code), headers)
 }
 
 // ---- Anthropic error model (charter §4.4) -----------------------------------
@@ -104,7 +110,10 @@ export function anthropicStatusFor(code: string, message: string): { statusCode:
     case 'UNKNOWN_MODEL':
       return { statusCode: 404, type: 'not_found_error' }
     case 'BUSY':
+    case 'POOL_EXHAUSTED':
       return { statusCode: 429, type: 'rate_limit_error' }
+    case 'VALIDATION_REQUIRED':
+      return { statusCode: 403, type: 'permission_error' }
     case 'UNSUPPORTED_REASONING_EFFORT':
       return { statusCode: 400, type: 'invalid_request_error' }
     case 'AGY_NOT_INSTALLED':
@@ -121,9 +130,13 @@ export function anthropicStatusFor(code: string, message: string): { statusCode:
 }
 
 /** Map an engine failure onto an Anthropic error response. */
-export function engineFailureToAnthropic(message: string, code: string): { statusCode: number; body: AnthropicErrorBody } {
+export function engineFailureToAnthropic(
+  message: string,
+  code: string,
+  headers?: Record<string, string>,
+): { statusCode: number; body: AnthropicErrorBody; headers?: Record<string, string> } {
   const { statusCode, type } = anthropicStatusFor(code, message)
-  return { statusCode, body: anthropicError(type, message) }
+  return { statusCode, body: anthropicError(type, message), headers }
 }
 
 /**
@@ -136,4 +149,18 @@ export function authErrorFor(url: string, message: string): GatewayHttpError {
     return new GatewayHttpError(401, anthropicError('authentication_error', message))
   }
   return httpError(401, message, 'authentication_error', 'invalid_api_key')
+}
+
+/**
+ * Per-key quota rejections (MA4/MA5): RPM and daily-token over-limit map to
+ * 429 rate_limit_error with a Retry-After header, bodies following the same
+ * per-protocol branching as auth errors. The message must name the quota
+ * type (RPM limit / daily_token_limit) and the reset time (MA5).
+ */
+export function quotaRejectFor(url: string, message: string, retryAfterSec: number): GatewayHttpError {
+  const headers = { 'retry-after': String(Math.max(1, Math.round(retryAfterSec))) }
+  if (isAnthropicPath(url)) {
+    return new GatewayHttpError(429, anthropicError('rate_limit_error', message), headers)
+  }
+  return new GatewayHttpError(429, openAiError(message, 'rate_limit_error', 'rate_limit_exceeded'), headers)
 }
