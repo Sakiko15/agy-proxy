@@ -167,5 +167,9 @@ export function resolveConfig(
   // plaintext key cannot rest on disk. An explicitly-set empty string
   // disables auth, distinct from leaving it unset.
   if (env.AGY_PROXY_API_KEY !== undefined) cfg.apiKey = env.AGY_PROXY_API_KEY
+  if (env.AGY_PROXY_SSE_HEARTBEAT_MS !== undefined) {
+    const v = Number(env.AGY_PROXY_SSE_HEARTBEAT_MS)
+    if (Number.isFinite(v) && v >= 0) cfg.sseHeartbeatMs = v
+  }
   return cfg
 }

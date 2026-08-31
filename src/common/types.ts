@@ -75,6 +75,11 @@ export interface GatewayConfig {
    *  runtime-overrides file, so a plaintext key never rests on disk. The M3
    *  sha256 key store replaces this behind the same middleware. */
   apiKey: string
+  /** SSE heartbeat interval in ms: when a streaming response stays silent
+   *  longer than this, the writer emits a keepalive (`: ping` comment on the
+   *  OpenAI leg, a `ping` event on the Anthropic leg) so reverse proxies and
+   *  Cloudflare keep the connection alive. 0 disables the heartbeat. */
+  sseHeartbeatMs: number
 }
 
 // Fallback line-up, mined from the agy 1.1.13 binary (inherited from
@@ -122,6 +127,7 @@ export function defaultConfig(): GatewayConfig {
     adminPassword: '',
     trustedProxies: '',
     apiKey: '',
+    sseHeartbeatMs: 60_000,
   }
 }
 
