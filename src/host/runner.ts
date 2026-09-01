@@ -183,7 +183,11 @@ function killTree(child: ChildProcess): void {
   if (IS_WIN) {
     // No Unix process groups on Windows: kill the whole tree via taskkill.
     try {
-      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+      // An unhandled 'error' on the spawned killer (taskkill missing/blocked)
+      // surfaces as an async throw and would crash the gateway mid-kill —
+      // swallow it; taskkill ships with every Windows install, and the
+      // process usually exits on its own regardless.
+      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }).on('error', () => {})
     } catch {
       try { child.kill() } catch { /* already gone */ }
     }

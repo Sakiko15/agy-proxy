@@ -9,13 +9,14 @@ import { randomBytes } from 'node:crypto'
 import type { GatewayConfig } from '../common/types.ts'
 import { parseMirrorCallId } from '../host/recording.ts'
 import type { EngineCall, EngineMessage, EngineMessageImage } from '../host/engine.ts'
+import { findEntry, resolveModelSlug } from '../host/models.ts'
 import type {
   FinishReason,
   StreamChunk,
   TokenUsage,
   ToolCallBlock,
 } from '../host/stream-types.ts'
-import { anthropicError, GatewayHttpError } from './errors.ts'
+import { anthropicError, anthropicStatusFor, GatewayHttpError } from './errors.ts'
 import { estimateTokens } from './tokens.ts'
 
 // ---- response body shapes ---------------------------------------------------
@@ -205,7 +206,7 @@ function mapContent(content: unknown, role: 'user' | 'assistant', imageBytes: Ma
 export async function mapMessagesRequest(
   body: unknown,
   cfg: GatewayConfig,
-  catalog?: Parameters<typeof import('../host/models.ts').findEntry>[0],
+  catalog?: Parameters<typeof findEntry>[0],
 ): Promise<{ call: EngineCall; meta: AnthropicRequestMeta }> {
   if (body === null || typeof body !== 'object') throw bad('request body must be a JSON object')
   const b = body as Record<string, unknown>
@@ -216,10 +217,13 @@ export async function mapMessagesRequest(
   if (model === '') throw bad('model is required')
 
   // OA8 mirror: same pre-validation policy as the OpenAI leg (live catalog
-  // enforces, fallback stays advisory).
+  // enforces, fallback stays advisory). findEntry() resolves the
+  // claude-opus-style aliases, so an alias that maps to a known slug passes
+  // (the engine re-resolves the slug when building argv); `resolved === model`
+  // excludes that alias path, matching the OpenAI leg line-for-line.
   if (catalog !== undefined && catalog.source === 'discovered') {
-    const known = catalog.models.some((m) => m.id === model) || catalog.models.some((m) => m.id === model)
-    if (!known) {
+    const resolved = resolveModelSlug(model)
+    if (findEntry(catalog, model) === undefined && resolved === model) {
       const available = catalog.models.map((m) => m.id).join(', ')
       throw new GatewayHttpError(
         404,
@@ -611,7 +615,11 @@ export function* anthropicStreamEvents(args: {
         state.openType = null
       }
       if (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted') {
-        yield { event: 'error', data: { type: 'error', error: { type: 'api_error', message: chunk.reason.failure.message } } }
+        // Same code→type table as the non-stream leg (engineFailureToAnthropic),
+        // so /overloaded/i surfaces as 529 overloaded_error in-stream too
+        // instead of a blanket api_error; unmapped codes stay api_error.
+        const { type } = anthropicStatusFor(chunk.reason.failure.code, chunk.reason.failure.message)
+        yield anthropicStreamErrorEvent(chunk.reason.failure.message, type)
         return
       }
       const stopReason = chunk.reason.kind === 'tool-calls' ? 'tool_use' : chunk.reason.kind === 'max-tokens' ? 'max_tokens' : 'end_turn'

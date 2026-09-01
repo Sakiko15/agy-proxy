@@ -18,6 +18,7 @@ import {
 } from '../src/server/anthropic-adapter.ts'
 import { engineFailureToAnthropic, isAnthropicPath } from '../src/server/errors.ts'
 import { CallId, type StreamChunk } from '../src/host/stream-types.ts'
+import type { Catalog } from '../src/host/models.ts'
 
 const cfg = defaultConfig()
 const map = (body: unknown, c: GatewayConfig = cfg) => mapMessagesRequest(body, c)
@@ -77,6 +78,27 @@ describe('mapMessagesRequest', () => {
     await mapThrows({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }, /max_tokens is required/)
     await mapThrows({ ...BASE, max_tokens: 0 }, /positive integer/)
     await mapThrows({ ...BASE, max_tokens: 'many' }, /positive integer/)
+  })
+
+  it('OA8 mirror: unknown model 404s on a discovered catalog; aliases pass (M2)', async () => {
+    const discovered: Catalog = {
+      source: 'discovered',
+      models: [
+        { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', efforts: ['low', 'medium', 'high'] },
+        { id: 'claude-opus-4-6-thinking', name: 'Claude Opus 4.6 Thinking', efforts: ['high'] },
+      ],
+      discoveredAt: Date.now(),
+    }
+    await expect(mapMessagesRequest({ ...BASE, model: 'no-such-model' }, cfg, discovered)).rejects.toMatchObject({
+      statusCode: 404,
+    })
+    // The pre-fix check compared raw ids only (with a duplicated condition),
+    // so the claude-opus alias was rejected even though resolveModelSlug maps
+    // it to the known claude-opus-4-6-thinking entry.
+    const aliased = await mapMessagesRequest({ ...BASE, model: 'claude-opus' }, cfg, discovered)
+    expect(aliased.call.model).toBe('claude-opus')
+    await expect(mapMessagesRequest(BASE, cfg, discovered)).resolves.toBeTruthy()
+    await expect(mapMessagesRequest(BASE, cfg)).resolves.toBeTruthy() // fallback catalog: advisory, no pre-check
   })
 
   it('joins system string and text-block forms equivalently', async () => {
@@ -379,5 +401,22 @@ describe('anthropicStreamEvents', () => {
     expect(last?.data.error).toMatchObject({ type: 'api_error', message: 'boom' })
     // No message_stop after an error terminal.
     expect(events.some((e) => e.event === 'message_stop')).toBe(false)
+  })
+
+  it('maps error-finish codes through anthropicStatusFor (529 parity, M14)', () => {
+    // Pre-fix the in-stream terminal hardcoded api_error, so an upstream
+    // overload surfaced as 502-shaped api_error even though the non-stream
+    // leg maps the same failure to 529 overloaded_error.
+    const ov = run([
+      { type: 'finish', reason: { kind: 'error', failure: { message: 'model overloaded', code: 'AGY_ERROR' } } },
+    ])
+    const ovErr = ov[ov.length - 1]
+    expect(ovErr?.event).toBe('error')
+    expect(ovErr?.data.error).toMatchObject({ type: 'overloaded_error', message: 'model overloaded' })
+    // Unmapped codes keep the api_error default; aborted rides the same table.
+    const ab = run([
+      { type: 'finish', reason: { kind: 'aborted', failure: { message: 'stop', code: 'AUTH' } } },
+    ])
+    expect(ab[ab.length - 1]?.data.error).toMatchObject({ type: 'authentication_error', message: 'stop' })
   })
 })

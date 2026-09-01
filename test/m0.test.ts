@@ -61,6 +61,34 @@ describe('config layering (env > overrides > defaults)', () => {
     const cfg = resolveConfig({ AGY_PROXY_EXTRA_ARGS: '--foo bar --baz' } as NodeJS.ProcessEnv, {})
     expect(cfg.extraArgs).toEqual(['--foo', 'bar', '--baz'])
   })
+
+  it('asBool parses falsey strings (S-M1: AGY_PROXY_ENABLED=false was a silent no-op)', () => {
+    expect(resolveConfig({ AGY_PROXY_ENABLED: 'false' } as NodeJS.ProcessEnv, {}).enabled).toBe(false)
+    expect(resolveConfig({ AGY_PROXY_ENABLED: '0' } as NodeJS.ProcessEnv, {}).enabled).toBe(false)
+    expect(resolveConfig({ AGY_PROXY_ENABLED: 'true' } as NodeJS.ProcessEnv, {}).enabled).toBe(true)
+    // A non-boolean string stays invalid → lower layers win.
+    expect(resolveConfig({ AGY_PROXY_ENABLED: 'nope' } as NodeJS.ProcessEnv, {}).enabled).toBe(true)
+  })
+
+  it('maxConcurrent/maxQueueDepth read the documented env vars (S-M11)', () => {
+    const env = { AGY_PROXY_MAX_CONCURRENT: '7', AGY_PROXY_MAX_QUEUE_DEPTH: '5' } as NodeJS.ProcessEnv
+    const cfg = resolveConfig(env, { maxConcurrent: 2, maxQueueDepth: 2 })
+    expect(cfg.maxConcurrent).toBe(7)
+    expect(cfg.maxQueueDepth).toBe(5)
+    // Out-of-range env values are ignored, not clamped (settings.ts mirrors
+    // these predicates for envLocked reporting).
+    const low = resolveConfig({ AGY_PROXY_MAX_CONCURRENT: '0', AGY_PROXY_MAX_QUEUE_DEPTH: '-3' } as NodeJS.ProcessEnv, { maxConcurrent: 2, maxQueueDepth: 2 })
+    expect(low.maxConcurrent).toBe(2)
+    expect(low.maxQueueDepth).toBe(2)
+  })
+
+  it('maxConcurrent/maxQueueDepth floors apply to every layer (S-M4: overrides 0 bricked the gateway)', () => {
+    const fromOverrides = resolveConfig({}, { maxConcurrent: 0, maxQueueDepth: -1 })
+    expect(fromOverrides.maxConcurrent).toBe(1)
+    expect(fromOverrides.maxQueueDepth).toBe(0)
+    const fromEnv = resolveConfig({ AGY_PROXY_MAX_QUEUE_DEPTH: '-5' } as NodeJS.ProcessEnv, { maxQueueDepth: -5 })
+    expect(fromEnv.maxQueueDepth).toBe(0)
+  })
 })
 
 describe('runner helpers', () => {

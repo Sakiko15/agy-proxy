@@ -45,7 +45,9 @@ function asString(v: unknown): string | undefined {
 
 function asBool(v: unknown): boolean | undefined {
   if (typeof v === 'boolean') return v
-  if (typeof v === 'string') return v === 'true' || v === '1'
+  // Same truthy set as settings.ts's copy — 'false'/'0' must parse as false
+  // or AGY_PROXY_ENABLED=false silently keeps the gateway enabled (S-M1).
+  if (typeof v === 'string') return v === 'true' || v === '1' ? true : v === 'false' || v === '0' ? false : undefined
   return undefined
 }
 
@@ -135,6 +137,16 @@ export function resolveConfig(
   if (env.AGY_PROXY_EXTRA_ARGS) {
     cfg.extraArgs = env.AGY_PROXY_EXTRA_ARGS.split(/\s+/).filter(Boolean)
   }
+  if (env.AGY_PROXY_MAX_CONCURRENT !== undefined) {
+    const c = asNum(env.AGY_PROXY_MAX_CONCURRENT)
+    // README documents this var; out-of-range values are ignored (not
+    // clamped) so the layering predicate in settings.ts mirrors exactly.
+    if (c !== undefined && c >= 1) cfg.maxConcurrent = c
+  }
+  if (env.AGY_PROXY_MAX_QUEUE_DEPTH !== undefined) {
+    const q = asNum(env.AGY_PROXY_MAX_QUEUE_DEPTH)
+    if (q !== undefined && q >= 0) cfg.maxQueueDepth = q
+  }
   if (env.AGY_PROXY_WORKSPACE_ROOT) cfg.workspaceRoot = env.AGY_PROXY_WORKSPACE_ROOT
   if (env.AGY_PROXY_MEDIA_DIR) cfg.mediaDir = env.AGY_PROXY_MEDIA_DIR
   if (env.AGY_PROXY_MEDIA_TTL_MS) {
@@ -184,5 +196,11 @@ export function resolveConfig(
     const v = Number(env.AGY_PROXY_SSE_HEARTBEAT_MS)
     if (Number.isFinite(v) && v >= 0) cfg.sseHeartbeatMs = v
   }
+  // Floors after layering (S-M4'): the overrides file and env are both
+  // clamped here because a hand-edited maxConcurrent: 0 once bricked the
+  // gateway — every semaphore acquire saw an exhausted cap and 429'd
+  // forever. maxQueueDepth 0 stays legal (reject overflow at once).
+  cfg.maxConcurrent = Math.max(1, cfg.maxConcurrent)
+  cfg.maxQueueDepth = Math.max(0, cfg.maxQueueDepth)
   return cfg
 }

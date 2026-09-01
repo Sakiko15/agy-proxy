@@ -167,6 +167,24 @@ describe('PUT /admin/settings', () => {
     const res2 = await built.app.inject({ method: 'GET', url: '/admin/settings', headers: { cookie } })
     expect((res2.json() as { envLocked: string[] }).envLocked).not.toContain('permissionMode')
   })
+
+  it('concurrency env vars now lock their keys (S-M11: they were silently unread)', async () => {
+    useTempDataDir()
+    process.env.AGY_PROXY_MAX_CONCURRENT = '9'
+    process.env.AGY_PROXY_MAX_QUEUE_DEPTH = '5'
+    const { built } = makeAdminServer()
+    const { cookie } = await login(built)
+    const res = await built.app.inject({ method: 'GET', url: '/admin/settings', headers: { cookie } })
+    const body = res.json() as { envLocked: string[]; effective: Record<string, unknown> }
+    expect(body.envLocked).toContain('maxConcurrent')
+    expect(body.envLocked).toContain('maxQueueDepth')
+    expect(body.effective.maxConcurrent).toBe(9)
+    expect(body.effective.maxQueueDepth).toBe(5)
+    // Out-of-range values are ignored by resolveConfig → not locked.
+    process.env.AGY_PROXY_MAX_CONCURRENT = '0'
+    const res2 = await built.app.inject({ method: 'GET', url: '/admin/settings', headers: { cookie } })
+    expect((res2.json() as { envLocked: string[] }).envLocked).not.toContain('maxConcurrent')
+  })
 })
 
 describe('writeOverridesPatch failure cleanup', () => {

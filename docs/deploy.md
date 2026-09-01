@@ -136,6 +136,20 @@ docker run --rm -v <实际卷名>:/data -v $PWD:/bak alpine \
 
 恢复 = 停容器（1Panel：编排停止）→ 清空卷 → 解包 → 起服。卷内所有凭证 device-bound，**跨机器迁移等于重新登录**（换机后每个账号需重跑 admin UI 的 login 流程）。
 
+## 5.1 日界时区（S-M9）
+
+per-key 每日 token 预算按**容器本地午夜**切日（`startOfToday` 用 `setHours(0,0,0,0)`
+取本地零点时间戳，见 `src/server/usage-ledger.ts`）。基础镜像未设 `TZ`，即 **UTC** ——
+对 UTC+8 运营者，实际切日是北京时间早上 8 点（前一日预算覆盖到 8:00）。
+需按本地日切日时，在 compose 的 `environment` 中加（docker-compose.yml 已留注释行）：
+
+```yaml
+    environment:
+      TZ: "Asia/Shanghai"
+```
+
+仅影响记账/展示的日界与日期串，不改变任何网关语义；已产生的 usage 行不会回溯重算。
+
 ## 6. 日志与观测面速查
 
 | 环境变量 | 默认 | 说明 |

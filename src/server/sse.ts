@@ -77,8 +77,22 @@ export class SseWriter {
   /** Write one frame honoring backpressure; resolves when the socket accepts it. */
   private async writeRaw(frame: string): Promise<void> {
     if (this.closed || this.raw.destroyed || this.raw.writableEnded) return
-    const ok = this.raw.write(frame)
-    if (!ok) await new Promise<void>((resolve) => this.raw.once('drain', resolve))
+    if (this.raw.write(frame)) return
+    // A client that disconnects mid-backpressure never emits 'drain' — the
+    // waiter must also settle on close/error or the producer loop hangs
+    // forever (M5'). once() + explicit removal keep a single resolution and
+    // leave no stray listeners behind.
+    await new Promise<void>((resolve) => {
+      const settle = (): void => {
+        this.raw.off('drain', settle)
+        this.raw.off('close', settle)
+        this.raw.off('error', settle)
+        resolve()
+      }
+      this.raw.once('drain', settle)
+      this.raw.once('close', settle)
+      this.raw.once('error', settle)
+    })
   }
 
   /** `data: <json>\n\n` (OpenAI chunk / [DONE] sentinel). */

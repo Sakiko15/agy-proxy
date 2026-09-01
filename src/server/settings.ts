@@ -52,10 +52,11 @@ const ENV_OWNERS: Readonly<Record<WritableKey, { wins: (env: NodeJS.ProcessEnv) 
   defaultModel: { wins: (e) => !!e.AGY_PROXY_DEFAULT_MODEL },
   defaultEffort: { wins: (e) => !!e.AGY_PROXY_DEFAULT_EFFORT },
   timeoutMs: { wins: (e) => { const t = asNum(e.AGY_PROXY_TIMEOUT_MS); return t !== undefined && t > 0 } },
-  // maxConcurrent / maxQueueDepth have no env binding — resolveConfig reads
-  // them from the overrides file only, so they are never env-locked.
-  maxConcurrent: { wins: () => false },
-  maxQueueDepth: { wins: () => false },
+  // The clamps themselves live in resolveConfig's post-layering floors; an
+  // out-of-range env value is ignored, so the wins predicates check the same
+  // ranges rather than mere presence.
+  maxConcurrent: { wins: (e) => { const c = asNum(e.AGY_PROXY_MAX_CONCURRENT); return c !== undefined && c >= 1 } },
+  maxQueueDepth: { wins: (e) => { const q = asNum(e.AGY_PROXY_MAX_QUEUE_DEPTH); return q !== undefined && q >= 0 } },
   permissionMode: {
     wins: (e) => {
       if (!!e.AGY_PROXY_MODE) return asMode(e.AGY_PROXY_MODE) !== undefined
