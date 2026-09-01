@@ -4,7 +4,7 @@
 
 红线提醒（development.md §6）：**tag / GitHub Release / 镜像推送一律等待用户显式发布指令**；本文只描述部署流程，不含发布动作。
 
-## 1. 两种部署路径
+## 1. 部署路径
 
 **A. 从 checkout 构建（推荐先行）**
 
@@ -14,11 +14,33 @@ npm ci && npm run build        # tsdown + web 构建链
 docker compose up -d --build   # 使用 compose 中的 `build: .`（需先取消注释）
 ```
 
-**B. 拉取预构建镜像**
+**B. 拉取预构建镜像（主 registry = Docker Hub；发布指令后可用）**
 
-`docker-compose.yml` 中的 `image: ghcr.io/OWNER/agy-proxy:latest` 是占位符：把 OWNER 换成实际 push 目标（或用 `.env` 覆盖），再 `docker compose up -d`。在用户下达发布指令之前，该镜像**不存在于任何 registry** —— 先用路径 A。
+镜像路径由 compose 的 `AGY_PROXY_IMAGE` 环境插值给定（如 `docker.io/<your-dockerhub-user>/agy-proxy:0.1.0`，与 `AGY_PROXY_API_KEY` 同放 `.env`）。**在用户下达发布指令之前，该镜像不存在于任何 registry** —— 镜像未推前用路径 A。私有仓库需先配认证（1Panel「容器 → 仓库」或 `docker login`）。ghcr.io 仅作备选（CN VPS 可达性通常差于 Docker Hub）。
+
+**C. 1Panel 面板编排 + 远程拉取镜像（本文实际部署形态）** —— 见 §1.1。
 
 agy CLI 版本由 Dockerfile `ARG AGY_CLI_VERSION=1.1.22` 锁定（m1.md 真机记录）；如需更换请显式覆盖 build args 并重跑全套协议回归（charter §4 矩阵）。
+
+### 1.1 路径 C：1Panel 编排（远程拉取镜像）
+
+已核实的面板事实（[1Panel 编排官方文档](https://1panel.cn/docs/v1/user_manual/containers/compose/)）：创建编排支持「编辑 / 路径选择 / 编排模版」三种来源；**编辑与启停操作仅适用于 1Panel 创建的编排**；编排文件落在 `{安装目录}/1panel/docker/compose/<名称>/`（项目名即编排名）。
+
+1. **镜像就位**（发布指令后）：Docker Hub 推送 `docker.io/<user>/agy-proxy:<git tag>`；若仓库设为私有，先在 1Panel「容器 → 仓库」添加仓库并填凭据（Docker Hub 账号 / token），否则拉取 401。
+2. **面板创建编排**：1Panel → 容器 → 编排 → 创建编排 → 来源「编辑」→ 文件夹名称填 `agy-proxy` → 粘贴仓库的 `docker-compose.yml` → 把 `image` 行改成本人 Docker Hub 路径（或在同一编排目录放 `.env`：`AGY_PROXY_IMAGE=docker.io/<user>/agy-proxy:0.1.0` 与 `AGY_PROXY_API_KEY`）→ 确认创建。
+3. **首启密码**：编排详情 → 容器 → 日志（或 SSH 后 `docker logs agy-proxy | grep -i password`）——随机管理密码只打印一次；常驻部署建议直接设 `AGY_PROXY_ADMIN_PASSWORD`（env）。
+4. **镜像加速**（CN VPS）：拉 Docker Hub 慢/失败时，1Panel「容器 → 配置 → 镜像加速」或 `/etc/docker/daemon.json` 配 registry-mirrors。
+5. 编排卷名带项目前缀：备份命令（本文 §5）中 `-v agy-data:/data` 对应改为实际卷名 `<编排名>_agy-data`（`docker volume ls | grep agy-data` 确认）。
+
+**暂不配反向代理的安全边界（当前实际形态）**
+
+- compose 默认只绑 `127.0.0.1:8080`——管理面（`/admin/*`）与 `/v1` 在隧道外**不可达**；访问 WebUI 走 SSH 隧道：`ssh -L 8080:127.0.0.1:8080 <vps>` 后本机开 `http://127.0.0.1:8080`。
+- 全程无 TLS：任何经公网直发的流量都是明文。在接反代（OpenResty/Caddy/nginx 任一）之前，不要把端口改为 `0.0.0.0` 或 `8080:8080` 全开。
+- `AGY_PROXY_ADMIN_ALLOW_CIDR` 填实际 docker 网段 + `127.0.0.1/32`（compose 注释示例，按请求重读）；对外 `/v1` 服务在接反代前同样只面向本机。
+
+**强杀演练 / 长稳的 1Panel 等价操作**（对映 `docs/verify/m5.md` P3 与用户执行项）：面板「容器」页可直接看日志 / 强制停止（= `docker kill`，强杀腿等价）/ 重建（等价 compose 重启）；本文件 §4 的 docker CLI 步骤在面板编排下同样适用（1Panel 编排就是标准 compose 项目）。
+
+**预留：接 1Panel OpenResty 反代时**（启用 SSE 对外服务时再做）：compose 取消 `1panel-network` 注释（外部网络，与面板 OpenResty 同网络后代理地址写 `http://agy-proxy:8080`，无需宿主端口）；网站 → 目标域名 → 配置 → 配置文件，在反代 location 内加 SSE 三件套——`proxy_buffering off;`（逐 chunk 直通）+ `proxy_http_version 1.1; proxy_set_header Connection '';` + `proxy_read_timeout 3600s;`——并把代理侧 IP/CIDR 填进 `AGY_PROXY_TRUSTED_PROXIES`（真实客户端地址决定 admin-CIDR 判定）。
 
 ## 2. 首次启动与首启密码
 
@@ -107,11 +129,12 @@ docker exec agy-proxy node -e "console.log(require('better-sqlite3')('/data/agy-
 ## 5. 卷备份
 
 ```bash
-docker run --rm -v agy-data:/data -v $PWD:/bak alpine \
+docker volume ls | grep agy-data        # 1Panel 编排下卷名为 <编排名>_agy-data，以下命令用实际卷名
+docker run --rm -v <实际卷名>:/data -v $PWD:/bak alpine \
   tar czf /bak/agy-data-$(date +%F).tar.gz -C /data .
 ```
 
-恢复 = 停容器 → 清空卷 → 解包 → 起服。卷内所有凭证 device-bound，**跨机器迁移等于重新登录**（换机后每个账号需重跑 admin UI 的 login 流程）。
+恢复 = 停容器（1Panel：编排停止）→ 清空卷 → 解包 → 起服。卷内所有凭证 device-bound，**跨机器迁移等于重新登录**（换机后每个账号需重跑 admin UI 的 login 流程）。
 
 ## 6. 日志与观测面速查
 

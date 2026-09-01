@@ -117,6 +117,11 @@ npm ci && npm run build && docker compose up -d   # or a prebuilt registry image
 docker logs agy-proxy | grep -i password          # first-boot admin password — printed exactly once
 ```
 
+Deploying from a **1Panel** server? Use the panel's 编排 flow (容器 → 编排 → create → paste this
+compose; the image reference is env-interpolated — Docker Hub is the primary registry, pushed
+on the explicit release command). Without a reverse proxy, bind stays loopback-only: reach the
+WebUI through an SSH tunnel. See `docs/deploy.md` 路径 C.
+
 The runbook (`docs/deploy.md`) covers first-boot posture, the SSE-critical reverse-proxy
 settings for nginx / Caddy / Cloudflare (`proxy_buffering off` / `flush_interval -1`, long
 read timeouts, body max size, `X-Forwarded-For` + `AGY_PROXY_TRUSTED_PROXIES`), the docker
