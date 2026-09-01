@@ -18,6 +18,10 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      - run: npm ci --prefix web
       - run: npm run check
       - run: npm run build
       - run: npm test
+      - run: npm run web:test
+      # G4 parity for the WebUI tree (acceptance.md §1 keeps src/; this adds web/src)
+      - run: "grep -rEn \"console\\.log\" web/src && exit 1 || exit 0"

@@ -2,6 +2,16 @@
 # tini is PID 1 (SIGTERM forwarding + zombie reaping for the short-lived agy
 # children spawned per request). The official agy binary is installed at build
 # time and version-locked; auto-update is disabled at runtime.
+
+# ---- stage 1: build the WebUI (web/dist for the static hosting in dist/) ----
+FROM node:24-slim AS web
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
+# ---- stage 2: gateway + WebUI assets ----
 FROM node:24-slim
 
 # tini for proper signal handling and zombie reaping
@@ -24,7 +34,7 @@ COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev || npm install --omit=dev
 
 COPY dist/ ./dist/
-COPY web/dist/ ./web/dist/
+COPY --from=web /web/dist/ ./web/dist/
 
 # All mutable state lives under /data (pool, sessions, accounts, media, sqlite).
 # Mount a named volume here — account credentials are device-bound and must

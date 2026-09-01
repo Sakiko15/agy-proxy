@@ -16,12 +16,14 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "scripts": {
-    "build": "tsdown",
+    "build": "tsdown && npm --prefix web run build",
     "check": "tsc --noEmit",
     "test": "vitest run",
     "dev": "tsx src/index.ts",
     "web:dev": "npm --prefix web run dev",
-    "web:build": "npm --prefix web run build"
+    "web:build": "npm --prefix web run build",
+    "web:test": "npm --prefix web run test",
+    "web:check": "npm --prefix web run check"
   },
   "engines": {
     "node": ">=24.0.0"
