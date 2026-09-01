@@ -216,12 +216,26 @@ export interface ParserStats {
   sawAuthFailure: boolean
   /** Error text from the last result envelope, if any (engine maps it to AGY_ERROR). */
   lastResultError: string | undefined
+  /** S-M6: how many times the pending torn-line buffer overflowed and was discarded. */
+  overflowDrops: number
+}
+
+// S-M6 bounds: agy stdout is trusted-ish but a hung/broken binary (or a
+// flood of megabyte "lines") must not grow memory without limit. A torn line
+// bigger than MAX_PENDING is discarded (its tail will fail JSON.parse and
+// count as garbage); stored diagnostics lines and garbage payloads are
+// truncated — they exist for the doctor report tail and counters only.
+const MAX_PENDING_CHARS = 1_048_576
+const MAX_STORED_LINE_CHARS = 4000
+
+function truncateStored(line: string): string {
+  return line.length > MAX_STORED_LINE_CHARS ? line.slice(0, MAX_STORED_LINE_CHARS) : line
 }
 
 export class StreamJsonParser {
   private buffer = ''
   private seq = 0
-  readonly stats: ParserStats = { lines: 0, garbage: 0, consecutiveGarbage: 0, authUrl: undefined, sawAuthFailure: false, lastResultError: undefined }
+  readonly stats: ParserStats = { lines: 0, garbage: 0, consecutiveGarbage: 0, authUrl: undefined, sawAuthFailure: false, lastResultError: undefined, overflowDrops: 0 }
   /** Ring buffer of raw stdout lines for diagnostics export. */
   readonly recentLines: string[] = []
   private readonly maxRecent = 2000
@@ -236,6 +250,16 @@ export class StreamJsonParser {
       this.buffer = this.buffer.slice(nl + 1)
       const ev = this.takeLine(line)
       if (ev) out.push(ev)
+    }
+    // S-M6: a torn "line" pending past the cap is pathological (agy hung
+    // mid-write or flooding without newlines) — discard the pending bytes
+    // instead of growing without bound. Complete lines were already processed
+    // above; an over-cap terminated line is counted as garbage by takeLine
+    // (the engine's INVALID_OUTPUT message surfaces the count).
+    if (this.buffer.length > MAX_PENDING_CHARS) {
+      this.buffer = ''
+      this.stats.overflowDrops++
+      this.stats.consecutiveGarbage++
     }
     return out
   }
@@ -252,7 +276,7 @@ export class StreamJsonParser {
   private takeLine(line: string): AgyEvent | undefined {
     if (line.trim() === '') return undefined
     this.stats.lines++
-    this.recentLines.push(line)
+    this.recentLines.push(truncateStored(line))
     if (this.recentLines.length > this.maxRecent) this.recentLines.splice(0, this.recentLines.length - this.maxRecent)
     if (looksLikeAuthFailure(line)) this.stats.sawAuthFailure = true
     if (this.stats.authUrl === undefined) {
@@ -265,7 +289,9 @@ export class StreamJsonParser {
     } catch {
       this.stats.garbage++
       this.stats.consecutiveGarbage++
-      return { kind: 'garbage', line }
+      // S-M6: the garbage payload rides the recording — truncate it; only
+      // the doctor-report tail and counters ever read it.
+      return { kind: 'garbage', line: truncateStored(line) }
     }
     const ev = classifyEvent(obj, this.seq++)
     if (!ev) {

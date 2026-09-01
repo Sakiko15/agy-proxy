@@ -26,6 +26,9 @@ export function defaultPoolDir(): string {
   return join(stateDir(), 'accounts')
 }
 
+/** Debounce window for hot-path pool persists (S-M8). */
+export const PERSIST_DEBOUNCE_MS = 500
+
 export class AccountPoolManager {
   private data: AccountPoolData
   private readonly baseDir: string
@@ -56,6 +59,11 @@ export class AccountPoolManager {
   }
 
   private persist(): void {
+    this.persistDirty = false
+    if (this.persistTimer !== null) {
+      clearTimeout(this.persistTimer)
+      this.persistTimer = null
+    }
     try {
       mkdirSync(dirname(this.file), { recursive: true })
       const tmp = join(dirname(this.file), '.pool.json.tmp')
@@ -65,6 +73,32 @@ export class AccountPoolManager {
       // Best-effort persistence
     }
     this.notify()
+  }
+
+  private persistTimer: NodeJS.Timeout | null = null
+  private persistDirty = false
+
+  /**
+   * Debounced persist for the per-request hot paths (S-M8): recordSuccess /
+   * recordFailure / updateAccountQuotas used to rewrite the full pool.json
+   * synchronously two or three times per proxied call. Coalesce them into one
+   * write on a short timer; account topology, quarantine and config changes
+   * keep persisting synchronously, and flush() covers shutdown. The timer is
+   * unref'd so a pending debounce never holds the process open.
+   */
+  private persistSoon(): void {
+    this.persistDirty = true
+    if (this.persistTimer !== null) return
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = null
+      if (this.persistDirty) this.persist()
+    }, PERSIST_DEBOUNCE_MS)
+    this.persistTimer.unref()
+  }
+
+  /** Write out a pending debounced persist (shutdown / test teardown). */
+  flush(): void {
+    if (this.persistDirty) this.persist()
   }
 
   // ---- mutation observers (M4): every mutating method funnels through
@@ -365,7 +399,7 @@ export class AccountPoolManager {
       ...quotas,
     }
     if (email) acc.email = email
-    this.persist()
+    this.persistSoon()
   }
 
   /**
@@ -400,7 +434,7 @@ export class AccountPoolManager {
       reason,
       consecutiveFailures: failures,
     }
-    this.persist()
+    this.persistSoon()
   }
 
   /**
@@ -417,7 +451,7 @@ export class AccountPoolManager {
     if (acc.cooldowns[family]) {
       delete acc.cooldowns[family]
     }
-    this.persist()
+    this.persistSoon()
   }
 
   clearCooldown(id?: string, family?: ModelFamily): void {

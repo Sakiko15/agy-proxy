@@ -165,12 +165,48 @@ export function buildAuthHook(deps: AuthDeps): preHandlerHookHandler {
 // ---- per-key rate limiters (created lazily, keyed id:rpm) --------------------
 const limiters = new Map<string, RateLimiterMemory>()
 
-function getLimiter(keyId: string, rpm: number): RateLimiterMemory {
+const LIMITER_SWEEP_INTERVAL_MS = 10 * 60_000
+let limiterSweeper: NodeJS.Timeout | null = null
+
+/**
+ * Evict idle limiters: entries used to live forever — a deleted or
+ * long-idle key kept its RateLimiterMemory (and its map slot) for the life
+ * of the process. A limiter is evictable when its single record (consume()
+ * is called with the literal key 1, which getKey passes through) has
+ * expired out of MemoryStorage — i.e. it carries no rate-limit state and
+ * dropping it cannot change any client's window. Runs on a lazy unref'd
+ * interval, started on first limiter creation and stopped when the map
+ * empties, so a quiet process holds no timer.
+ */
+export async function sweepIdleLimiters(): Promise<number> {
+  let removed = 0
+  for (const [cacheKey, limiter] of limiters) {
+    // get() resolves null when the record expired out of MemoryStorage.
+    if ((await limiter.get(1)) === null) {
+      limiters.delete(cacheKey)
+      removed++
+    }
+  }
+  if (limiters.size === 0 && limiterSweeper !== null) {
+    clearInterval(limiterSweeper)
+    limiterSweeper = null
+  }
+  return removed
+}
+
+/** Test seam: the module-level limiter registry is keyed `id:rpm`. */
+export function getLimiter(keyId: string, rpm: number): RateLimiterMemory {
   const cacheKey = `${keyId}:${rpm}`
   let limiter = limiters.get(cacheKey)
   if (limiter === undefined) {
     limiter = new RateLimiterMemory({ points: rpm, duration: 60 })
     limiters.set(cacheKey, limiter)
+    if (limiterSweeper === null) {
+      limiterSweeper = setInterval(() => {
+        void sweepIdleLimiters().catch(() => undefined)
+      }, LIMITER_SWEEP_INTERVAL_MS)
+      limiterSweeper.unref()
+    }
   }
   return limiter
 }

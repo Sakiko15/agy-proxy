@@ -12,8 +12,9 @@
 //     and each snapshot is a few KB
 // `run` events carry exactly the usage-ledger fields for the same run (the
 // index.ts onRun hook feeds both), so dashboard and usage accounting can
-// never disagree. No timers exist while idle: the only timer is the pool
-// debouncer, armed solely when a change arrives.
+// never disagree. Timers while idle: the pool debouncer (armed only when a
+// change arrives) and the half-open client sweeper (unref'd hourly interval,
+// started on the first SSE registration — see registerClient).
 //
 // Client lifecycle is explicit: every /admin/events connection registers its
 // stream-end callback via registerClient(), and closeAll() (shutdown teardown)
@@ -51,6 +52,8 @@ export interface AdminEventBusOptions {
   debounceMs?: number
   /** Ring capacity for Last-Event-ID replay. */
   capacity?: number
+  /** Age at which a registered SSE client is force-recycled. */
+  clientTtlMs?: number
 }
 
 export class AdminEventBus {
@@ -59,15 +62,18 @@ export class AdminEventBus {
   private readonly capacity: number
   private ring: AdminEvent[] = []
   private readonly subscribers = new Map<number, (ev: AdminEvent) => void>()
-  private readonly clients = new Map<number, () => void>()
+  private readonly clients = new Map<number, { end: () => void; at: number }>()
   private seq = 0
   private nextId = 1
   private debounceTimer: NodeJS.Timeout | null = null
+  private clientSweeper: NodeJS.Timeout | null = null
+  private readonly clientTtlMs: number
 
   constructor(opts: AdminEventBusOptions) {
     this.getPool = opts.getPool
     this.debounceMs = opts.debounceMs ?? 250
     this.capacity = opts.capacity ?? 200
+    this.clientTtlMs = opts.clientTtlMs ?? 24 * 3_600_000
   }
 
   /** Monotonic sequence number of the most recent event (0 = none yet). */
@@ -101,13 +107,48 @@ export class AdminEventBus {
 
   /** Register one SSE connection's stream-end callback. closeAll() invokes
    *  these to end hijacked sockets; the returned function unregisters (the
-   *  route calls it when the stream closes on its own first). */
+   *  route calls it when the stream closes on its own first). The registration
+   *  timestamp feeds the half-open sweeper below. */
   registerClient(endStream: () => void): () => void {
     const id = this.nextId++
-    this.clients.set(id, endStream)
+    this.clients.set(id, { end: endStream, at: Date.now() })
+    if (this.clientSweeper === null) {
+      this.clientSweeper = setInterval(() => this.sweepStaleClients(), 3_600_000)
+      this.clientSweeper.unref()
+    }
     return () => {
       this.clients.delete(id)
     }
+  }
+
+  /**
+   * Force-recycle SSE clients registered longer than maxAgeMs ago (default:
+   * clientTtlMs). A half-open connection — client vanished behind a dropped
+   * NAT mapping, no FIN/RST — never fires raw 'close', so sse.done never
+   * resolves and the client+subscriber pair would sit registered forever.
+   * Invoking the stored callback routes through the route's idempotent end()
+   * (unregister + sse.close()); a LIVE client merely takes a reconnect blip —
+   * EventSource reconnects with Last-Event-ID and the ring replays it.
+   */
+  sweepStaleClients(maxAgeMs: number = this.clientTtlMs): number {
+    const cutoff = Date.now() - maxAgeMs
+    let removed = 0
+    for (const [id, client] of this.clients) {
+      if (client.at <= cutoff) {
+        // Unregister FIRST: the stored callback is normally the route's
+        // idempotent end() (which unregisters via its own closure), but a
+        // callback that does not unregister must not be re-invoked by a
+        // later sweep.
+        this.clients.delete(id)
+        try {
+          client.end()
+        } catch {
+          // already unregistered — a throwing end() must not stall the sweep
+        }
+        removed++
+      }
+    }
+    return removed
   }
 
   get subscriberCount(): number {
@@ -146,12 +187,16 @@ export class AdminEventBus {
       clearTimeout(this.debounceTimer)
       this.debounceTimer = null
     }
+    if (this.clientSweeper !== null) {
+      clearInterval(this.clientSweeper)
+      this.clientSweeper = null
+    }
     const ends = [...this.clients.values()]
     this.clients.clear()
     this.subscribers.clear()
-    for (const end of ends) {
+    for (const client of ends) {
       try {
-        end()
+        client.end()
       } catch {
         // a stream refusing to end must not block the shutdown path
       }

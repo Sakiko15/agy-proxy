@@ -236,6 +236,14 @@ const CALLBACK_SUCCESS_HTML = `<!doctype html><html><head><meta charset="utf-8">
 <p>可以关闭此标签页，返回 agy-proxy。</p>
 </body></html>`
 
+// The callback reflects the ?error= query param back into an HTML page — on a
+// port any local page can reach, so the value is attacker-controlled text.
+// Escape it (L5): without this, a crafted redirect like
+// ?error=<img src=x onerror=...> ran script in the operator's browser.
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] ?? c)
+}
+
 /**
  * Listen on 127.0.0.1:OAUTH_CALLBACK_PORT for the OAuth redirect.
  * Rejects on bind failure (e.g. port busy) so callers can fall back to
@@ -261,7 +269,7 @@ export function startCallbackListener(timeoutMs = 300_000): CallbackHandle {
     const oauthError = url.searchParams.get('error')
     if (oauthError) {
       res.writeHead(400, { 'Content-Type': 'text/html', connection: 'close' })
-      res.end(`<h2>Authorization failed: ${oauthError}</h2>`)
+      res.end(`<h2>Authorization failed: ${escapeHtml(oauthError)}</h2>`)
       rejectResult(new Error(`oauth error: ${oauthError}`))
       setTimeout(() => server.close(), 1500)
       return

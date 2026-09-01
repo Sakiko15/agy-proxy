@@ -27,7 +27,11 @@ AGY_PROXY_API_KEY=change-me node dist/index.js
 ```
 
 The gateway listens on `0.0.0.0:8080` by default and requires the official `agy` CLI to be
-installed and signed in (`agy` on PATH, or point `AGY_PROXY_BIN` at the binary). A minimal
+installed and signed in (`agy` on PATH, or point `AGY_PROXY_BIN` at the binary). On Windows this
+must be the official `agy.exe` — npm/pnpm `.cmd` shims are refused at spawn time because they can
+only run through cmd.exe, whose quoting would let API request text inject shell commands; install
+the real exe from <https://antigravity.google/cli> (or via winget) and point `AGY_PROXY_BIN` at it
+if it is not on PATH. A minimal
 OpenAI-compatible request:
 
 ```bash

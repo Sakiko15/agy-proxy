@@ -65,7 +65,15 @@ function asMode(v: unknown): PermissionMode | undefined {
     : undefined
 }
 
-/** Layered config read; cheap enough to call per request (thunk pattern). */
+/**
+ * Layered config read. NOTE (perf): the default `overrides` parameter does a
+ * SYNCHRONOUS disk read (readOverrides()) on every call, and the host's
+ * getConfig thunk (index.ts) calls this uncached — so every request pays a
+ * small stat+read on the overrides file. Accepted: the file is tiny, it is
+ * what makes runtime-overrides.json take effect without a restart, and
+ * spawn/argon2/etc. dwarf it on request latency; revisit only if profiling
+ * ever disagrees.
+ */
 export function resolveConfig(
   env: NodeJS.ProcessEnv = process.env,
   overrides: OverridesFile = readOverrides(),

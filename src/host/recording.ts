@@ -28,6 +28,17 @@ export interface RecordingFailure {
 
 const waiters: unique symbol = Symbol('waiters')
 
+/**
+ * S-M6: a single run's event log is capped. A run crossing the cap loses its
+ * OLDEST-visible tail (step/garbage/init events stop being stored — indices
+ * of stored events stay stable, so existing callIds and continuation cursors
+ * stay valid), while `result` envelopes are always kept: a flooded run that
+ * eventually produces a result still completes with the right conversation
+ * binding and usage, just with a truncated mirror history. Without the cap,
+ * one pathological agy run grows memory without limit.
+ */
+export const MAX_EVENTS_PER_RUN = 20_000
+
 /** One agy run's append-only event log plus its settlement state. */
 export class RunRecording {
   readonly runId: string
@@ -36,6 +47,8 @@ export class RunRecording {
   private failure: RecordingFailure | null = null
   private resultConversationId: string | null = null
   private lastStepUsageRaw: RawUsage | null = null
+  /** Events dropped because the run crossed MAX_EVENTS_PER_RUN. */
+  droppedEvents = 0
   private [waiters] = new Set<() => void>()
 
   /**
@@ -53,8 +66,18 @@ export class RunRecording {
   /** Append one pump event and wake every span consumer. */
   append(ev: AgyEvent): void {
     if (this.settled) return
-    this.events.push(ev)
-    if (ev.kind === 'result') this.resultConversationId = ev.conversationId ?? null
+    // Result/usage bookkeeping happens regardless of the cap, so settlement
+    // classification and token meters survive a truncated run.
+    if (ev.kind === 'result') {
+      this.resultConversationId = ev.conversationId ?? null
+    } else if (ev.kind === 'step' && ev.usage !== undefined && Object.keys(ev.usage).length > 0) {
+      this.noteStepUsage(ev.usage)
+    }
+    if (ev.kind !== 'result' && this.events.length >= MAX_EVENTS_PER_RUN) {
+      this.droppedEvents++
+    } else {
+      this.events.push(ev)
+    }
     this.wake()
   }
 

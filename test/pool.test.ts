@@ -245,7 +245,6 @@ describe('pool: AccountPoolManager', () => {
       expect(seen).toEqual(['change', 'change']) // no further notifies
 
       // Reads and no-op lookups (unknown account) never notify.
-      expect(seen).toEqual(['change', 'change'])
       const noopCount = seen.length
       pool.getAccount('does-not-exist')
       pool.getPoolData()
@@ -254,6 +253,38 @@ describe('pool: AccountPoolManager', () => {
       unsubscribe()
     }
   })
+
+  it('hot-path pool writes are debounced; flush() and the timer land them (S-M8)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-pool-debounce-'))
+    const pool = new AccountPoolManager(dir)
+    const file = join(dir, 'pool.json')
+    // createAccountSlot persists synchronously (critical path) — the file exists.
+    const acc = pool.createAccountSlot('deb')
+    const before = readFileSync(file, 'utf8')
+
+    // Per-request hot paths coalesce: no synchronous rewrite inside the window.
+    pool.updateAccountQuotas(acc.id, { google: { remainingFraction: 0.42, updatedAt: Date.now() } }, 'debounced@gmail.com')
+    pool.recordFailure(acc.id, 'google', '429 RESOURCE_EXHAUSTED: quota exceeded')
+    pool.recordSuccess(acc.id, 'google')
+    expect(readFileSync(file, 'utf8')).toBe(before)
+
+    // flush() writes the coalesced state (shutdown path).
+    pool.flush()
+    const flushed = JSON.parse(readFileSync(file, 'utf8')) as { accounts: { id: string; quotas: Record<string, { remainingFraction: number }>; lastUsedAt: number }[] }
+    const row = flushed.accounts.find((a) => a.id === acc.id)
+    expect(row?.quotas.google?.remainingFraction).toBe(0.42)
+    expect(row?.lastUsedAt).toBeTruthy()
+
+    // And a later hot mutation lands via the unref'd timer on its own.
+    const afterFlush = readFileSync(file, 'utf8')
+    pool.updateAccountQuotas(acc.id, { google: { remainingFraction: 0.99, updatedAt: Date.now() } })
+    expect(readFileSync(file, 'utf8')).toBe(afterFlush)
+    await new Promise((r) => setTimeout(r, 700))
+    const timed = JSON.parse(readFileSync(file, 'utf8')) as { accounts: { id: string; quotas: Record<string, { remainingFraction: number }> }[] }
+    expect(timed.accounts.find((a) => a.id === acc.id)?.quotas.google?.remainingFraction).toBe(0.99)
+    // Settle any still-pending timer before the temp dir is removed.
+    pool.flush()
+  }, 10_000)
 
   it('sweepOldLogs sweeps log files older than retention days', () => {
     const dir = mkdtempSync(join(tmpdir(), 'agy-pool-logs-'))

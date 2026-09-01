@@ -12,6 +12,7 @@
 // key plaintext rides the create response exactly once and is never logged,
 // and no route exposes key_hash or session tokens.
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
+import { RateLimiterMemory } from 'rate-limiter-flexible'
 import QRCode from 'qrcode'
 import type { Logger } from 'pino'
 import type { GatewayConfig } from '../common/types.ts'
@@ -119,14 +120,35 @@ export function registerAdminApi(app: AdminInstance, deps: AdminDeps): void {
   })
 
   // ---- session ----
+  // Login brute-force backoff (S-M5), auth.ts's RateLimiterMemory pattern but
+  // keyed by client IP inside ONE limiter: the 5th failed password inside a
+  // 5-minute window makes every further attempt from that IP answer 429 —
+  // correct passwords included — until the record expires. The gate runs
+  // BEFORE argon2 verify, so a flooded IP costs no password hashing, and a
+  // success deletes the record (an operator who mistyped 4 times starts a
+  // fresh window). Per-key records self-expire via unref'd timers in the
+  // limiter's internal store, so growth is bounded by distinct recent IPs.
+  const loginFailures = new RateLimiterMemory({ points: 5, duration: 300 })
   app.post('/admin/login', guarded({ skipSession: true, mutating: true }), async (request, reply) => {
+    const prior = await loginFailures.get(request.ip)
+    if (prior !== null && prior.consumedPoints >= 5 && prior.msBeforeNext > 0) {
+      const sec = Math.max(1, Math.ceil(prior.msBeforeNext / 1000))
+      await reply
+        .code(429)
+        .header('retry-after', String(sec))
+        .send({ ok: false, error: `too many failed logins from this address — retry in ${sec}s` })
+      return reply
+    }
     const body = (request.body ?? {}) as { password?: unknown }
     const ok = typeof body.password === 'string' && body.password !== '' && (await deps.verifyPassword(body.password))
     if (!ok) {
+      // A consume past capacity still records the point (library semantics).
+      await loginFailures.consume(request.ip).catch(() => undefined)
       await new Promise((r) => setTimeout(r, 300)) // brute-force damping (deliberately capped)
       await reply.code(401).send({ ok: false, error: 'invalid password' })
       return reply
     }
+    await loginFailures.delete(request.ip)
     const session = deps.sessions.create()
     await reply
       .code(200)

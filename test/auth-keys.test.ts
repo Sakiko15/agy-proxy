@@ -21,6 +21,7 @@ import { GatewaySemaphore } from '../src/server/semaphore.ts'
 import { openDb, checkpointAndClose } from '../src/server/db.ts'
 import { KeyStore } from '../src/server/key-store.ts'
 import { UsageLedger } from '../src/server/usage-ledger.ts'
+import { getLimiter, sweepIdleLimiters } from '../src/server/auth.ts'
 
 const fakeBin = process.execPath
 const fakeScript = join(import.meta.dirname, 'fake-agy.mjs')
@@ -210,6 +211,25 @@ describe('MA4/MA5: per-key rate limits (429 + Retry-After)', () => {
     expect(rejected.statusCode).toBe(429)
     const passes = await countTokens(built, { authorization: `Bearer ${other.plaintext}` })
     expect(passes.statusCode).toBe(200)
+  })
+})
+
+describe('idle rate-limiter sweep (S-M10)', () => {
+  it('evicts limiters with no live window; a consumed window survives', async () => {
+    const busy = getLimiter('sweep-busy', 5)
+    await busy.consume(1) // record live for the 60s window
+    const idle = getLimiter('sweep-idle', 5) // created, never consumed
+    expect(await sweepIdleLimiters()).toBeGreaterThanOrEqual(1)
+    expect(getLimiter('sweep-busy', 5)).toBe(busy) // live window untouched
+    expect(getLimiter('sweep-idle', 5)).not.toBe(idle) // idle entry was evicted
+  })
+
+  it('an expired window becomes evictable again', async () => {
+    const lim = getLimiter('sweep-expiring', 5)
+    await lim.set(1, 1, 1) // 1-point record under the consume key, 1s window
+    await new Promise((r) => setTimeout(r, 1100))
+    await sweepIdleLimiters()
+    expect(getLimiter('sweep-expiring', 5)).not.toBe(lim)
   })
 })
 

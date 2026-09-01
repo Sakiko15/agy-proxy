@@ -297,6 +297,7 @@ async function main(): Promise<void> {
       metricsTimer.stop()
       mediaSweeper.stop()
       bus.closeAll() // ends hijacked /admin/events streams — app.close() does not
+      pool.flush() // write out a pending debounced hot-path persist (S-M8)
       await poolAuth.cancel().catch(() => undefined)
       await ledger.close().catch(() => undefined) // flush → WAL checkpoint → close
     },

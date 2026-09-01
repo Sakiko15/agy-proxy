@@ -208,8 +208,12 @@ export function buildServer(deps: ServerDeps): BuiltServer {
     }
   })
 
-  // M4 static WebUI: registered LAST (after every API literal route) and
-  // no-op when no built frontend exists — dev/tests stay exactly as in M3.
+  // M4 static WebUI: registered after the API routes for readability, but the
+  // API routes are NOT protected by that order — the router (find-my-way)
+  // matches static segments before parametric/wildcard regardless of
+  // registration order, so @fastify/static's wildcard can never shadow them.
+  // Registration itself no-ops when no built frontend exists — dev/tests stay
+  // exactly as in M3.
   let webRoot: string | null = null
   try {
     webRoot = resolveWebDist(deps.getConfig())

@@ -242,6 +242,39 @@ describe('AdminEventBus unit: ring + replay edge cases', () => {
   })
 })
 
+describe('AdminEventBus unit: half-open client sweep', () => {
+  it('force-recycles aged registrations exactly once; fresh ones survive', () => {
+    const bus = new AdminEventBus({ getPool: () => AccountPoolManagerStub() })
+    const ended: number[] = []
+    bus.registerClient(() => {
+      ended.push(1)
+    })
+    // A freshly registered client is inside the default TTL — untouched.
+    expect(bus.sweepStaleClients(24 * 3_600_000)).toBe(0)
+    expect(ended).toEqual([])
+    // Past the TTL: end() runs exactly once even though the plain callback
+    // (unlike the route's end()) never unregisters itself.
+    expect(bus.sweepStaleClients(0)).toBe(1)
+    expect(ended).toEqual([1])
+    expect(bus.sweepStaleClients(0)).toBe(0)
+    expect(ended).toEqual([1])
+    bus.closeAll()
+  })
+
+  it('the sweep ends clients but never touches subscribers; end() owns both', () => {
+    const bus = new AdminEventBus({ getPool: () => AccountPoolManagerStub() })
+    const unsubscribe = bus.subscribe(() => {})
+    bus.registerClient(() => {})
+    bus.sweepStaleClients(0)
+    // Subscribers are removed only through their route's end() or closeAll();
+    // the sweeper must not silently drop a possibly-live subscriber.
+    expect(bus.subscriberCount).toBe(1)
+    unsubscribe()
+    expect(bus.subscriberCount).toBe(0)
+    bus.closeAll()
+  })
+})
+
 // Pool data shape for bus unit tests — a tiny literal AccountPoolData stub.
 function AccountPoolManagerStub(): any {
   return { version: 1, mode: 'sequential', defaultCooldownMs: 900_000, maxCooldownMs: 3_600_000, accounts: [] }

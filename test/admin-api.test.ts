@@ -17,6 +17,34 @@ describe('admin session + guards (charter §10)', () => {
     expect(bad.res.statusCode).toBe(401)
   })
 
+  it('per-IP login failure backoff: the 6th attempt 429s without password work (S-M5)', async () => {
+    const { built } = makeAdminServer()
+    for (let i = 0; i < 5; i++) {
+      const r = await login(built, 'wrong-' + i)
+      expect(r.res.statusCode).toBe(401)
+    }
+    // Past the 5-failure window the gate answers 429 pre-verify — for a wrong
+    // password AND for the correct one (the lockout is IP-scoped).
+    const blocked = await login(built, 'wrong-5')
+    expect(blocked.res.statusCode).toBe(429)
+    expect(String(blocked.res.headers['retry-after'])).toMatch(/^\d+$/)
+    expect((blocked.res.json() as { error: string }).error).toContain('too many failed logins')
+    const correct = await login(built)
+    expect(correct.res.statusCode).toBe(429)
+  }, 20_000)
+
+  it('a successful login resets the IP failure record (S-M5)', async () => {
+    const { built } = makeAdminServer()
+    for (let i = 0; i < 4; i++) await login(built, 'nope')
+    const good = await login(built)
+    expect(good.res.statusCode).toBe(200)
+    // Fresh window: five more failures stay 401, never 429.
+    for (let i = 0; i < 5; i++) {
+      const r = await login(built, 'nope-again')
+      expect(r.res.statusCode).toBe(401)
+    }
+  }, 20_000)
+
   it('/admin/* without a session → 401; a valid cookie passes', async () => {
     const { built } = makeAdminServer()
     const denied = await adminGet(built, '/admin/pool', '')

@@ -193,7 +193,7 @@ agy-proxy 是自托管的 LLM 网关：把 Google Antigravity 官方 `agy` CLI �
 - **API key**：sha256 哈希 + 前 8 位前缀辨识；每 key RateLimiterMemory 限流 + 429 带 Retry-After；模型白名单**已落地（M5）**——`getScopes(keyId)` 引擎预 spawn 对实际服务模型（fallback 解析后）判定，`Err.MODEL_NOT_ALLOWED` → 双协议 403 permission_error；根 key 与未配置白名单的 key 旁路（空=不限，非 deny-all）
 - **Admin 面**：argon2 密码 + DB session（哈希落库、可吊销）；同源 SPA + SameSite=Lax；admin 变更路由要求自定义头（X-Requested-With）作 CSRF 双保险；默认监听 127.0.0.1、由反代对外
 - **agy 权限（受控工具执行）**：workspace 限定网关专用目录（每账号独立子目录），权限模式默认 `plan`；`--dangerously-skip-permissions` 默认关闭，设置页开启需二次确认 + 全程警示横幅（skip = key 持有者可在容器内执行任意命令——本立项最大单点风险）；`--sandbox` 兼容性评估列入 M5（官方 issue #36：不可与 skip 组合）
-- **凭证卫生**：OAuth token 文件永不读取/复制/入日志；doctor 式脱敏（auth URL / `4/` 授权码 / `ya29.` / Bearer 全 scrub）
+- **凭证卫生**：token material 永不复制/导出/入日志；quota 轮询**就地读写**账号自身 token 文件（`getStoredToken`/`persistRefreshedToken`：读取 access/refresh 供配额端点认证，过期即用 refresh_token 刷新并回写**原文件原格式**——agy 与轮询共享同一份新鲜凭证，避免每次轮询重复刷新；token 是唯一可信身份锚点，防止取错账号配额）；doctor 式脱敏（auth URL / `4/` 授权码 / `ya29.` / Bearer 全 scrub）
 - **传输**：TLS 交反代；`TRUSTED_PROXIES` 解析真实 IP（限流与日志）
 - **上游纪律**：代理/刷新节奏保守（继承配额轮询默认 15min）；不做 token 导出/导入功能
 

@@ -18,17 +18,9 @@ export function binCandidates(dir: string, platform: string = process.platform):
   return exts.map((e) => join(dir, 'agy' + e))
 }
 
-/** True when the resolved bin is a Windows cmd shim (needs shell wrapping). */
+/** True when the resolved bin is a Windows cmd shim (never spawnable here). */
 export function isCmdShim(bin: string): boolean {
   return /\.(cmd|bat)$/i.test(bin)
-}
-
-/** cmd.exe argument quoting (cross-spawn rules). Exported for tests. */
-export function windowsQuote(arg: string): string {
-  if (/[ \t\n\v"]/.test(arg) === false) return arg
-  let escaped = arg.replace(/(\\+)\"/g, '$1$1\\"').replace(/(\\+)$/, '$1$1')
-  escaped = '"' + escaped.replace(/"/g, '\\"') + '"'
-  return escaped
 }
 
 /**
@@ -206,23 +198,30 @@ function killTree(child: ChildProcess): void {
 
 export function startAgyProcess(opts: RunOptions): RunningProcess {
   const started = Date.now()
-  const viaCmd = IS_WIN && isCmdShim(opts.bin)
+  // S-H4 fail-closed: a Windows .cmd/.bat shim can only execute through
+  // cmd.exe, whose quoting cannot neutralize hostile text (Node itself
+  // refuses to spawn .bat/.cmd without a shell since CVE-2024-27980). The
+  // prompt and — on fallback catalogs — the model slug are request-controlled
+  // argv values, so the old cross-spawn quoting left a shell-injection
+  // surface on shim-only Windows installs. Refuse the spawn; the engine
+  // classifies the throw like any other spawn failure and the message names
+  // the fix. resolveAgyBin still surfaces shims so diagnostics can report
+  // exactly this instead of a generic "not installed".
+  if (IS_WIN && isCmdShim(opts.bin)) {
+    throw new Error(
+      'Windows: agy resolved to a cmd shim (' +
+        opts.bin +
+        ') — install the official agy.exe; spawning through cmd.exe would let API request text inject shell commands',
+    )
+  }
   const env = opts.env ?? process.env
-  const child = viaCmd
-    ? spawn(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', [opts.bin, ...opts.args].map(windowsQuote).join(' ')], {
-        cwd: opts.cwd,
-        env,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        windowsVerbatimArguments: true,
-        windowsHide: true,
-      })
-    : spawn(opts.bin, opts.args, {
-        cwd: opts.cwd,
-        env,
-        detached: !IS_WIN,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        windowsHide: true,
-      })
+  const child = spawn(opts.bin, opts.args, {
+    cwd: opts.cwd,
+    env,
+    detached: !IS_WIN,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  })
   let stdout = ''
   let stderr = ''
   let timedOut = false
@@ -331,7 +330,14 @@ export async function probeProcess(
   signal?: AbortSignal,
   env?: NodeJS.ProcessEnv,
 ): Promise<ProbeResult> {
-  const p = startAgyProcess({ bin, args, timeoutMs, signal, env })
+  let p: RunningProcess
+  try {
+    p = startAgyProcess({ bin, args, timeoutMs, signal, env })
+  } catch (e) {
+    // The S-H4 shim refusal throws synchronously; the probe's contract is a
+    // report, so surface it as a failed probe instead of crashing startup.
+    return { ok: false, error: String(e) }
+  }
   const out = await p.outcome
   if (out.code !== 0) {
     return { ok: false, error: out.stderrTail.trim() !== '' ? out.stderrTail.trim() : `exited with code ${out.code}` }

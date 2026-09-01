@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { resolveConfig } from '../src/common/config.ts'
-import { compareVersions, parseVersion, binCandidates, windowsQuote, isCmdShim, isolatedHomeEnv, probeProcess } from '../src/host/runner.ts'
+import { compareVersions, parseVersion, binCandidates, isCmdShim, isolatedHomeEnv, probeProcess, startAgyProcess } from '../src/host/runner.ts'
 import { compareVersions as cmp2 } from '../src/index.ts'
 
 const NODE = process.execPath
@@ -118,11 +118,25 @@ describe('runner helpers', () => {
     expect(isCmdShim('/usr/bin/agy')).toBe(false)
   })
 
-  it('windowsQuote quotes args with spaces', () => {
-    expect(windowsQuote('plain')).toBe('plain')
-    expect(windowsQuote('a b')).toBe('"a b"')
-    expect(windowsQuote('say "hi"')).toBe('"say \\"hi\\""')
+  it('refuses to spawn a Windows cmd shim (S-H4)', async () => {
+    const run = (): ReturnType<typeof startAgyProcess> => startAgyProcess({ bin: 'C:\\x\\agy.cmd', args: ['-p', 'hi'] })
+    if (process.platform === 'win32') {
+      // A .cmd can only run through cmd.exe, whose quoting lets request text
+      // inject shell commands — the spawn must fail closed, not wrap in /c.
+      expect(run).toThrow(/cmd shim.*install the official agy\.exe/s)
+    } else {
+      // POSIX has no cmd shims: the name is just a path. Spawn proceeds and
+      // fails asynchronously (ENOENT → code null), which must still settle.
+      const out = await run().outcome
+      expect(out.code).toBeNull()
+    }
   })
+
+  it('probeProcess reports the shim refusal as a failed probe (S-H4)', async () => {
+    const r = await probeProcess(process.platform === 'win32' ? 'C:\\x\\agy.cmd' : '/nonexistent/agy.cmd', ['--version'])
+    expect(r.ok).toBe(false)
+    if (process.platform === 'win32') expect(r.error).toContain('cmd shim')
+  }, 30_000)
 
   it('isolatedHomeEnv sets USERPROFILE family on win32', () => {
     const env = isolatedHomeEnv('D:\\acc1')

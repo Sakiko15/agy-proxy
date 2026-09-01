@@ -127,3 +127,26 @@ describe('parser', () => {
     expect(tool.tool?.name).toBe('bash')
   })
 })
+
+describe('parser S-M6 memory bounds', () => {
+  it('discards a torn line past the pending cap; parsing stays tolerant', () => {
+    const p = new StreamJsonParser()
+    p.feed('x'.repeat(1_100_000)) // > 1 MiB with no newline
+    expect(p.stats.overflowDrops).toBe(1)
+    // A well-formed line after the drop still parses.
+    const evs = p.feed('{"event":"result","result":{"conversation_id":"c1","status":"DONE","response":"done"}}' + '\n')
+    expect(evs).toHaveLength(1)
+    expect(asResult(evs[0]).ok).toBe(true)
+    expect(p.stats.garbage).toBe(0)
+  })
+
+  it('truncates stored diagnostics lines and garbage payloads', () => {
+    const p = new StreamJsonParser()
+    const evs = p.feed('z'.repeat(5_000_000) + '\n')
+    const g = evs[0]
+    expect(g?.kind).toBe('garbage')
+    if (g?.kind === 'garbage') expect(g.line.length).toBe(4000)
+    expect(p.recentLines[0]?.length).toBe(4000)
+    expect(p.stats.garbage).toBe(1)
+  })
+})

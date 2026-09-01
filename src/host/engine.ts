@@ -759,7 +759,7 @@ export class AgyEngine {
         if (attemptAcc) {
           const lastSpawn = this.lastAccountSpawnTime.get(attemptAcc.id) ?? 0
           const elapsed = Date.now() - lastSpawn
-          const jitter = Math.floor(Math.random() * 300) // 100~400ms organic jitter
+          const jitter = Math.floor(Math.random() * 300) // 0~299ms organic jitter
           const targetInterval = this.minSpawnIntervalMs + jitter
           if (elapsed < targetInterval) {
             await new Promise((r) => setTimeout(r, targetInterval - elapsed))
