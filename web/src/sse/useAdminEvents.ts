@@ -9,14 +9,17 @@ import type { AccountPoolData, AdminEvent, RunEventPayload } from '../api/types.
 export interface AdminEventsState {
   /** 'connecting' until the first event; 'online' after; 'offline' on error. */
   status: 'connecting' | 'online' | 'offline'
-  /** Newest-first — the dashboard feed and recent-error stream. */
-  runs: RunEventPayload[]
+  /** Newest-first — the dashboard feed and recent-error stream. `at` is the
+   *  server-side event timestamp (not present in the run payload itself). */
+  runs: Array<RunEventPayload & { at: number }>
   pool: AccountPoolData | null
   /** Last received event seq (from the SSE id line). */
   lastEventId: number
 }
 
 const RUNS_BUFFER = 100
+
+export type LiveRun = RunEventPayload & { at: number }
 
 export function useAdminEvents(): AdminEventsState {
   const [state, setState] = useState<AdminEventsState>({ status: 'connecting', runs: [], pool: null, lastEventId: 0 })
@@ -57,7 +60,7 @@ export function useAdminEvents(): AdminEventsState {
           setState((previous) => ({
             ...previous,
             status: 'online',
-            runs: [data.run as RunEventPayload, ...previous.runs].slice(0, RUNS_BUFFER),
+            runs: [{ ...(data.run as RunEventPayload), at: data.at }, ...previous.runs].slice(0, RUNS_BUFFER),
             ...seqPatch,
           }))
           break

@@ -10,6 +10,7 @@ import './i18n/index.ts'
 import { requireAuth } from './auth.ts'
 import { AppShell } from './shell/AppShell.tsx'
 import { LoginPage } from './routes/login.tsx'
+import { DashboardPage } from './routes/dashboard.tsx'
 import './app.css'
 
 const queryClient = new QueryClient({
@@ -32,7 +33,7 @@ const appRoute = createRoute({
 const indexRoute = createRoute({
   getParentRoute: () => appRoute,
   path: '/',
-  component: () => <div className="text-sm text-muted-foreground">dashboard placeholder</div>,
+  component: DashboardPage,
 })
 
 // Page stubs — replaced one per M4 commit (accounts/keys/usage/settings).
