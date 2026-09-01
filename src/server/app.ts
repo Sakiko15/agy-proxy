@@ -165,6 +165,24 @@ export function buildServer(deps: ServerDeps): BuiltServer {
     // TypeBox/Fastify validation and malformed-JSON bodies.
     const status = err instanceof Error && 'statusCode' in err ? (err as { statusCode?: number }).statusCode : undefined
     const validation = err instanceof Error && 'validation' in err ? (err as { validation?: unknown }).validation : undefined
+    // Unsupported content types (FST_ERR_CTP_*): a client POSTing
+    // form-urlencoded used to fall into the 500 branch (m3 drill finding);
+    // it is a 415 client error with a per-surface body shape.
+    if (validation === undefined && status === 415) {
+      // Fastify's CTP message ("Unsupported Media Type") does not name the
+      // offending type — surface it, since `curl -d` users rarely know their
+      // own content-type default.
+      const ct = request.headers['content-type'] ?? 'unknown'
+      const message = `${err instanceof Error ? err.message : String(err)} (content-type: ${ct})`
+      if (request.url.startsWith('/admin')) {
+        void reply.code(415).send({ ok: false, error: message })
+      } else if (isAnthropicPath(request.url)) {
+        void reply.code(415).send(anthropicError('invalid_request_error', message))
+      } else {
+        void reply.code(415).send(openAiError(message, 'invalid_request_error', 'unsupported_media_type'))
+      }
+      return
+    }
     if (validation !== undefined || status === 400 || status === 413) {
       const message = err instanceof Error ? err.message : String(err)
       if (isAnthropicPath(request.url)) {
