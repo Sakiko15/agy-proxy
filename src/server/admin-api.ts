@@ -24,6 +24,7 @@ import type { KeyStore } from './key-store.ts'
 import type { UsageLedger } from './usage-ledger.ts'
 import type { AdminSessionStore } from './admin-session.ts'
 import { parseCookieHeader, serializeClearCookie, serializeSetCookie } from './admin-session.ts'
+import { sanitizeSettings, settingsView, writeOverridesPatch } from './settings.ts'
 
 export interface AdminDeps {
   getConfig: () => GatewayConfig
@@ -386,6 +387,26 @@ export function registerAdminApi(app: AdminInstance, deps: AdminDeps): void {
 
   app.get('/admin/usage/summary', guarded(), async (_request, reply) => {
     await reply.code(200).send({ ok: true, today: deps.ledger.summarizeToday() })
+    return reply
+  })
+
+  // ---- settings (M4: the WebUI settings page writes runtime-overrides.json;
+  // env vars always win per resolveConfig, so a locked key is reported in
+  // envLocked rather than rejected — see settings.ts) ----
+  app.get('/admin/settings', guarded(), async (_request, reply) => {
+    await reply.code(200).send({ ok: true, ...settingsView() })
+    return reply
+  })
+
+  app.put('/admin/settings', guarded({ mutating: true }), async (request, reply) => {
+    const body = (request.body ?? {}) as Record<string, unknown>
+    const parsed = sanitizeSettings(body)
+    if (!parsed.ok) {
+      await reply.code(400).send({ ok: false, error: parsed.error })
+      return reply
+    }
+    writeOverridesPatch(parsed.patch)
+    await reply.code(200).send({ ok: true, ...settingsView() })
     return reply
   })
 }
