@@ -7,8 +7,24 @@
 // completion → landed row, P95 < 2s, acceptance §4). Rows survive a SIGKILL
 // up to one flush window thanks to WAL+FULL; per-key sums are therefore
 // ±1-request accurate, matching MA5's tolerance.
+//
+// Flush is fault-tolerant (M5, DoD: disk-full ⇒ bounded buffering, never a
+// process abort): a failed transaction requeues its batch ahead of rows that
+// arrived meanwhile and the next flush window retries. The requeue is bounded
+// — over MAX_PENDING_ROWS the OLDEST rows are dropped (newest survive) — and
+// the accompanying warning is throttled to one per WARN_INTERVAL_MS so a
+// permanently full disk cannot turn into a log flood. There are no await
+// points between the buffer swap and the requeue, so the event loop makes the
+// hand-back atomic (record() cannot interleave). close() follows the same
+// guard: a failed insert must not throw out of the shutdown path, and
+// checkpoint/close are attempted even then.
 import { randomUUID } from 'node:crypto'
 import type BetterSqlite3 from 'better-sqlite3'
+
+/** Hard cap on requeued rows across failed flushes; beyond it oldest rows go. */
+export const MAX_PENDING_ROWS = 5_000
+/** Minimum gap between two "flush failed" warnings (disk-full log firehose). */
+export const WARN_INTERVAL_MS = 60_000
 
 export interface UsageRecord {
   requestId: string
@@ -66,17 +82,26 @@ export class UsageLedger {
   private timer: NodeJS.Timeout | null = null
   private closed = false
   private readonly flushIntervalMs: number
+  private readonly maxPendingRows: number
   private readonly log?: (msg: string) => void
   private readonly now: () => number
   private readonly insertStmt: BetterSqlite3.Statement
   /** Warn once about post-close record() calls (straggler run callbacks). */
   private warnedClosed = false
+  /** Timestamp of the last flush-failure warning (throttle state). */
+  private lastWarnAt = 0
 
   constructor(
     private readonly db: BetterSqlite3.Database,
-    opts: { flushIntervalMs?: number; now?: () => number; log?: (msg: string) => void } = {},
+    opts: {
+      flushIntervalMs?: number
+      now?: () => number
+      log?: (msg: string) => void
+      maxPendingRows?: number
+    } = {},
   ) {
     this.flushIntervalMs = Math.max(50, opts.flushIntervalMs ?? 1_000)
+    this.maxPendingRows = Math.max(1, opts.maxPendingRows ?? MAX_PENDING_ROWS)
     this.log = opts.log
     this.now = opts.now ?? Date.now
     this.insertStmt = db.prepare(`
@@ -121,18 +146,33 @@ export class UsageLedger {
     if (this.buffer.length >= 500) void this.flush()
   }
 
-  /** Drain the buffer inside one transaction (idempotent per request_id). */
+  /** Drain the buffer inside one transaction (idempotent per request_id).
+   *  Never throws — a failed transaction is requeued for the next window. */
   async flush(): Promise<void> {
     if (this.closed || this.buffer.length === 0) return
     const batch = this.buffer
     this.buffer = []
     const ts = this.now()
-    const tx = this.db.transaction((rows: InsertParams[]) => {
-      for (const r of rows) {
-        this.insertStmt.run({ ...r, createdAt: ts })
+    try {
+      this.insertBatch(batch, ts)
+    } catch (err) {
+      // No await between the swap above and this requeue: record() cannot
+      // interleave, so the merged order is strictly time-ordered.
+      this.buffer = [...batch, ...this.buffer]
+      if (this.buffer.length > this.maxPendingRows) {
+        const dropped = this.buffer.length - this.maxPendingRows
+        this.buffer = this.buffer.slice(-this.maxPendingRows)
+        this.warnThrottled(
+          `usage ledger flush failed (${describeError(err)}) — ` +
+            `${dropped} oldest row(s) dropped, keeping the newest ${this.maxPendingRows} for retry`,
+        )
+      } else {
+        this.warnThrottled(
+          `usage ledger flush failed (${describeError(err)}) — ` +
+            `${this.buffer.length} row(s) requeued for the next window`,
+        )
       }
-    })
-    tx(batch)
+    }
   }
 
   /** SUM(total_tokens) for one key since LOCAL midnight (MA5 daily budget). */
@@ -177,23 +217,46 @@ export class UsageLedger {
     return { total, rows: rows.map(fromDbRow) }
   }
 
-  /** flush → WAL checkpoint (TRUNCATE) → close. Further record()s are no-ops. */
+  /** flush → WAL checkpoint (TRUNCATE) → close. Further record()s are no-ops.
+   *  Never throws: even with a poisoned database the shutdown path completes
+   *  and does not leave the process wedged on teardown. */
   async close(): Promise<void> {
     if (this.closed) return
     this.disarmTimer()
     this.closed = true
     if (this.buffer.length > 0) {
       const batch = this.buffer
-      this.buffer = []
-      const tx = this.db.transaction((rows: InsertParams[]) => {
-        for (const r of rows) {
-          this.insertStmt.run({ ...r, createdAt: this.now() })
-        }
-      })
-      tx(batch)
+      this.buffer = [] // teardown: rows are dropped on failure, not requeued
+      try {
+        this.insertBatch(batch, this.now())
+      } catch (err) {
+        this.warnThrottled(`usage ledger close: final flush failed (${describeError(err)}) — rows dropped`)
+      }
     }
-    this.db.pragma('wal_checkpoint(TRUNCATE)')
-    this.db.close()
+    try {
+      this.db.pragma('wal_checkpoint(TRUNCATE)')
+      this.db.close()
+    } catch (err) {
+      this.warnThrottled(`usage ledger close: checkpoint/close failed (${describeError(err)})`)
+    }
+  }
+
+  /** One transaction of INSERT OR IGNOREs — idempotent per request_id. */
+  private insertBatch(rows: InsertParams[], ts: number): void {
+    const tx = this.db.transaction((batch: InsertParams[]) => {
+      for (const r of batch) {
+        this.insertStmt.run({ ...r, createdAt: ts })
+      }
+    })
+    tx(rows)
+  }
+
+  /** Throttled failure warning — at most one per WARN_INTERVAL_MS so a
+   *  permanently full disk cannot flood the log; clock is the injectable one. */
+  private warnThrottled(msg: string): void {
+    if (this.now() - this.lastWarnAt < WARN_INTERVAL_MS) return
+    this.lastWarnAt = this.now()
+    this.log?.(msg)
   }
 
   private armTimer(): void {
@@ -217,6 +280,10 @@ function startOfToday(now: () => number): number {
   const midnight = new Date(now())
   midnight.setHours(0, 0, 0, 0)
   return midnight.getTime()
+}
+
+function describeError(err: unknown): string {
+  return err instanceof Error ? `${err.message} [${(err as { code?: string }).code ?? 'NO_CODE'}]` : String(err)
 }
 
 interface RawUsageDbRow {
