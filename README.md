@@ -4,10 +4,10 @@ Self-hosted LLM gateway: Google Antigravity (official `agy` CLI) as the upstream
 exposed as OpenAI Chat Completions + Anthropic Messages compatible HTTP APIs with per-key
 quotas and a management WebUI. Runs in Docker on a VPS behind a reverse proxy.
 
-**Status: M3 (account pool + key management + SQLite accounting) — under active development.**
-The account pool, the paste-URL login flow with QR, per-key quotas and the SQLite usage
-ledger, and the JSON admin API are in; the WebUI pages (M4) ride on the same admin routes.
-See [docs/charter.md](docs/charter.md) (立项文档), [docs/development.md](docs/development.md),
+**Status: M4 (management WebUI) — under active development.** The six-page zh-CN console
+(login / dashboard / accounts / keys / usage / settings) rides the same admin API, with live
+updates over `/admin/events` SSE and same-process static hosting. See
+[docs/charter.md](docs/charter.md) (立项文档), [docs/development.md](docs/development.md),
 [docs/acceptance.md](docs/acceptance.md).
 
 ## Risk disclaimer
@@ -49,6 +49,11 @@ curl http://127.0.0.1:8080/v1/messages \
 
 `GET /healthz` is unauthenticated and returns `{"ok":true}` for orchestration probes.
 
+When a built frontend exists (`web/dist` — `npm run web:build`, or `AGY_PROXY_WEB_DIST`),
+the same process serves the management console at `/` (dot-free GET paths fall through to
+the SPA; API 404 shapes stay identical). Development: `npm run web:dev` starts the Vite dev
+server with `/admin` and `/v1` proxied to a local gateway.
+
 ## Endpoints
 
 | Route | Notes |
@@ -89,6 +94,8 @@ must carry a non-empty `x-requested-with` header). Session cookie: `HttpOnly; Sa
 | `POST /admin/pool/quota/refresh` · `/admin/pool/mode` · `/admin/pool/reorder` | Pool-wide refresh, selection mode, sticky order |
 | `GET/POST/PATCH/DELETE /admin/keys` | Key lifecycle — `POST` returns the `sk-agy-` plaintext **exactly once**; it is never logged |
 | `GET /admin/usage` · `/admin/usage/summary` | Ledger query (`keyId`,`model`,`family`,`from`,`to`,`limit`≤500,`offset`) and today's totals |
+| `GET /admin/events` | **SSE** (`text/event-stream`): seq-stamped `snapshot`/`run`/`pool` events; reconnects replay from `Last-Event-ID` (snapshot XOR replay) |
+| `GET /admin/settings` · `PUT /admin/settings` | Settings view `{requested, effective, envLocked}` · write the 9-key allowlist to `runtime-overrides.json` (atomically; env vars still win — locked keys are *reported*, written values land in the file) |
 
 Usage accounting: one ledger row per actual agy spawn, keyed by the caller's `x-request-id`
 header (or the request id) — replaying the same id does not double-count. Per-key day

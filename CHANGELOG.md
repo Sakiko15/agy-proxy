@@ -2,6 +2,25 @@
 
 All notable changes to agy-proxy are documented here. Format based on Keep a Changelog; versions follow semver.
 
+## [Unreleased] (M4 管理 WebUI)
+
+### Added
+- **WebUI (`web/`, React 19 + Vite 8 + Tailwind v4 + TanStack Router/Query + react-i18next)**: six pages (charter §9) riding the admin JSON + SSE surface — login; dashboard (today's stats + live run feed + recent errors); accounts (dual 5h/weekly quota bars with reset countdowns, live cooldown countdowns + reasons, health badges incl. `VALIDATION_REQUIRED` + `validation_url` surfacing, paste-URL login with same-origin QR, enable/disable/proxy/clear-cooldown/refresh); API keys (create-once plaintext dialog gated by an "I saved it" checkbox, quota edits, disable/delete); usage log (filters + 50-row pages + status chips + client-side CSV export of the filtered rows); settings (effective vs in-file values, env-locked lock hints, `permissionMode=skip` behind a consequence dialog + typed SKIP confirmation per charter §10, with an app-wide warning banner in the shell). zh-CN default with EN switch (persisted, navigator detection), light/dark/system theme (pre-paint, no FOUC), 375px-responsive layouts. i18n discipline is mechanically enforced: zh/en key-set identity is tested, and all CJK lives in `.ts` resource files (acceptance greps only `*.tsx`).
+- **Admin event bus + `GET /admin/events`** (src/server/events.ts): the server had no push surface. Monotonic seq `id:`-stamped SSE events (`snapshot`/`run`/`pool`), a 200-event ring for `Last-Event-ID` reconnect replay with snapshot XOR replay semantics (never both — no gap merging, no duplicate rows), trailing-edge 250ms-debounced pool snapshots via the new pool `onChange` hook, and `run` events carrying exactly the usage-ledger fields from the same `onRun` hook. SseWriter gained optional `id` framing; hijacked streams register explicit end callbacks because `app.close()` does not close hijacked connections.
+- **Settings write path** (src/server/settings.ts): `GET/PUT /admin/settings` — a 9-key allowlist (defaultModel, defaultEffort, timeoutMs, maxConcurrent, maxQueueDepth, permissionMode, enabled, autoFallbackModel, quotaPollIntervalMs) written atomically (tmp+rename) to `runtime-overrides.json`, clamps mirroring resolveConfig's env rules line-for-line, hand-edited keys preserved, `apiKey`/`adminPassword` and boot-critical keys excluded. Env-owned keys are reported per-key (`envLocked`) rather than rejected: the file stores the requested value so it becomes effective the day the variable is removed.
+- **Static WebUI hosting** (src/server/static.ts, @fastify/static ^8 — charter §8 amendment): `wildcard:false` per-file routes can never shadow the /v1, /admin, /healthz literals; the SPA fallback rides in front of the single not-found handler for dot-free GET non-API paths; every cache-control decision is owned (`cacheControl:false` — send()'s default `public, max-age=0` would have overridden setHeaders), hashed assets immutable 1y, index `no-cache`. No built frontend → JSON-only no-op with one info log; a broken `AGY_PROXY_WEB_DIST` can never take the server down.
+- **CI/CD**: root `build` chains `tsdown && npm --prefix web run build` (development.md §3 semantics); CI installs web deps, runs the web vitest suites and a `web/src` console.log fence (G4 parity); Dockerfile gained a web build stage finally feeding the `COPY web/dist` line it always had.
+
+### Fixed
+- **Unsupported content-type → 415** (closes the m3 drill finding): `FST_ERR_CTP_*` fell into the 500 branch; now a first-class 415 with per-surface bodies (admin `{ok:false}`, dual-protocol OpenAI/Anthropic) and the offending content-type named in the message (Fastify's own CTP message does not).
+- CI push trigger corrected `main` → `master` — the default branch had never run push CI (pre-existing mismatch).
+
+### Deliberate deviations (M4)
+- **No error-text column in the usage page**: ledger schema v1 has none; the page shows status codes (chip per code) and the raw text stays in gateway logs. `errorText` is a schema-v2/M5 candidate. This deviates from charter §9 page-5 wording and is recorded here instead of faking a field.
+- **TanStack Virtual not introduced** (charter §9 principle): the log table is server-paginated ≤500 rows where virtualization costs a11y and bundle for no gain; charter §8 WebUI row annotated. Revisit if M5 adds an unbounded live log.
+- **Per-key model whitelist (scopes)**: enforcement deliberately deferred to M5 (user decision); the keys UI shows a read-only "planned M5" badge instead of a dead edit form.
+- Dashboard "success rate" derives from two from-midnight ledger queries (all vs `status=OK`) because the day summary carries no status split.
+
 ## [Unreleased] (M3 池与记账)
 
 ### Added
