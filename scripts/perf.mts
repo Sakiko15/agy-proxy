@@ -254,9 +254,19 @@ async function main(): Promise<void> {
   }
   const serialMs = Date.now() - tSerial0
   const tParallel0 = Date.now()
-  await Promise.all([call(h, false, 310), call(h, false, 311), call(h, false, 312)])
+  const par = await Promise.all([call(h, false, 310), call(h, false, 311), call(h, false, 312)])
   const parallelMs = Date.now() - tParallel0
   const speedup = parallelMs > 0 ? serialMs / parallelMs : 0
+  // M5 drill diagnosis: print which account each parallel call landed on and
+  // the per-call latency — stacking on one account's queue caps the ratio.
+  {
+    const usage = await h.api('GET', '/admin/usage?limit=12', undefined, cookie)
+    const rows = (JSON.parse(usage.body) as { rows?: Array<{ requestId: string; accountId: string; durationMs: number }> }).rows ?? []
+    for (const r of rows) {
+      if (r.requestId.startsWith('perf-3')) console.log(`      [leg6] ${r.requestId} account=${r.accountId} durationMs=${String(r.durationMs)}`)
+    }
+    console.log(`      [leg6] per-call ms: ${par.map((c) => String(c.ms)).join('/')}`)
+  }
   judge('6 three-account scale ≥ 2.5x', speedup >= 2.5, `serial=${String(serialMs)}ms parallel=${String(parallelMs)}ms (ratio ${String(Math.round(speedup * 10) / 10)})`)
 
   // 3: flood forwarding vs bare pipe (same 20k-event fake process, no awaits)
