@@ -30,6 +30,24 @@ export function redactLine(line: string): string {
   return out
 }
 
+/**
+ * Narrow client-boundary scrub for terminal failure text shipped to API
+ * clients: strips only token-shaped material (OAuth access tokens, bearer
+ * headers, long `4/…` authorization codes — the run excludes `/`, so a URL
+ * segment after a code-looking path stays visible) and leaves URLs verbatim —
+ * the VALIDATION_REQUIRED `validation_url` passthrough is a feature surface.
+ * redactLine() is deliberately NOT used here: its accounts.google.com rule
+ * destroys the validation_url and its `\b[0-9]{4,}/` rule mangles ordinary
+ * prose (a plain "1234/" becomes 4/<code-redacted>).
+ */
+export function scrubTokenMaterial(text: string): string {
+  let out = text
+  out = out.replace(/ya29\.[A-Za-z0-9._-]+/g, '<oauth-token-redacted>')
+  out = out.replace(/Bearer\s+\S+/gi, 'Bearer <redacted>')
+  out = out.replace(/\b4\/[A-Za-z0-9._+=-]{20,}/g, '<code-redacted>')
+  return out
+}
+
 export function writeDoctorReport(deps: DoctorDeps): string {
   const cfg = deps.cfg()
   const cat = deps.catalog().get()

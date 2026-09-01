@@ -20,6 +20,7 @@ import { CallId, type StreamChunk, type TokenUsage } from './stream-types.ts'
 import type { AgyEvent, RawUsage } from '../common/types.ts'
 import { mirrorCallId } from './recording.ts'
 import { MIRROR_TOOL_NAME } from './mirror.ts'
+import { scrubTokenMaterial } from './diagnostics.ts'
 
 export function usageFromRaw(raw: RawUsage): TokenUsage {
   // Optional counters are omitted, not set to undefined, so JSON
@@ -282,9 +283,13 @@ export class EventMapper {
     this.finished = true
   }
 
-  /** Terminal error/abort: close what is open, zero usage, failure finish. */
+  /** Terminal error/abort: close what is open, zero usage, failure finish.
+   *  The message crosses the client boundary here (every terminal failure of
+   *  both protocols funnels through this generator), so token-shaped material
+   *  is scrubbed while URLs — validation_url included — pass through. */
   *emitFailure(kind: 'error' | 'aborted', code: string, message: string): Generator<StreamChunk> {
     if (this.finished) return
+    const clean = scrubTokenMaterial(message)
     const close = this.closeOpen()
     if (close) yield close
     yield { type: 'usage', usage: { inputTokens: 0, outputTokens: 0 } }
@@ -292,8 +297,8 @@ export class EventMapper {
       type: 'finish',
       reason:
         kind === 'error'
-          ? { kind: 'error', failure: { message, code } }
-          : { kind: 'aborted', failure: { message, code } },
+          ? { kind: 'error', failure: { message: clean, code } }
+          : { kind: 'aborted', failure: { message: clean, code } },
     };
     this.finished = true
   }
