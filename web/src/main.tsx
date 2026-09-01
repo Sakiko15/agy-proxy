@@ -12,6 +12,7 @@ import { AppShell } from './shell/AppShell.tsx'
 import { LoginPage } from './routes/login.tsx'
 import { DashboardPage } from './routes/dashboard.tsx'
 import { AccountsPage } from './routes/accounts.tsx'
+import { KeysPage } from './routes/keys.tsx'
 import './app.css'
 
 const queryClient = new QueryClient({
@@ -43,7 +44,7 @@ function pageStub(name: string) {
 }
 
 const accountsRoute = createRoute({ getParentRoute: () => appRoute, path: '/accounts', component: AccountsPage })
-const keysRoute = createRoute({ getParentRoute: () => appRoute, path: '/keys', component: pageStub('keys') })
+const keysRoute = createRoute({ getParentRoute: () => appRoute, path: '/keys', component: KeysPage })
 const usageRoute = createRoute({ getParentRoute: () => appRoute, path: '/usage', component: pageStub('usage') })
 const settingsRoute = createRoute({ getParentRoute: () => appRoute, path: '/settings', component: pageStub('settings') })
 
