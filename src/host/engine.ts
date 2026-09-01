@@ -441,7 +441,28 @@ export class AgyEngine {
 
     let activeModel = model === '' ? cfg.defaultModel : model
     let family = modelFamilyOf(activeModel)
-    let account = this.deps.pool ? this.deps.pool.selectAccount(family) : undefined
+    // Accounts with in-flight spawns (tracked by THIS engine until settle) are
+    // skipped by selectAccount so concurrent requests spread across the pool
+    // (M5: acceptance §4 互不阻塞 / ≥2.5× throughput). Busy-but-healthy pools
+    // fall through to the unfiltered selection inside the pool.
+    const busyAccounts = new Set<string>()
+    const inFlightCount = new Map<string, number>()
+    const trackBusy = (id: string | undefined): void => {
+      if (id === undefined) return
+      inFlightCount.set(id, (inFlightCount.get(id) ?? 0) + 1)
+      busyAccounts.add(id)
+    }
+    const untrackBusy = (id: string | undefined): void => {
+      if (id === undefined) return
+      const left = (inFlightCount.get(id) ?? 1) - 1
+      if (left <= 0) {
+        inFlightCount.delete(id)
+        busyAccounts.delete(id)
+      } else {
+        inFlightCount.set(id, left)
+      }
+    }
+    let account = this.deps.pool ? this.deps.pool.selectAccount(family, busyAccounts) : undefined
     if (this.deps.pool && this.deps.pool.getAccounts().length > 0 && !account) {
       if (cfg.autoFallbackModel) {
         const fallbackSlugs = ['gemini-3.5-flash', 'gemini-3.6-flash']
@@ -488,6 +509,7 @@ export class AgyEngine {
       }
     }
 
+    trackBusy(account?.id)
     const sessionAccountKey = account ? `${sessionKey}:${account.id}` : sessionKey
     let binding = sessionAccountKey !== '' ? this.deps.store.get(sessionAccountKey) : undefined
 
@@ -887,12 +909,18 @@ export class AgyEngine {
           }
           // Same sticky selection as the first spawn, for the fixed family.
           // A retryable failure never touches account state, so this normally
-          // returns the same account; an operator disable mid-flight keeps
-          // the settled failure instead of a secondhand POOL_EXHAUSTED.
+          // returns the same account (now un-busy); an operator disable
+          // mid-flight keeps the settled failure instead of a secondhand
+          // POOL_EXHAUSTED.
           if ((this.deps.pool?.getAccounts().length ?? 0) > 0) {
-            const next = this.deps.pool?.selectAccount(family) ?? undefined
-            if (next === undefined) break
+            untrackBusy(attemptAccount?.id)
+            const next = this.deps.pool?.selectAccount(family, busyAccounts) ?? undefined
+            if (next === undefined) {
+              trackBusy(attemptAccount?.id)
+              break
+            }
             attemptAccount = next
+            trackBusy(next.id)
           }
         }
         releaseOnce()
@@ -935,6 +963,8 @@ export class AgyEngine {
       } catch (err) {
         releaseOnce()
         rec.settle({ kind: 'error', code: Err.PROCESS_EXIT, message: 'internal error: ' + brief(String(err)) })
+      } finally {
+        untrackBusy(attemptAccount?.id)
       }
     })()
 

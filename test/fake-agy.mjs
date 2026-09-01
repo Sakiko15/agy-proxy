@@ -32,6 +32,9 @@
 //                   (TerminateProcess); POSIX: signal SIGKILL, code null.
 //   kill-mid      — init + a text delta, THEN SIGKILL (partial output on the
 //                   wire ⇒ the no-replay guard must end the run, single spawn)
+//   flood         — FAKE_AGY_FLOOD_EVENTS (default 20000) tiny step events at
+//                   maximum write speed, then an ok-shaped result: the perf
+//                   harness measures end-to-end forwarding vs a bare pipe.
 //
 // FAKE_AGY_EVENTS_FILE (any mode): when set, every line of that file is
 // written to stdout verbatim — the golden-case runner replays recorded event
@@ -117,6 +120,23 @@ if (mode === 'kill-mid') {
   await sleep(Number(process.env.FAKE_AGY_DELAY_MS ?? 40))
   process.kill(process.pid, 'SIGKILL')
   await new Promise(() => {})
+}
+
+if (mode === 'flood') {
+  // Throughput drill: no awaits between writes — the pipe itself is the
+  // bottleneck from here on.
+  const count = Number(process.env.FAKE_AGY_FLOOD_EVENTS ?? 20_000)
+  emit({ event: 'init', conversation_id: conv, model: 'gemini-3-6-flash' })
+  const chunk = Math.ceil(count / 16)
+  for (let batch = 0; batch < count; batch += chunk) {
+    let out = ''
+    for (let i = batch; i < Math.min(batch + chunk, count); i++) {
+      out += JSON.stringify({ event: 'step_update', step_update: { conversation_id: conv, step_index: 0, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'x' } }) + '\n'
+    }
+    process.stdout.write(out)
+  }
+  emit({ event: 'result', result: { conversation_id: conv, status: 'DONE', response: 'flood done', usage: { input_tokens: 1, output_tokens: 1 } } })
+  process.exit(0)
 }
 
 if (mode === 'slow') {

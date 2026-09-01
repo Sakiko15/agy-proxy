@@ -439,10 +439,17 @@ export class AccountPoolManager {
    * Core scheduling algorithm: Sticky Sequential Drain.
    * Sticks to the current active account until it runs out of quota/rate-limited,
    * then smoothly advances to the next available account in cyclic order.
+   *
+   * M5 (additive): `busyAccountIds` — accounts with an in-flight or queued
+   * spawn, tracked by the engine — are skipped so concurrent requests spread
+   * across the pool instead of stacking on one account's concurrency:1 queue.
+   * When every healthy account is busy, the busy filter is dropped (a
+   * fully-busy pool still routes; the per-account queue re-serializes).
    */
-  selectAccount(family: ModelFamily): ManagedAccount | null {
+  selectAccount(family: ModelFamily, busy?: ReadonlySet<string>): ManagedAccount | null {
     const now = Date.now()
     const candidates = this.data.accounts.filter((acc) => {
+      if (busy !== undefined && busy.has(acc.id)) return false
       if (!acc.enabled || acc.authRequired) return false
       const cd = acc.cooldowns[family]
       if (cd && cd.cooldownUntil > now) return false
@@ -464,7 +471,12 @@ export class AccountPoolManager {
       return true
     })
 
-    if (candidates.length === 0) return null
+    if (candidates.length === 0) {
+      // Everything healthy is busy — fall back to the unfiltered selection so
+      // the request still routes (per-account queues re-serialize from here).
+      if (busy !== undefined && busy.size > 0) return this.selectAccount(family)
+      return null
+    }
 
     if (this.data.mode === 'round-robin' && candidates.length > 1) {
       // Pick least recently used candidate
