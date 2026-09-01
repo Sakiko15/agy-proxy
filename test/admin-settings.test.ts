@@ -8,6 +8,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { resolveConfig } from '../src/common/config.ts'
+import { writeOverridesPatch } from '../src/server/settings.ts'
 import { makeAdminServer, login, adminGet } from './helpers.admin.ts'
 
 const dataDirs: string[] = []
@@ -165,5 +166,20 @@ describe('PUT /admin/settings', () => {
     process.env.AGY_PROXY_MODE = 'bogus'
     const res2 = await built.app.inject({ method: 'GET', url: '/admin/settings', headers: { cookie } })
     expect((res2.json() as { envLocked: string[] }).envLocked).not.toContain('permissionMode')
+  })
+})
+
+describe('writeOverridesPatch failure cleanup', () => {
+  it('a failed write/rename does not strand the .tmp residue and rethrows', () => {
+    // The rename target pre-exists as a directory: writeFileSync(tmp) succeeds,
+    // renameSync(tmp → file) fails on every platform (EISDIR/EPERM) — the real
+    // error path the guard exists for, no mocks.
+    const dir = mkdtempSync(join(tmpdir(), 'agy-settings-fail-'))
+    dataDirs.push(dir)
+    const file = join(dir, 'gateway')
+    mkdirSync(file)
+    expect(() => writeOverridesPatch({ timeoutMs: 1000 }, file)).toThrow()
+    expect(existsSync(file + '.tmp')).toBe(false)
+    expect(existsSync(join(dir, 'gateway.tmp'))).toBe(false)
   })
 })

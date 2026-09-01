@@ -12,7 +12,7 @@
 //     stores the requested value (it becomes effective the day the env var is
 //     removed), while a hard 400 would silently block rotation workflows;
 //   - unknown pre-existing keys in the overrides file are preserved verbatim.
-import { mkdirSync, renameSync, writeFileSync } from 'node:fs'
+import { mkdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import {
   overridesPath,
@@ -184,8 +184,16 @@ export function writeOverridesPatch(patch: OverridesFile, file: string = overrid
   const merged: OverridesFile = { ...readOverrides(file), ...patch }
   const tmp = `${file}.tmp`
   mkdirSync(dirname(tmp), { recursive: true })
-  writeFileSync(tmp, JSON.stringify(merged, null, 2) + '\n')
-  renameSync(tmp, file)
+  try {
+    writeFileSync(tmp, JSON.stringify(merged, null, 2) + '\n')
+    renameSync(tmp, file)
+  } catch (err) {
+    // A failed write/rename must not strand the .tmp residue next to the real
+    // overrides file (M5 hardening); drop it best-effort and rethrow — the
+    // caller surfaces the failure to the operator, the file was never touched.
+    try { unlinkSync(tmp) } catch { /* best effort */ }
+    throw err
+  }
 }
 
 export interface SettingsView {
