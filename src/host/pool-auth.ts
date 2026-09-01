@@ -81,10 +81,13 @@ export class PoolAuthFlow {
     }
     this.statusValue = { ...this.statusValue, ...patch }
     if (patch.phase === 'done') {
-      // Hold the success state briefly so pollers see it, then reset.
+      // Hold the success state briefly so pollers see it, then reset. unref'd:
+      // a 30 s event-loop hold after a completed login must not keep the
+      // gateway process (or a test worker) alive past real shutdown.
       this.doneResetTimer = setTimeout(() => {
         if (this.statusValue.phase === 'done') this.statusValue = { phase: 'idle' }
       }, DONE_STATUS_TTL_MS)
+      this.doneResetTimer.unref()
     }
   }
 
