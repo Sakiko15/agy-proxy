@@ -57,6 +57,13 @@ Already ported: M0 brought `src/host/runner.ts`, `src/common/config.ts` + `types
 - Golden-case system (acceptance.md §2): `test/golden/<protocol>/<case>/` (openai/, anthropic/, models/) with `request.json` (raw body = legacy /v1/chat/completions POST, or `{method,url,query,headers,body}`) + `events.ndjson` (fake-agy `FAKE_AGY_EVENTS_FILE` verbatim replay; empty = no spawn) + `expected.json` (`_status` pins HTTP status; `sse` array for streaming cases) + `PROVENANCE.md`; every case must cite its source (OpenAI SDK path / Anthropic docs URL — the runner asserts a URL is present). Provenance convention: JSON cannot carry comments, so the citation lives in a sibling `PROVENANCE.md` plus an `_provenance` key in expected.json (stripped by the runner). Dynamic fields use sentinels: `chatcmpl-/msg_ ids → __ID__` (shape-regex checked), `agytc- mirror ids → __AGYTC__`, embedded run UUIDs → `__UUID__` (scrubbed at RAW text level pre-parse — they live inside JSON strings), `created → 0` on chat surfaces only, MODEL_CREATED (1767225600) compared literally on model listings. Per-case `case.json`: `apiKey`, `fakeAgyExitCode`, `discoveredModels`. `sseHeartbeatMs: 0` in the runner keeps SSE deterministic. Windows: temp-dir cleanup after each case is best-effort (fake-agy child can hold a handle a beat past exit).
 - fake-agy is the only upstream for tests — never hit real Google endpoints in CI. Modes: `ok|auth|noise|exit12|exit-error|real|real-error|real-fail|hang|slow|rate-limit|validation|kill-early|kill-mid|flood` plus `FAKE_AGY_EVENTS_FILE` (verbatim replay, with `FAKE_AGY_EXIT_CODE`), `FAKE_AGY_ARGS_FILE` (argv recording), `FAKE_AGY_FAIL_HOME` (hard-fails only the account whose isolated HOME matches — pool switch drills) and `FAKE_AGY_MODE_FILE` (mode re-read per process start — flip failure modes between retry attempts mid-run; falls back to `FAKE_AGY_MODE`). kill-* modes self-SIGKILL (win32 records exit code 1 / no signal, POSIX a SIGKILL signal — both classify as PROCESS_EXIT).
 
+## Working rules (standing)
+
+- Verification-first (development.md §9): never assert on unverified
+  assumptions — search the codebase + docs first, web-search when
+  project-level info is insufficient, and label anything unverified as such
+  instead of guessing.
+
 ## Release rules (inherited from AGENTS.md discipline of the upstream repo)
 
 - NEVER auto-publish npm/GitHub Release/tags. Publish only on the user's explicit command.
