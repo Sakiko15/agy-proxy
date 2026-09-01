@@ -274,8 +274,32 @@ export class AgyEngine {
    *  must not interleave on one conversation binding. Continuations bypass the
    *  queue (no spawn). Inactive without a pool. */
   private readonly accountQueues = new Map<string, PQueue>()
+  /** Accounts with in-flight spawns, tracked ENGINE-LEVEL until each request's
+   *  dispatch finally: selectAccount skips these so concurrent same-family
+   *  arrivals spread across the pool (M5 acceptance ≥2.5×). Per-call tracking
+   *  was the original M5 bug — each request only ever saw its own account, so
+   *  the busy filter filtered nothing. */
+  private readonly busyAccounts = new Set<string>()
+  private readonly inFlightCount = new Map<string, number>()
 
   constructor(private readonly deps: EngineDeps) {}
+
+  private trackBusy(id: string | undefined): void {
+    if (id === undefined) return
+    this.inFlightCount.set(id, (this.inFlightCount.get(id) ?? 0) + 1)
+    this.busyAccounts.add(id)
+  }
+
+  private untrackBusy(id: string | undefined): void {
+    if (id === undefined) return
+    const left = (this.inFlightCount.get(id) ?? 1) - 1
+    if (left <= 0) {
+      this.inFlightCount.delete(id)
+      this.busyAccounts.delete(id)
+    } else {
+      this.inFlightCount.set(id, left)
+    }
+  }
 
   /**
    * Earliest reset signal for a family across the pool: min over live cooldown
@@ -441,28 +465,11 @@ export class AgyEngine {
 
     let activeModel = model === '' ? cfg.defaultModel : model
     let family = modelFamilyOf(activeModel)
-    // Accounts with in-flight spawns (tracked by THIS engine until settle) are
+    // Accounts with in-flight spawns (tracked at ENGINE level until settle) are
     // skipped by selectAccount so concurrent requests spread across the pool
     // (M5: acceptance §4 互不阻塞 / ≥2.5× throughput). Busy-but-healthy pools
     // fall through to the unfiltered selection inside the pool.
-    const busyAccounts = new Set<string>()
-    const inFlightCount = new Map<string, number>()
-    const trackBusy = (id: string | undefined): void => {
-      if (id === undefined) return
-      inFlightCount.set(id, (inFlightCount.get(id) ?? 0) + 1)
-      busyAccounts.add(id)
-    }
-    const untrackBusy = (id: string | undefined): void => {
-      if (id === undefined) return
-      const left = (inFlightCount.get(id) ?? 1) - 1
-      if (left <= 0) {
-        inFlightCount.delete(id)
-        busyAccounts.delete(id)
-      } else {
-        inFlightCount.set(id, left)
-      }
-    }
-    let account = this.deps.pool ? this.deps.pool.selectAccount(family, busyAccounts) : undefined
+    let account = this.deps.pool ? this.deps.pool.selectAccount(family, this.busyAccounts) : undefined
     if (this.deps.pool && this.deps.pool.getAccounts().length > 0 && !account) {
       if (cfg.autoFallbackModel) {
         const fallbackSlugs = ['gemini-3.5-flash', 'gemini-3.6-flash']
@@ -509,7 +516,7 @@ export class AgyEngine {
       }
     }
 
-    trackBusy(account?.id)
+    this.trackBusy(account?.id)
     const sessionAccountKey = account ? `${sessionKey}:${account.id}` : sessionKey
     let binding = sessionAccountKey !== '' ? this.deps.store.get(sessionAccountKey) : undefined
 
@@ -913,14 +920,14 @@ export class AgyEngine {
           // mid-flight keeps the settled failure instead of a secondhand
           // POOL_EXHAUSTED.
           if ((this.deps.pool?.getAccounts().length ?? 0) > 0) {
-            untrackBusy(attemptAccount?.id)
-            const next = this.deps.pool?.selectAccount(family, busyAccounts) ?? undefined
+            this.untrackBusy(attemptAccount?.id)
+            const next = this.deps.pool?.selectAccount(family, this.busyAccounts) ?? undefined
             if (next === undefined) {
-              trackBusy(attemptAccount?.id)
+              this.trackBusy(attemptAccount?.id)
               break
             }
             attemptAccount = next
-            trackBusy(next.id)
+            this.trackBusy(next.id)
           }
         }
         releaseOnce()
@@ -964,7 +971,7 @@ export class AgyEngine {
         releaseOnce()
         rec.settle({ kind: 'error', code: Err.PROCESS_EXIT, message: 'internal error: ' + brief(String(err)) })
       } finally {
-        untrackBusy(attemptAccount?.id)
+        this.untrackBusy(attemptAccount?.id)
       }
     })()
 

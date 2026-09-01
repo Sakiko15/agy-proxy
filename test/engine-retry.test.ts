@@ -14,6 +14,7 @@ import { AgyEngine, computeRetryDelayMs, RETRY_POLICY, type EngineCall, type Eng
 import { ModelCatalog } from '../src/host/models.ts'
 import { SessionStore } from '../src/host/sessions.ts'
 import { RunRegistry } from '../src/host/recording.ts'
+import { AccountPoolManager } from '../src/host/pool.ts'
 import type { StreamChunk } from '../src/host/stream-types.ts'
 import { defaultConfig, Err, type GatewayConfig } from '../src/common/types.ts'
 
@@ -319,5 +320,40 @@ describe('computeRetryDelayMs (pure backoff math)', () => {
     expect(computeRetryDelayMs(2_000, () => 0.5)).toBe(2_000)
     expect(computeRetryDelayMs(50_000, () => 1)).toBe(RETRY_POLICY.maxDelayMs)
     expect(computeRetryDelayMs(50_000, () => 0)).toBe(RETRY_POLICY.maxDelayMs)
+  })
+})
+describe('busy-aware spread (engine-level tracking, M5 drill fix)', () => {
+  it('concurrent same-family arrivals select DIFFERENT accounts — the busy set is shared across stream() calls, not per call', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-spread-'))
+    dirs.push(dir)
+    process.env.AGY_PROXY_CONVERSATIONS_DIR = join(dir, 'convs')
+    process.env.FAKE_AGY_MODE = 'ok'
+    const cfg: GatewayConfig = { ...defaultConfig(), permissionMode: 'plan', timeoutMs: 5_000 }
+    const pool = new AccountPoolManager(join(dir, 'accounts'))
+    for (const alias of ['s0', 's1', 's2']) pool.createAccountSlot(alias)
+    const onRunCalls: OnRunInfo[] = []
+    const engine = new AgyEngine({
+      getConfig: () => cfg,
+      catalog: new ModelCatalog(async () => { throw new Error('no discovery in tests') }, cfg.fallbackModels, 300_000),
+      store: new SessionStore(join(dir, 'sessions.json')),
+      pool,
+      bin: () => fakeBin,
+      binArgs: [fakeScript],
+      acquire: () => Promise.resolve(() => {}),
+      runs: new RunRegistry(),
+      onRun: (i) => { onRunCalls.push(i) },
+      retryDelay: async () => {},
+    })
+    const drain = async (i: number): Promise<void> => {
+      for await (const _ of engine.stream(call([msg('user', 'spread ' + String(i))]))) void _
+    }
+    // All three selections run in the sync prefix before any spawn awaits, so
+    // the busy filter must see the earlier arrivals' accounts (selection and
+    // tracking are adjacent synchronous statements in stream()).
+    await Promise.all([drain(1), drain(2), drain(3)])
+    await vi.waitFor(() => expect(onRunCalls).toHaveLength(3))
+    expect(new Set(onRunCalls.map((c) => c.accountId)).size).toBe(3)
+    for (const c of onRunCalls) expect(c.ok).toBe(true)
+    delete process.env.FAKE_AGY_MODE
   })
 })
