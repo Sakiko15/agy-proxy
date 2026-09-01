@@ -171,6 +171,7 @@ export const zhCN = {
     maxConcurrent: '最大并发 agy 进程',
     maxQueueDepth: '最大排队深度',
     autoFallbackModel: '失败时自动回退模型',
+    enabled: '网关启用',
     quotaPollIntervalMs: '配额轮询间隔（毫秒，≥60000）',
     permissionMode: '权限模式',
     permissionModePlan: 'plan（只读计划，推荐）',

@@ -170,6 +170,7 @@ export const en = {
     maxConcurrent: 'Max concurrent agy processes',
     maxQueueDepth: 'Max queue depth',
     autoFallbackModel: 'Auto-fallback model on failure',
+    enabled: 'Gateway enabled',
     quotaPollIntervalMs: 'Quota poll interval (ms, ≥60000)',
     permissionMode: 'Permission mode',
     permissionModePlan: 'plan (supervised, recommended)',

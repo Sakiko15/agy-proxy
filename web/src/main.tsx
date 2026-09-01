@@ -14,6 +14,7 @@ import { DashboardPage } from './routes/dashboard.tsx'
 import { AccountsPage } from './routes/accounts.tsx'
 import { KeysPage } from './routes/keys.tsx'
 import { UsagePage } from './routes/usage.tsx'
+import { SettingsPage } from './routes/settings.tsx'
 import './app.css'
 
 const queryClient = new QueryClient({
@@ -39,15 +40,10 @@ const indexRoute = createRoute({
   component: DashboardPage,
 })
 
-// Page stubs — replaced one per M4 commit (accounts/keys/usage/settings).
-function pageStub(name: string) {
-  return () => <div className="text-sm text-muted-foreground">{name} placeholder</div>
-}
-
 const accountsRoute = createRoute({ getParentRoute: () => appRoute, path: '/accounts', component: AccountsPage })
 const keysRoute = createRoute({ getParentRoute: () => appRoute, path: '/keys', component: KeysPage })
 const usageRoute = createRoute({ getParentRoute: () => appRoute, path: '/usage', component: UsagePage })
-const settingsRoute = createRoute({ getParentRoute: () => appRoute, path: '/settings', component: pageStub('settings') })
+const settingsRoute = createRoute({ getParentRoute: () => appRoute, path: '/settings', component: SettingsPage })
 
 const loginRoute = createRoute({
   getParentRoute: () => rootRoute,
