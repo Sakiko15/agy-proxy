@@ -90,9 +90,9 @@ must carry a non-empty `x-requested-with` header). Session cookie: `HttpOnly; Sa
 | `POST /admin/pool/auth/complete` | `{code}` — the full callback URL or a bare code |
 | `POST /admin/pool/auth/cancel` | Abort the flow |
 | `PATCH`/`DELETE /admin/pool/accounts/{id}` | Alias / enable / proxy changes · remove the account |
-| `POST /admin/pool/accounts/{id}/clear-cooldown` · `/refresh-quota` | Manual pool maintenance |
+| `POST /admin/pool/accounts/{id}/clear-cooldown` · `/refresh-quota` · `/clear-auth` | Manual pool maintenance (M5: `/clear-auth` recovers a misfired VALIDATION_REQUIRED/auth quarantine) |
 | `POST /admin/pool/quota/refresh` · `/admin/pool/mode` · `/admin/pool/reorder` | Pool-wide refresh, selection mode, sticky order |
-| `GET/POST/PATCH/DELETE /admin/keys` | Key lifecycle — `POST` returns the `sk-agy-` plaintext **exactly once**; it is never logged |
+| `GET/POST/PATCH/DELETE /admin/keys` | Key lifecycle — `POST` returns the `sk-agy-` plaintext **exactly once**; it is never logged. `PATCH` accepts `scopes` (comma/newline-separated model whitelist; empty = unrestricted) |
 | `GET /admin/usage` · `/admin/usage/summary` | Ledger query (`keyId`,`model`,`family`,`from`,`to`,`limit`≤500,`offset`) and today's totals |
 | `GET /admin/events` | **SSE** (`text/event-stream`): seq-stamped `snapshot`/`run`/`pool` events; reconnects replay from `Last-Event-ID` (snapshot XOR replay) |
 | `GET /admin/settings` · `PUT /admin/settings` | Settings view `{requested, effective, envLocked}` · write the 9-key allowlist to `runtime-overrides.json` (atomically; env vars still win — locked keys are *reported*, written values land in the file) |
@@ -101,6 +101,26 @@ Usage accounting: one ledger row per actual agy spawn, keyed by the caller's `x-
 header (or the request id) — replaying the same id does not double-count. Per-key day
 budgets and RPM limits are enforced pre-engine; a rejected request never reaches agy and
 never books a row.
+
+## Deploy (docker + reverse proxy)
+
+The container shape is two-stage: `node:24-slim` builds `web/dist` (WebUI), then a slim
+runtime with **tini as PID 1** (SIGTERM forwarding + zombie reaping for the per-request agy
+children) installs the **official agy CLI pinned to `AGY_CLI_VERSION=1.1.22`** (m1.md real-binary
+record; no floating tags). All mutable state lives on the `/data` volume — pool, per-account
+isolated HOMEs, sessions, media, SQLite. Credentials are device-bound: replacing the container
+keeps logins only because the volume persists; moving volumes to another machine means
+logging in again.
+
+```bash
+npm ci && npm run build && docker compose up -d   # or a prebuilt registry image (docs/deploy.md §1)
+docker logs agy-proxy | grep -i password          # first-boot admin password — printed exactly once
+```
+
+The runbook (`docs/deploy.md`) covers first-boot posture, the SSE-critical reverse-proxy
+settings for nginx / Caddy / Cloudflare (`proxy_buffering off` / `flush_interval -1`, long
+read timeouts, body max size, `X-Forwarded-For` + `AGY_PROXY_TRUSTED_PROXIES`), the docker
+force-kill drill (×3 with ledger reconciliation), and volume backups.
 
 ## Configuration
 
