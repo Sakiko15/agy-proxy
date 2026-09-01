@@ -1,6 +1,6 @@
 // API client contract: query building + the mandatory CSRF header.
 import { describe, it, expect, afterEach } from 'vitest'
-import { buildQuery, apiSend, apiGet, ApiError } from './client.ts'
+import { buildQuery, apiSend, apiGet, api, ApiError } from './client.ts'
 
 const FETCHED: { url: string; init: RequestInit }[] = []
 const originalFetch = globalThis.fetch
@@ -57,5 +57,16 @@ describe('apiSend', () => {
     const err = await apiGet('/admin/keys').catch((e: unknown) => e)
     expect((err as ApiError).status).toBe(401)
     expect((err as ApiError).message).toContain('unauthorized')
+  })
+
+  it('patchKey carries the scopes patch verbatim — string sets, null clears (M5)', async () => {
+    mockFetch(200, { ok: true })
+    await api.patchKey('key_1', { scopes: 'gemini-3.7-flash, claude-sonnet-4-6' })
+    expect(FETCHED[0]!.init.body).toBe('{"scopes":"gemini-3.7-flash, claude-sonnet-4-6"}')
+    await api.patchKey('key_1', { scopes: null })
+    expect(FETCHED[1]!.init.body).toBe('{"scopes":null}')
+    // partial patches ride alongside other fields
+    await api.patchKey('key_1', { dailyTokenLimit: 5, scopes: '' })
+    expect(FETCHED[2]!.init.body).toBe('{"dailyTokenLimit":5,"scopes":""}')
   })
 })

@@ -98,6 +98,8 @@ export interface UsageRow {
   totalTokens: number
   status: string
   durationMs?: number
+  /** Terminal failure text (schema v2 error_text) — present on failed rows. */
+  errorText?: string
   createdAt: number
 }
 

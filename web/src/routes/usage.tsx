@@ -1,9 +1,9 @@
 // Usage log page (charter §9 page 5): filter by key/model/family/protocol/
 // status/from/to, server-paginated ≤500 rows, status chips, client-side CSV
-// export of the filtered rows (button disabled past the 500-row query cap —
-// the ledger schema v1 has no error-text column, so the page shows status
-// codes; the deviation from charter wording is recorded in CHANGELOG M4).
-import { useMemo, useState } from 'react'
+// export of the filtered rows (button disabled past the 500-row query cap).
+// Schema v2 (M5) added usage.error_text: failed rows carry their terminal
+// error detail — expanded in place under the row and included in the CSV.
+import { Fragment, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import { Download } from 'lucide-react'
@@ -31,6 +31,7 @@ export function UsagePage(): React.JSX.Element {
   const { t } = useTranslation()
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS)
   const [page, setPage] = useState(0)
+  const [expanded, setExpanded] = useState<number | null>(null)
 
   const query = useMemo(
     () =>
@@ -68,6 +69,8 @@ export function UsagePage(): React.JSX.Element {
       { header: 'completion_tokens', value: (r) => r.completionTokens },
       { header: 'total_tokens', value: (r) => r.totalTokens },
       { header: 'duration_ms', value: (r) => r.durationMs },
+      // schema v2: terminal failure text rides alongside its status (empty for OK rows)
+      { header: 'error_text', value: (r) => r.errorText ?? '' },
     ])
     downloadCsv(`agy-proxy-usage-${new Date().toISOString().slice(0, 10)}.csv`, csv)
   }
@@ -133,18 +136,40 @@ export function UsagePage(): React.JSX.Element {
                 </thead>
                 <tbody>
                   {rows.map((row) => (
-                    <tr key={row.seq} className="border-b border-border/50 last:border-0">
-                      <td className="p-2 tabular-nums text-muted-foreground">{formatTime(row.createdAt)}</td>
-                      <td className="p-2 font-mono text-xs">{row.model}</td>
-                      <td className="p-2">
-                        <Badge variant={statusVariant(row.status)}>{row.status}</Badge>
-                      </td>
-                      <td className="p-2 text-right tabular-nums">{row.promptTokens}</td>
-                      <td className="p-2 text-right tabular-nums">{row.completionTokens}</td>
-                      <td className="p-2 text-right tabular-nums">{row.totalTokens}</td>
-                      <td className="p-2 text-right tabular-nums">{formatDuration(row.durationMs)}</td>
-                      <td className="p-2 font-mono text-xs text-muted-foreground">{shortId(row.requestId)}</td>
-                    </tr>
+                    <Fragment key={row.seq}>
+                      <tr className="border-b border-border/50">
+                        <td className="p-2 tabular-nums text-muted-foreground">{formatTime(row.createdAt)}</td>
+                        <td className="p-2 font-mono text-xs">{row.model}</td>
+                        <td className="p-2">
+                          {row.errorText !== undefined ? (
+                            <button
+                              type="button"
+                              className="cursor-pointer"
+                              title={t('usage.errorTextCol')}
+                              aria-expanded={expanded === row.seq}
+                              onClick={() => setExpanded((cur) => (cur === row.seq ? null : row.seq))}
+                            >
+                              <Badge variant={statusVariant(row.status)}>{row.status}</Badge>
+                            </button>
+                          ) : (
+                            <Badge variant={statusVariant(row.status)}>{row.status}</Badge>
+                          )}
+                        </td>
+                        <td className="p-2 text-right tabular-nums">{row.promptTokens}</td>
+                        <td className="p-2 text-right tabular-nums">{row.completionTokens}</td>
+                        <td className="p-2 text-right tabular-nums">{row.totalTokens}</td>
+                        <td className="p-2 text-right tabular-nums">{formatDuration(row.durationMs)}</td>
+                        <td className="p-2 font-mono text-xs text-muted-foreground">{shortId(row.requestId)}</td>
+                      </tr>
+                      {row.errorText !== undefined && expanded === row.seq && (
+                        <tr className="border-b border-border/50 bg-muted/40">
+                          <td colSpan={8} className="p-3">
+                            <div className="text-xs font-medium text-muted-foreground">{t('usage.errorTextCol')}</div>
+                            <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-foreground">{row.errorText}</pre>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
                   ))}
                 </tbody>
               </table>
