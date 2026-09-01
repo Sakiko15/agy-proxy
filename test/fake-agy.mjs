@@ -46,7 +46,8 @@
 // drill fails account A while account B keeps serving ok runs.
 //
 // Records its argv (JSON, one per line) to FAKE_AGY_ARGS_FILE when set;
-// records cwd to FAKE_AGY_CWD_FILE when set.
+// records cwd to FAKE_AGY_CWD_FILE when set; records its pid to
+// FAKE_AGY_PID_FILE when set (lifetime observation for kill drills).
 //
 // FAKE_AGY_MODE_FILE (M5): path to a file holding the mode name, read at
 // every PROCESS START — lets a drill flip the failure mode between engine
@@ -69,6 +70,11 @@ if (process.env.FAKE_AGY_ARGS_FILE) {
 }
 if (process.env.FAKE_AGY_CWD_FILE) {
   try { appendFileSync(process.env.FAKE_AGY_CWD_FILE, process.cwd() + '\n') } catch {}
+}
+if (process.env.FAKE_AGY_PID_FILE) {
+  // Lets a test observe this process's lifetime (disconnect → tree-kill drill:
+  // poll until process.kill(pid, 0) throws ESRCH).
+  try { appendFileSync(process.env.FAKE_AGY_PID_FILE, String(process.pid) + '\n') } catch {}
 }
 
 if (argv[0] === '--version') {

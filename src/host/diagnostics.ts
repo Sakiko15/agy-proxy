@@ -58,7 +58,9 @@ export function writeDoctorReport(deps: DoctorDeps): string {
   lines.push('- generated: ' + new Date().toISOString())
   lines.push('- agy binary: ' + (deps.bin() ?? 'NOT FOUND'))
   lines.push('- agy version: ' + (deps.version() ?? 'unknown'))
-  lines.push('- gateway config: ' + JSON.stringify({ ...cfg, extraArgs: cfg.extraArgs.length, adminPassword: '<redacted>' }))
+  // Key material never rests in a report file: the bootstrap root key is
+  // plaintext in cfg (S-H3), so it is redacted alongside adminPassword.
+  lines.push('- gateway config: ' + JSON.stringify({ ...cfg, extraArgs: cfg.extraArgs.length, apiKey: '<redacted>', adminPassword: '<redacted>' }))
   lines.push('- catalog: ' + cat.source + ' — ' + cat.models.length + ' models' + (cat.lastError === undefined ? '' : ' — error: ' + cat.lastError))
   for (const m of cat.models) {
     lines.push('  - ' + m.id + (m.efforts ? ' [' + m.efforts.join('/') + ']' : ''))

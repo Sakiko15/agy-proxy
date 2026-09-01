@@ -17,6 +17,7 @@
 // preemption, duplicate submission debounce, and continuation spans.
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { mkdirSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import PQueue from 'p-queue'
@@ -362,6 +363,18 @@ export class AgyEngine {
     const bin = this.deps.bin()
     if (!bin) throw new EngineError('agy binary not found on PATH — install it via https://antigravity.google/docs/cli/install', Err.AGY_NOT_INSTALLED)
     const sessionKey = call.sessionKey !== undefined ? String(call.sessionKey) : ''
+    // Tenant scoping (S-H2): the gateway never sets sessionKey, so without a
+    // tenant dimension the conversation binding below degrades to
+    // `:<accountId>` — shared by EVERY caller of that account, letting one
+    // key's chat continue another key's agy conversation (and collide staged
+    // media files). meta.keyId (set by withCallMeta; absent = bootstrap root
+    // key) namespaces both.
+    const metaTenant = (call.meta ?? {}) as { keyId?: unknown }
+    const tenantKey = typeof metaTenant.keyId === 'string' && metaTenant.keyId !== '' ? metaTenant.keyId : 'root'
+    // Steer/debounce maps get the same tenant prefix: an identical prompt from
+    // another key must neither be debounced nor preempt this run. Gateway
+    // calls never set sessionKey, so these stay off for them (empty key).
+    const steerKey = sessionKey !== '' ? `${tenantKey}:${sessionKey}` : ''
 
     // Workspace precedence: explicit config > <dataDir>/workspace. Unlike the
     // upstream adapter there is no process.cwd() fallback — a gateway has no
@@ -403,8 +416,8 @@ export class AgyEngine {
     // is still alive (a NEW run, not a continuation). The previous run's agy
     // process would keep appending to the SAME conversation concurrently —
     // abort it first.
-    if (sessionKey !== '') {
-      const prev = this.activeRuns.get(sessionKey)
+    if (steerKey !== '') {
+      const prev = this.activeRuns.get(steerKey)
       if (prev !== undefined && !prev.isSettled) {
         if (prev.requestAbort != null) prev.requestAbort()
         // A queued (not yet spawned) run has no process to abort — settle it
@@ -516,8 +529,9 @@ export class AgyEngine {
       }
     }
 
-    this.trackBusy(account?.id)
-    const sessionAccountKey = account ? `${sessionKey}:${account.id}` : sessionKey
+    const sessionAccountKey = account
+      ? `${tenantKey}:${sessionKey}:${account.id}`
+      : (sessionKey !== '' ? `${tenantKey}:${sessionKey}` : '')
     let binding = sessionAccountKey !== '' ? this.deps.store.get(sessionAccountKey) : undefined
 
     // Model switch detection: If model changed in the session, drop stale agy conversation binding
@@ -580,45 +594,91 @@ export class AgyEngine {
         })
       }
     }
-    if (imageRefs.length > 0) {
-      // Call-level reader wins: protocol adapters stage request-scoped
-      // byte buffers (data: URLs) without shared mutable state.
-      const readImage = call.readImage ?? this.deps.readImage
-      if (readImage) {
-        const dir = cfg.mediaDir !== '' ? cfg.mediaDir : defaultMediaDir(stateDir())
-        const key = (sessionKey !== '' ? sessionKey.replace(/[^a-zA-Z0-9_-]+/g, '_') : 'anon') + '-' + messages.length
-        const res = await stageImages({
-          dir,
-          key,
-          images: imageRefs,
-          readImage,
-          maxImages: cfg.mediaMaxImages,
-          maxBytes: cfg.mediaMaxBytes,
-        })
-        if (res.promptSuffix !== '') {
-          prompt = prompt === ''
-            ? (res.promptSuffix + '\n\n[Please inspect the attached image(s) using view_file and assist the user.]')
-            : (prompt + '\n\n' + res.promptSuffix)
+    // M5 busy-spread: the mark is tracked synchronously with selection —
+    // tracking only after the await-ed semaphore acquire let concurrent
+    // same-tick arrivals all select from an empty busy set and pile onto
+    // one account. H1 (no leak) is preserved by the try/catch around the
+    // throw-capable pre-dispatch segment: its catch releases the mark, and
+    // post-acquire untracking stays in the dispatch IIFE's finally.
+    this.trackBusy(account?.id)
+    let args: string[] = []
+    let schemaCleanup: (() => Promise<void>) | null = null
+    let release: () => void = () => undefined
+    try {
+      if (imageRefs.length > 0) {
+        // Call-level reader wins: protocol adapters stage request-scoped
+        // byte buffers (data: URLs) without shared mutable state.
+        const readImage = call.readImage ?? this.deps.readImage
+        if (readImage) {
+          const dir = cfg.mediaDir !== '' ? cfg.mediaDir : defaultMediaDir(stateDir())
+          // Tenant-prefixed + per-request random suffix (S-H2a): the old
+          // `anon-<msgLen>` key was deterministic across callers — two users
+          // sending the same message count overwrote each other's staged
+          // files (cross-tenant image swap). Within one request the index
+          // suffix stays deterministic, so a retried read reuses its own file.
+          const key = tenantKey.replace(/[^a-zA-Z0-9_-]+/g, '_') + '-' + messages.length + '-' + randomUUID()
+          const res = await stageImages({
+            dir,
+            key,
+            images: imageRefs,
+            readImage,
+            maxImages: cfg.mediaMaxImages,
+            maxBytes: cfg.mediaMaxBytes,
+          })
+          if (res.promptSuffix !== '') {
+            prompt = prompt === ''
+              ? (res.promptSuffix + '\n\n[Please inspect the attached image(s) using view_file and assist the user.]')
+              : (prompt + '\n\n' + res.promptSuffix)
+          }
+          if (res.staged.length > 0) stagedDirs = [dir]
         }
-        if (res.staged.length > 0) stagedDirs = [dir]
       }
-    }
-    if (prompt.trim() === '') {
-      throw new EngineError('request carries no user text or images to forward to agy', Err.AGY_ERROR)
-    }
-
-    // In-flight duplicate submission debounce (prevents double-clicks / network repeat loops)
-    if (sessionKey !== '') {
-      const activePrompt = this.activeSessionPrompts.get(sessionKey)
-      if (activePrompt !== undefined && activePrompt.prompt === prompt && Date.now() - activePrompt.startedAt < 3000) {
-        throw new EngineError(
-          'Duplicate request ignored: an identical request is already running for this session.',
-          Err.BUSY,
-        )
+      if (prompt.trim() === '') {
+        throw new EngineError('request carries no user text or images to forward to agy', Err.AGY_ERROR)
       }
-      this.activeSessionPrompts.set(sessionKey, { prompt, startedAt: Date.now() })
-    }
 
+      // In-flight duplicate submission debounce (prevents double-clicks / network repeat loops)
+      if (steerKey !== '') {
+        const activePrompt = this.activeSessionPrompts.get(steerKey)
+        if (activePrompt !== undefined && activePrompt.prompt === prompt && Date.now() - activePrompt.startedAt < 3000) {
+          throw new EngineError(
+            'Duplicate request ignored: an identical request is already running for this session.',
+            Err.BUSY,
+          )
+        }
+        this.activeSessionPrompts.set(steerKey, { prompt, startedAt: Date.now() })
+      }
+
+      args = this.buildArgs({
+        prompt,
+        model: activeModel === '' ? cfg.defaultModel : activeModel,
+        effort,
+        conversationId: binding !== undefined ? binding.conversationId : undefined,
+        permissionMode: cfg.permissionMode,
+        timeoutMs: cfg.timeoutMs,
+        printTimeoutMinutes: Math.max(240, Math.ceil(cfg.timeoutMs / 60_000)),
+        extraArgs: cfg.extraArgs,
+        addDirs: stagedDirs,
+      })
+      // --json-schema: write the schema to a temp file and append the argv tail
+      // (absorbed from upstream oneshot.ts schemaArgs so /v1 endpoints can use
+      // structured output without the oneshot machinery).
+      if (call.jsonSchema !== undefined && call.jsonSchema !== null) {
+        const dir = await mkdtemp(join(tmpdir(), 'agy-schema-'))
+        const file = join(dir, 'schema.json')
+        await writeFile(file, JSON.stringify(call.jsonSchema), 'utf8')
+        args.push('--json-schema', file)
+        schemaCleanup = () => rm(dir, { recursive: true, force: true })
+      }
+      release = await this.deps.acquire()
+    } catch (err) {
+      // H1: the dispatch IIFE's finally only runs once it starts — a throw
+      // before it (queue-full BUSY, staging/schema fs errors, the debounce)
+      // must release the busy mark here, or the account is suppressed from
+      // selection until restart.
+      this.untrackBusy(account?.id)
+      throw err
+    }
     // ---- dispatch with a single engine-level retry (M5) ----
     // One recording per LOGICAL run: every spawn attempt appends into it in
     // order, so the span consumer sees one seamless event stream and a
@@ -626,29 +686,6 @@ export class AgyEngine {
     // once — after the retry loop — which is what guarantees a failure frame
     // can never reach the client before the retries are exhausted.
     const rec = this.deps.runs.create()
-    const args = this.buildArgs({
-      prompt,
-      model: activeModel === '' ? cfg.defaultModel : activeModel,
-      effort,
-      conversationId: binding !== undefined ? binding.conversationId : undefined,
-      permissionMode: cfg.permissionMode,
-      timeoutMs: cfg.timeoutMs,
-      printTimeoutMinutes: Math.max(240, Math.ceil(cfg.timeoutMs / 60_000)),
-      extraArgs: cfg.extraArgs,
-      addDirs: stagedDirs,
-    })
-    // --json-schema: write the schema to a temp file and append the argv tail
-    // (absorbed from upstream oneshot.ts schemaArgs so /v1 endpoints can use
-    // structured output without the oneshot machinery).
-    let schemaCleanup: (() => Promise<void>) | null = null
-    if (call.jsonSchema !== undefined && call.jsonSchema !== null) {
-      const dir = await mkdtemp(join(tmpdir(), 'agy-schema-'))
-      const file = join(dir, 'schema.json')
-      await writeFile(file, JSON.stringify(call.jsonSchema), 'utf8')
-      args.push('--json-schema', file)
-      schemaCleanup = () => rm(dir, { recursive: true, force: true })
-    }
-    const release = await this.deps.acquire()
     let released = false
     const releaseOnce = (): void => {
       if (released) return
@@ -758,10 +795,10 @@ export class AgyEngine {
           // but it used to leave the recording unsettled forever. Normalize.
           return spawnFailed('failed to spawn agy: ' + brief(String(e)), attemptAcc)
         }
-        if (sessionKey !== '') this.activeRuns.set(sessionKey, rec)
+        if (steerKey !== '') this.activeRuns.set(steerKey, rec)
         const outcome = await proc.outcome
-        if (this.activeRuns.get(sessionKey) === rec) this.activeRuns.delete(sessionKey)
-        if (sessionKey !== '') this.activeSessionPrompts.delete(sessionKey)
+        if (this.activeRuns.get(steerKey) === rec) this.activeRuns.delete(steerKey)
+        if (steerKey !== '') this.activeSessionPrompts.delete(steerKey)
         for (const ev of parser.flush()) {
           if (ev.kind === 'result' && ev.conversationId !== '') streamCid = ev.conversationId
           rec.append(ev)
@@ -889,7 +926,13 @@ export class AgyEngine {
       let last: AttemptResult
       try {
         for (;;) {
-          if (rec.isSettled) return // steer settled the whole run as superseded
+          if (rec.isSettled) {
+            // Steer settled the whole run as superseded — return the
+            // semaphore slot (and temp-schema) before leaving, or it leaks
+            // until the next same-account run releases for us.
+            releaseOnce()
+            return
+          }
           last = await runOnce(attempt, attemptAccount)
           // Retry gate (M5): only outcome-level failures with nothing on the
           // wire. A result-shaped failure never emits span chunks (the mapper

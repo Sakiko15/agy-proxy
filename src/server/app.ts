@@ -86,9 +86,12 @@ function stagedImageReader(meta: { imageBytes: Map<string, Uint8Array> }): NonNu
 
 /**
  * Merge the server-side observability meta into an outgoing EngineCall: the
- * ledger request id (client x-request-id wins — it is the replay-idempotency
- * key, DoD ⑥), the authenticated key id (null = bootstrap root key), and the
- * protocol surface. The enriched settle-time onRun echoes it back.
+ * ledger request id (ALWAYS the server-generated fastify id — a client-supplied
+ * `x-request-id` is attacker-controlled, and keying the UNIQUE ledger index on
+ * it let any caller replay one id to void every later row, silently zeroing
+ * day budgets), the authenticated key id (null = bootstrap root key), the
+ * protocol surface, and the client header kept purely as observability
+ * (clientReqId, never a DB key). The enriched settle-time onRun echoes it back.
  */
 function withCallMeta(
   request: Pick<import('fastify').FastifyRequest, 'headers' | 'id'>,
@@ -101,7 +104,8 @@ function withCallMeta(
     ...call,
     ...(readImage !== undefined ? { readImage } : {}),
     meta: {
-      reqId: typeof hdr === 'string' && hdr.trim() !== '' ? hdr.trim() : request.id,
+      reqId: request.id,
+      ...(typeof hdr === 'string' && hdr.trim() !== '' ? { clientReqId: hdr.trim() } : {}),
       keyId: requestKey(request as import('fastify').FastifyRequest)?.id ?? null,
       protocol,
     },
@@ -259,9 +263,18 @@ export function buildServer(deps: ServerDeps): BuiltServer {
     inFlight.add(abort)
     // Client disconnect must cascade into the agy process tree (charter §6):
     // the engine passes `signal` to startAgyProcess, whose abort kills the
-    // process group.
-    request.raw.on('close', () => {
-      if (!reply.sent) abort.abort(new Error('client disconnected'))
+    // process group. Two Node/fastify traps shape this listener:
+    // - Listen on reply.raw (ServerResponse), NOT request.raw: a fully
+    //   consumed request's IncomingMessage fires 'close' the moment body
+    //   parsing ends — long before any real disconnect — so a listener there
+    //   registers too late and never fires. ServerResponse 'close' fires on
+    //   premature connection termination, exactly the event we need.
+    // - The guard is `raw.writableEnded`, NOT `reply.sent`: fastify marks a
+    //   hijacked reply (every SSE stream) as sent forever, and normal
+    //   completion sets writableEnded — so the guard lets the orderly-end
+    //   close through and only aborts on a real disconnect (S-H2).
+    reply.raw.on('close', () => {
+      if (!reply.raw.writableEnded) abort.abort(new Error('client disconnected'))
     })
 
     try {
@@ -338,8 +351,12 @@ export function buildServer(deps: ServerDeps): BuiltServer {
 
     const abort = new AbortController()
     inFlight.add(abort)
-    request.raw.on('close', () => {
-      if (!reply.sent) abort.abort(new Error('client disconnected'))
+    // Same reply.raw close listener as the OpenAI leg (S-H2): ServerResponse
+    // 'close' is the premature-termination signal (request.raw's fires at
+    // body-parse completion in modern Node), and writableEnded filters the
+    // orderly end from a real disconnect.
+    reply.raw.on('close', () => {
+      if (!reply.raw.writableEnded) abort.abort(new Error('client disconnected'))
     })
 
     try {

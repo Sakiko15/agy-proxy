@@ -6,7 +6,7 @@
 // same auth hook and sits under /v1/messages → its error bodies are the
 // ANTHROPIC shape (isAnthropicPath matches the path prefix), so the OpenAI
 // body shape comes from /v1/chat/completions below.
-import { describe, it, expect, afterEach } from 'vitest'
+import { describe, it, expect, afterEach, vi } from 'vitest'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -28,7 +28,7 @@ const fakeScript = join(import.meta.dirname, 'fake-agy.mjs')
 const dbs: string[] = []
 let lastDb: { db: ReturnType<typeof openDb>; keys: KeyStore; ledger: UsageLedger } | null = null
 
-function makeServer(cfgOverrides: Partial<GatewayConfig> = {}, withStore = true) {
+function makeServer(cfgOverrides: Partial<GatewayConfig> = {}, withStore = true, wireOnRun = false) {
   const cfg: GatewayConfig = { ...defaultConfig(), permissionMode: 'plan', timeoutMs: 20_000, ...cfgOverrides }
   const dir = mkdtempSync(join(tmpdir(), 'agy-auth-'))
   dbs.push(dir)
@@ -47,6 +47,25 @@ function makeServer(cfgOverrides: Partial<GatewayConfig> = {}, withStore = true)
     acquire: () => sem.acquire(),
     runs: new RunRegistry(),
     retryDelay: async () => {}, // M5: failing runs retry once - keep tests fast (timing pinned in engine-retry.test)
+    // index.ts's production settle-hook wiring, ledger legs only (S-H1
+    // regression coverage needs rows actually booked by real requests).
+    ...(wireOnRun ? {
+      onRun: (i: Parameters<NonNullable<EngineDeps['onRun']>>[0]) => {
+        if (!i.final) return
+        const meta = (i.meta ?? {}) as { reqId?: unknown; keyId?: unknown; protocol?: unknown }
+        ledger.record({
+          requestId: typeof meta.reqId === 'string' ? meta.reqId : '',
+          keyId: typeof meta.keyId === 'string' ? meta.keyId : null,
+          accountId: i.accountId ?? null,
+          model: i.providerModel,
+          family: i.family ?? 'unknown',
+          protocol: meta.protocol === 'anthropic' ? 'anthropic' : 'openai',
+          promptTokens: i.usage?.inputTokens ?? 0,
+          completionTokens: i.usage?.outputTokens ?? 0,
+          status: i.code,
+        })
+      },
+    } : {}),
     ...({} as Partial<EngineDeps>),
   })
   const built = buildServer({
@@ -191,5 +210,29 @@ describe('MA4/MA5: per-key rate limits (429 + Retry-After)', () => {
     expect(rejected.statusCode).toBe(429)
     const passes = await countTokens(built, { authorization: `Bearer ${other.plaintext}` })
     expect(passes.statusCode).toBe(200)
+  })
+})
+
+describe('S-H1 regression: the ledger keys on the server request id', () => {
+  it('replaying one client x-request-id books a row per request; the client id never becomes the DB key', async () => {
+    // Pre-fix, withCallMeta adopted the client header as the ledger request
+    // id: this loop booked exactly ONE row (INSERT OR IGNORE swallowed every
+    // replay), so a caller could zero its day budget by replaying one id.
+    const { built, ledger, db } = makeServer({ apiKey: 'root-key' }, true, true)
+    const headers = { authorization: 'Bearer root-key', 'x-request-id': 'replay-me' }
+    const a = await chat(built, headers)
+    const b = await chat(built, headers)
+    expect(a.statusCode).toBe(200)
+    expect(b.statusCode).toBe(200)
+    // Settlement books the row after the response ends (documented onRun
+    // timing), so poll instead of assuming it has landed by the first flush.
+    await vi.waitFor(async () => {
+      await ledger.flush()
+      const rows = db.prepare('SELECT request_id FROM usage').all() as Array<{ request_id: string }>
+      expect(rows.length).toBe(2)
+      for (const row of rows) expect(row.request_id).toMatch(/^[0-9a-f-]{36}$/)
+      expect(rows.some((row) => row.request_id === 'replay-me')).toBe(false)
+    })
+    await ledger.close().catch(() => undefined)
   })
 })

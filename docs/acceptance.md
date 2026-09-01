@@ -86,7 +86,7 @@ golden 用例存放 `test/golden/<protocol>/<case>/`：每目录含 `request.jso
 - [ ] 429 演练：fake-agy 触发硬限流文本 → 账号冷却 + 请求自动切到下一账号成功；全部冷却时返回 429 带重置倒计时
 - [ ] 403 VALIDATION_REQUIRED 演练：validation_url 出现在 API 错误 message 与 WebUI 中
 - [ ] key 生命周期：创建/明文仅一次/禁用/删除；sha256 落库验证（sqlite3 CLI 查库确认无明文）
-- [ ] 记账幂等：同一请求 id 重放不重复计数（构造重放请求验证）
+- [ ] 记账幂等：一次请求至多一行——引擎级重试由服务端 request id 合并（客户端自选 `x-request-id` 不作为记账键，仅观测；重放同一请求各自记账。安全修复 S-H1 后的语义）
 - [ ] 崩溃恢复：`docker kill` 后重启，pool.json/sessions.json/SQLite 状态完好、无孤儿 agy 进程（容器内 `ps` 验证）
 
 ### M4 WebUI

@@ -33,7 +33,11 @@ export class GatewaySemaphore {
       }
       const slot = new Promise<void>((resolve) => this.waiting.push(resolve))
       await slot
-      this.active++
+      // H3: the slot was transferred by release() with the count unchanged,
+      // so nothing to increment here. The old active--/active++ pair let an
+      // acquire issued in the same tick as the release (one I/O callback
+      // finishing a run and starting another) barge past max while the woken
+      // waiter's increment was still pending in the microtask queue.
       return this.release.bind(this)
     }
     this.active++
@@ -41,8 +45,14 @@ export class GatewaySemaphore {
   }
 
   private release(): void {
-    this.active--
     const next = this.waiting.shift()
-    if (next !== undefined) next()
+    if (next !== undefined) {
+      // Direct slot handoff: the count stays put and the woken waiter owns
+      // the slot without re-incrementing, so no same-tick acquire can slip
+      // between the wake and the waiter's bookkeeping.
+      next()
+      return
+    }
+    this.active--
   }
 }

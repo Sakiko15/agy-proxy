@@ -8,10 +8,11 @@
 // the service layer uses ModelCatalog directly; sessionCwd cases dropped —
 // the engine has no host-provided session workspace seam).
 import { describe, it, expect, afterAll } from 'vitest'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AgyEngine, buildDigest, detectContinuation, EngineError, type EngineCall, type EngineDeps, type EngineMessage } from '../src/host/engine.ts'
+import type { AccountPoolManager } from '../src/host/pool.ts'
 import { ModelCatalog } from '../src/host/models.ts'
 import { SessionStore } from '../src/host/sessions.ts'
 import { RunRegistry } from '../src/host/recording.ts'
@@ -152,7 +153,8 @@ describe('engine: ok run, mirroring, binding', () => {
     expect(argv[argv.indexOf('--output-format') + 1]).toBe('stream-json')
     expect(argv).toContain('--mode')
     expect(argv).not.toContain('--conversation')
-    const b = await waitFor(() => store.get('sess-1'))
+    // Binding keys are tenant-prefixed (S-H2): '<keyId|root>:<sessionKey>[:<accountId>]'.
+    const b = await waitFor(() => store.get('root:sess-1'))
     expect(b.conversationId).toBe('conv-fresh-1')
     expect(b.lastMessageCount).toBe(1)
   })
@@ -170,7 +172,7 @@ describe('engine: ok run, mirroring, binding', () => {
     const argsFile = join(workDir, 'args2.json')
     process.env.FAKE_AGY_ARGS_FILE = argsFile
     await runTurn(engine, [msg('user', 'one')], { sessionKey: 'sess-2' })
-    await waitFor(() => store.get('sess-2'))
+    await waitFor(() => store.get('root:sess-2'))
     await runTurn(engine, [msg('assistant', 'one'), msg('user', 'two')], { sessionKey: 'sess-2' })
     const argv = JSON.parse(readFileSync(argsFile, 'utf8').trim().split('\n').at(-1) ?? '[]') as string[]
     expect(argv[argv.indexOf('--conversation') + 1]).toBe('conv-fresh-1')
@@ -376,7 +378,7 @@ describe('engine: argv assembly, digest, rate limit', () => {
     process.env.FAKE_AGY_ARGS_FILE = argsFile
     // Turn 1 binds the session (watermark = 1 message).
     await runTurn(engine, [msg('user', 'one')], { sessionKey: 'sess-w' })
-    await waitFor(() => store.get('sess-w'))
+    await waitFor(() => store.get('root:sess-w'))
     // Turn 2: our own agy reply + a foreign (deepseek) interjection in between.
     await runTurn(engine, [
       { role: 'assistant', text: 'one', provider: 'antigravity' },
@@ -386,7 +388,7 @@ describe('engine: argv assembly, digest, rate limit', () => {
     ], { sessionKey: 'sess-w' })
     // wait for turn 2's watermark (4 messages) before asserting/driving turn 3
     await waitFor(() => {
-      const b = store.get('sess-w')
+      const b = store.get('root:sess-w')
       return b !== undefined && b.lastMessageCount >= 4 ? b : undefined
     })
     const argv = JSON.parse(readFileSync(argsFile, 'utf8').trim().split('\n').at(-1) ?? '[]') as string[]
@@ -429,8 +431,8 @@ describe('engine: argv assembly, digest, rate limit', () => {
       msg('user', 'm3'),
     ], { sessionKey: 'sess-compact' })
 
-    await waitFor(() => store.get('sess-compact'))
-    expect(store.get('sess-compact')?.lastMessageCount).toBe(5)
+    await waitFor(() => store.get('root:sess-compact'))
+    expect(store.get('root:sess-compact')?.lastMessageCount).toBe(5)
 
     // Turn 2: the client truncates history down to 2 messages
     await runTurn(engine, [
@@ -455,9 +457,9 @@ describe('engine: argv assembly, digest, rate limit', () => {
 
     // Turn 1: model gemini-3.7-flash
     await runTurn(engine, [msg('user', 'hello')], { sessionKey: 'sess-switch', model: 'gemini-3.7-flash' })
-    await waitFor(() => store.get('sess-switch'))
-    expect(store.get('sess-switch')?.model).toBe('gemini-3.7-flash')
-    const conv1 = store.get('sess-switch')?.conversationId
+    await waitFor(() => store.get('root:sess-switch'))
+    expect(store.get('root:sess-switch')?.model).toBe('gemini-3.7-flash')
+    const conv1 = store.get('root:sess-switch')?.conversationId
 
     // Turn 2: switch to claude-sonnet-4-6
     await runTurn(engine, [msg('user', 'hello'), msg('assistant', 'hi'), msg('user', 'next')], { sessionKey: 'sess-switch', model: 'claude-sonnet-4-6' })
@@ -544,6 +546,97 @@ describe('engine: multimodal staging', () => {
     const prompt2 = argv2[argv2.indexOf('-p') + 1] ?? ''
     expect(prompt2).toContain('[image attached: "image"')
     expect(prompt2).toContain('[Please inspect the attached image(s) using view_file and assist the user.]')
+  })
+})
+
+describe('S-H1/S-H2/H1 regressions: tenant scoping, media keys, busy tracking', () => {
+  it('different tenant keys never share a conversation binding (S-H2b)', async () => {
+    const { engine, store } = makeEngine()
+    process.env.FAKE_AGY_MODE = 'ok'
+    const argsFile = join(workDir, 'args-tenant.json')
+    process.env.FAKE_AGY_ARGS_FILE = argsFile
+    // Key A binds its own conversation under its namespace.
+    await runTurn(engine, [msg('user', 'one')], { sessionKey: 'shared', meta: { keyId: 'key_aaa' } })
+    // Key B sends the same shape: it must NOT continue key A's conversation —
+    // pre-fix the binding key degraded to ':<accountId>' (or bare sessionKey),
+    // shared by every caller of the account.
+    await runTurn(engine, [msg('user', 'one')], { sessionKey: 'shared', meta: { keyId: 'key_bbb' } })
+    const argv = JSON.parse(readFileSync(argsFile, 'utf8').trim().split('\n').at(-1) ?? '[]') as string[]
+    expect(argv).not.toContain('--conversation')
+    // Each tenant holds its own binding; the bare/root namespace stayed empty.
+    await waitFor(() => store.get('key_bbb:shared'))
+    expect(store.get('key_aaa:shared')).toBeDefined()
+    expect(store.get('root:shared')).toBeUndefined()
+  })
+
+  it('staged media keys are unique per request — no cross-request overwrite (S-H2a)', async () => {
+    const pngData = Buffer.from('89504e470d0a1a0a', 'hex')
+    const { engine } = makeEngine({ mediaDir: join(workDir, 'media') }, {
+      readImage: async () => pngData,
+    })
+    process.env.FAKE_AGY_MODE = 'ok'
+    const argsFile = join(workDir, 'args-media-unique.json')
+    process.env.FAKE_AGY_ARGS_FILE = argsFile
+    const staged: string[] = []
+    for (let i = 0; i < 2; i++) {
+      await runTurn(engine, [{
+        role: 'user',
+        text: 'what is this image?',
+        images: [{ mediaType: 'image/png', bytes: pngData.length }],
+      }], { meta: { keyId: 'key_media' } })
+      const argv = JSON.parse(readFileSync(argsFile, 'utf8').trim().split('\n').at(-1) ?? '[]') as string[]
+      const prompt = argv[argv.indexOf('-p') + 1] ?? ''
+      const m = prompt.match(/staged at (.+?) \(/)
+      expect(m).not.toBeNull()
+      staged.push(m![1]!)
+    }
+    expect(staged[0]).not.toBe(staged[1])
+    expect(existsSync(staged[0]!)).toBe(true)
+    expect(existsSync(staged[1]!)).toBe(true)
+  })
+
+  it('a pre-admission rejection never leaves the account busy-tracked (H1)', async () => {
+    let busySeen: ReadonlySet<string> | undefined
+    const fakePool = {
+      getAccounts: () => [{ id: 'acc-1' }],
+      selectAccount: (_family: string, busy: ReadonlySet<string>) => {
+        // The engine passes its live busy set — snapshot a copy.
+        busySeen = new Set(busy)
+        return { id: 'acc-1' }
+      },
+      recordSuccess: () => {},
+      recordFailure: () => {},
+      markAuthRequired: () => {},
+    }
+    const { engine } = makeEngine({}, { pool: fakePool as unknown as AccountPoolManager })
+    process.env.FAKE_AGY_MODE = 'ok'
+    const argsFile = join(workDir, 'args-busy-leak.json')
+    process.env.FAKE_AGY_ARGS_FILE = argsFile
+
+    // Empty prompt → the engine throws before the semaphore; pre-fix the busy
+    // mark had already been set and leaked (the only untrack lives in the
+    // dispatch finally, never reached).
+    await expect(collect(engine.stream(call([msg('user', '')])))).rejects.toMatchObject({ code: Err.AGY_ERROR })
+    // The next selection must see the account as free again.
+    await runTurn(engine, [msg('user', 'hello')], { meta: { keyId: 'root' } })
+    expect(busySeen?.has('acc-1')).toBe(false)
+
+    // Same for a BUSY rejection at the semaphore (queue full): the acquire
+    // seam rejects the FIRST call, then admits (one engine → one busy set).
+    let rejected = false
+    const onceBusy = makeEngine({}, {
+      pool: fakePool as unknown as AccountPoolManager,
+      acquire: async () => {
+        if (!rejected) {
+          rejected = true
+          throw new EngineError('request queue is full', Err.BUSY)
+        }
+        return () => {}
+      },
+    })
+    await expect(collect(onceBusy.engine.stream(call([msg('user', 'hello')])))).rejects.toMatchObject({ code: Err.BUSY })
+    await runTurn(onceBusy.engine, [msg('user', 'hello again')], { meta: { keyId: 'root' } })
+    expect(busySeen?.has('acc-1')).toBe(false)
   })
 })
 

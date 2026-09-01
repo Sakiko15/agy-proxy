@@ -4,6 +4,7 @@
 // busy), and the QR route states. DoD ① partial + charter §10 security rows.
 import { describe, it, expect } from 'vitest'
 import { makeAdminServer, login, adminGet, adminSend } from './helpers.admin.ts'
+import { parseCookieHeader } from '../src/server/admin-session.ts'
 
 describe('admin session + guards (charter §10)', () => {
   it('login sets an httpOnly SameSite=Lax cookie; wrong password → 401', async () => {
@@ -53,6 +54,21 @@ describe('admin session + guards (charter §10)', () => {
     await adminSend(built, 'POST', '/admin/logout', cookie)
     const after = await adminGet(built, '/admin/pool', cookie)
     expect(after.statusCode).toBe(401)
+  })
+
+  it('a malformed cookie header answers 401, not 500 (L3)', async () => {
+    // decodeURIComponent('%E0%A4%A') throws URIError — pre-fix the guard
+    // crashed and the request surfaced as a 500 instead of a clean denial.
+    const { built } = makeAdminServer()
+    const res = await built.app.inject({
+      method: 'GET',
+      url: '/admin/pool',
+      headers: { cookie: 'agy_admin_session=%E0%A4%A' },
+    })
+    expect(res.statusCode).toBe(401)
+    // Unit contract: undecodable values are dropped, valid ones decode.
+    expect(parseCookieHeader('agy_admin_session=%E0%A4%A')).toEqual({})
+    expect(parseCookieHeader('a=1; b=%2Fx')).toEqual({ a: '1', b: '/x' })
   })
 
   it('/admin/status carries count-only key info and today usage (no key material)', async () => {

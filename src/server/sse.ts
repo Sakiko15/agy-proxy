@@ -48,6 +48,10 @@ export class SseWriter {
       'x-accel-buffering': 'no', // nginx: stream unbuffered
       ...headers,
     })
+    // writeHead only stores the head — Node flushes it on the first body
+    // write. A slow engine (thinking for a minute, or heartbeats disabled)
+    // would leave the client with no status line at all, so push it out now.
+    this.raw.flushHeaders()
     this.lastSendAt = Date.now()
     if (this.heartbeatMs > 0) {
       this.heartbeatTimer = setInterval(() => this.tick(), this.heartbeatMs)

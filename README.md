@@ -97,10 +97,12 @@ must carry a non-empty `x-requested-with` header). Session cookie: `HttpOnly; Sa
 | `GET /admin/events` | **SSE** (`text/event-stream`): seq-stamped `snapshot`/`run`/`pool` events; reconnects replay from `Last-Event-ID` (snapshot XOR replay) |
 | `GET /admin/settings` · `PUT /admin/settings` | Settings view `{requested, effective, envLocked}` · write the 9-key allowlist to `runtime-overrides.json` (atomically; env vars still win — locked keys are *reported*, written values land in the file) |
 
-Usage accounting: one ledger row per actual agy spawn, keyed by the caller's `x-request-id`
-header (or the request id) — replaying the same id does not double-count. Per-key day
-budgets and RPM limits are enforced pre-engine; a rejected request never reaches agy and
-never books a row.
+Usage accounting: one ledger row per gateway request (booked at agy-spawn settlement; an
+engine-level retry of the same request merges into that one row via the server-assigned
+request id). The client `x-request-id` header is echoed back for observability only — it
+never keys the ledger, so replaying a request always books its own row (client-chosen
+ids are not trusted as dedupe keys). Per-key day budgets and RPM limits are enforced
+pre-engine; a rejected request never reaches agy and never books a row.
 
 ## Deploy (docker + reverse proxy)
 
@@ -168,6 +170,13 @@ log sites). To verify: send a request with a fake key, then grep the log output 
 
 ## Request surface notes (M2 semantics)
 
+- **Session scoping is per key, not per chat.** Conversation bindings and staged
+  media are namespaced by API key (root key included), so two different keys
+  never share agy conversation context or overwrite each other's staged files.
+  Two concurrent chats under the SAME key share the binding: when their message
+  counts align, the newer prompt may continue the older chat's agy conversation.
+  Interleaving multi-chat traffic on one key is not recommended (an
+  `x-session-id` header is a candidate for a future release).
 - **Client tools are accepted, not executed.** `tools`/`tool_choice` definitions pass
   validation with a warning but never reach agy and are never invoked; only **agy's own
   tool activity** mirrors as round trips — OpenAI `delta.tool_calls` / Anthropic `tool_use`

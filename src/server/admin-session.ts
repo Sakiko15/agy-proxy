@@ -71,7 +71,13 @@ export function parseCookieHeader(header: string | undefined): Record<string, st
     if (eq === -1) continue
     const k = part.slice(0, eq).trim()
     const v = part.slice(eq + 1).trim()
-    if (k !== '') out[k] = decodeURIComponent(v)
+    if (k === '') continue
+    try {
+      out[k] = decodeURIComponent(v)
+    } catch {
+      // Malformed percent-escaping in a cookie must not surface as a 500:
+      // drop the pair so the request just fails the session check (L3).
+    }
   }
   return out
 }
