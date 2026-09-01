@@ -50,6 +50,7 @@ function makePoolServer(engineOverrides: Partial<Pick<EngineDeps, 'onRun'>> = {}
     binArgs: [fakeScript],
     acquire: () => sem.acquire(),
     runs: new RunRegistry(),
+    retryDelay: async () => {}, // M5: failing runs retry once - keep tests fast (timing pinned in engine-retry.test)
     onRun: (i) => { onRunCalls.push(i) },
     ...engineOverrides,
   })

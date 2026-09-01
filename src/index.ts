@@ -154,12 +154,15 @@ async function main(): Promise<void> {
     runs,
     log: (m) => log.warn({ src: 'engine' }, redactLine(m)),
     onRun: (i) => {
-      // Enriched settle hook (one per actual agy spawn — continuations do not
-      // re-fire): the ledger row is the request-id-idempotent accounting.
+      // Enriched settle hook (one per actual agy spawn attempt — continuations
+      // do not re-fire). Per-attempt: the pino log; the ledger row + SSE event
+      // are final-gated: the ledger's INSERT OR IGNORE is first-wins, so a
+      // retried attempt's successful usage must be the row that books.
       log.info(
-        { ok: i.ok, code: i.code, durationMs: i.durationMs, model: i.model, accountId: i.accountId },
+        { ok: i.ok, code: i.code, attempt: i.attempt, final: i.final, durationMs: i.durationMs, model: i.model, accountId: i.accountId },
         i.ok ? 'agy run finished' : 'agy run failed',
       )
+      if (!i.final) return
       const meta = (i.meta ?? {}) as { reqId?: unknown; keyId?: unknown; protocol?: unknown }
       const reqId = typeof meta.reqId === 'string' ? meta.reqId : randomUUID()
       const keyId = typeof meta.keyId === 'string' ? meta.keyId : null

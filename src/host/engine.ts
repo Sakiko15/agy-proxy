@@ -29,7 +29,7 @@ import { parseMirrorCallId, type RunRecording, type RunRegistry } from './record
 import { defaultEffortFor, findEntry, ModelCatalog, resolveModelSlug } from './models.ts'
 import { StreamJsonParser } from './parser.ts'
 import { defaultMediaDir, stageImages, type ImageRefLike } from './media.ts'
-import { isolatedHomeEnv, startAgyProcess } from './runner.ts'
+import { isolatedHomeEnv, startAgyProcess, type RunOutcome } from './runner.ts'
 import { dataDir, stateDir } from '../common/config.ts'
 import type { SessionStore } from './sessions.ts'
 import type { StreamChunk, TokenUsage } from './stream-types.ts'
@@ -57,6 +57,25 @@ export const RETRY_POLICY = {
   maxDelayMs: 10_000,
   jitterRatio: 0.1,
 } as const
+
+/** Jittered backoff for one retry: base ± jitterRatio (±10% of 2s ⇒ 1.8–2.2s),
+ *  capped at maxDelayMs. Pure so tests can pin the bounds without sleeping. */
+export function computeRetryDelayMs(
+  baseMs: number,
+  rand: () => number = Math.random,
+  maxMs: number = RETRY_POLICY.maxDelayMs,
+): number {
+  const jittered = baseMs * (1 + (2 * rand() - 1) * RETRY_POLICY.jitterRatio)
+  return Math.max(0, Math.min(maxMs, Math.round(jittered)))
+}
+
+/** Default retry-delay implementation used when deps.retryDelay is absent. */
+export function defaultRetryDelay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const t = setTimeout(resolve, computeRetryDelayMs(ms))
+    t.unref()
+  })
+}
 
 export interface EngineMessageImage {
   name?: string
@@ -119,12 +138,22 @@ export interface EngineDeps {
   /** Recordings shared with the agy_tool mirror (continuation spans). */
   runs: RunRegistry
   /** Last-run telemetry + usage-ledger input, fired once per actual agy
-   *  spawn (settle time — never for continuation spans, so tool round trips
-   *  do not double count). Pre-flight throws (POOL_EXHAUSTED/BUSY/…) do not
-   *  fire it: no upstream consumption, no ledger row. */
+   *  spawn attempt (settle time — never for continuation spans, so tool
+   *  round trips do not double count). With dispatch-level retries (M5) an
+   *  attempt that will be retried fires with final=false; the host gates
+   *  ledger/push bookkeeping on final=true because the ledger's
+   *  INSERT OR IGNORE is first-wins — a failed attempt's row would otherwise
+   *  swallow the retry's successful usage. Pre-flight throws
+   *  (POOL_EXHAUSTED/BUSY/…) never fire it: no upstream consumption.
+   *  failureMessage carries the terminal error text (schema v2 error_text). */
   onRun?: (info: {
     ok: boolean
     code: string
+    /** 0-based spawn attempt within the logical run. */
+    attempt: number
+    /** true for the one attempt whose outcome settles the run. */
+    final: boolean
+    failureMessage?: string
     durationMs: number
     model: string
     /** Model slug actually driven (after fallback-model resolution). */
@@ -135,6 +164,10 @@ export interface EngineDeps {
     conversationId?: string
     meta?: Readonly<Record<string, unknown>>
   }) => void
+  /** Retry backoff seam for dispatch-level retries (M5); tests inject a
+   *  resolved promise to keep failing-run suites fast. Absent = the
+   *  RETRY_POLICY jittered delay. */
+  retryDelay?: (ms: number) => Promise<void>
   /** Reads image bytes from protocol-layer attachment storage. */
   readImage?: (ref: ImageRefLike) => Promise<Uint8Array | null>
   /**
@@ -530,15 +563,13 @@ export class AgyEngine {
       this.activeSessionPrompts.set(sessionKey, { prompt, startedAt: Date.now() })
     }
 
-    // ---- spawn + record (spans consume a shared recording) ----
-    // Conversation-id discovery is per-ACCOUNT: pool accounts run with an
-    // isolated HOME, so the conversations directory lives under account.dir,
-    // never the gateway process's real HOME.
-    const before = snapshotConversations(account?.dir || undefined)
+    // ---- dispatch with a single engine-level retry (M5) ----
+    // One recording per LOGICAL run: every spawn attempt appends into it in
+    // order, so the span consumer sees one seamless event stream and a
+    // retried spawn adds no visible seam. The recording is settled exactly
+    // once — after the retry loop — which is what guarantees a failure frame
+    // can never reach the client before the retries are exhausted.
     const rec = this.deps.runs.create()
-    const parser = new StreamJsonParser()
-    this.deps.onParser?.(parser)
-    let streamCid: string | null = null
     const args = this.buildArgs({
       prompt,
       model: activeModel === '' ? cfg.defaultModel : activeModel,
@@ -569,10 +600,11 @@ export class AgyEngine {
       release()
       if (schemaCleanup) void schemaCleanup().catch(() => undefined)
     }
+
     // Only pool accounts run with an isolated HOME (their token file lives in
     // account.dir/.gemini); injecting HOME for the real user profile would
-    // hide its agy login.
-    const env = {
+    // hide its agy login. Attempt-scoped: a retry may re-select the account.
+    const envFor = (acc: typeof account): NodeJS.ProcessEnv => ({
       ...process.env,
       ...(cfg.disableTelemetry
         ? {
@@ -582,205 +614,307 @@ export class AgyEngine {
             ANTIGRAVITY_DISABLE_TELEMETRY: '1',
           }
         : {}),
-      ...(account && account.dir ? isolatedHomeEnv(account.dir) : {}),
-      ...(account?.proxyUrl
+      ...(acc && acc.dir ? isolatedHomeEnv(acc.dir) : {}),
+      ...(acc?.proxyUrl
         ? {
-            ALL_PROXY: account.proxyUrl,
-            HTTPS_PROXY: account.proxyUrl,
-            HTTP_PROXY: account.proxyUrl,
-            all_proxy: account.proxyUrl,
-            https_proxy: account.proxyUrl,
-            http_proxy: account.proxyUrl,
+            ALL_PROXY: acc.proxyUrl,
+            HTTPS_PROXY: acc.proxyUrl,
+            HTTP_PROXY: acc.proxyUrl,
+            all_proxy: acc.proxyUrl,
+            https_proxy: acc.proxyUrl,
+            http_proxy: acc.proxyUrl,
           }
         : {}),
-    }
+    })
 
-    // ---- per-account serial queue (charter §6, p-queue concurrency:1) ----
-    // One agy process per account at a time: two concurrent requests on the
-    // same sticky account would race the per-HOME conversation discovery
-    // (two fresh .db files → ambiguous diff) and interleave on one session
-    // binding. The queue task spans the whole spawn→outcome window, so the
-    // next same-account spawn waits for the previous process to exit.
-    // Pool-off behavior is unchanged (the task runs immediately).
+    // Steer preemption lives on the recording, but the abort now has to
+    // survive beyond the current process (a kill between retry attempts must
+    // not be followed by a fresh spawn), so it flips a flag as well.
     let proc: ReturnType<typeof startAgyProcess> | undefined
-    let spawnError: unknown = null
-    let gateResolve!: () => void
-    const spawnGate = new Promise<void>((r) => { gateResolve = r })
+    let steerAborted = false
+    rec.requestAbort = () => {
+      steerAborted = true
+      proc?.kill('abort')
+    }
 
-    const runTask = async (): Promise<void> => {
-      // Superseded while queued (steer settled the recording) — don't spawn.
-      if (rec.isSettled) { releaseOnce(); return }
-      // Per-account burst spacing throttle with randomized jitter (prevents high-frequency flood to Google endpoints)
-      if (account) {
-        const lastSpawn = this.lastAccountSpawnTime.get(account.id) ?? 0
-        const elapsed = Date.now() - lastSpawn
-        const jitter = Math.floor(Math.random() * 300) // 100~400ms organic jitter
-        const targetInterval = this.minSpawnIntervalMs + jitter
-        if (elapsed < targetInterval) {
-          await new Promise((r) => setTimeout(r, targetInterval - elapsed))
+    /** What one spawn attempt concluded. */
+    interface AttemptResult {
+      failure: { kind: 'error' | 'aborted'; code: string; message: string } | null
+      outcome: RunOutcome
+      rawErrText: string
+      conversationId: string | null
+      resultEvent: { ok: boolean; response: string } | null
+      account: typeof account
+    }
+
+    const spawnFailed = (msg: string, acc: typeof account): AttemptResult => ({
+      failure: { kind: 'error', code: Err.PROCESS_EXIT, message: msg },
+      outcome: { code: null, signal: null, timedOut: false, aborted: false, stdout: '', stderrTail: '', durationMs: 0 },
+      rawErrText: '',
+      conversationId: null,
+      resultEvent: null,
+      account: acc,
+    })
+
+    const runOnce = async (index: number, attemptAcc: typeof account): Promise<AttemptResult> => {
+      const task = async (): Promise<AttemptResult> => {
+        // Superseded while queued (steer/abort) — don't spawn.
+        if (rec.isSettled || steerAborted) {
+          return spawnFailedAbort(attemptAcc)
         }
-        this.lastAccountSpawnTime.set(account.id, Date.now())
+        // Per-account burst spacing throttle with randomized jitter (prevents high-frequency flood to Google endpoints)
+        if (attemptAcc) {
+          const lastSpawn = this.lastAccountSpawnTime.get(attemptAcc.id) ?? 0
+          const elapsed = Date.now() - lastSpawn
+          const jitter = Math.floor(Math.random() * 300) // 100~400ms organic jitter
+          const targetInterval = this.minSpawnIntervalMs + jitter
+          if (elapsed < targetInterval) {
+            await new Promise((r) => setTimeout(r, targetInterval - elapsed))
+          }
+          this.lastAccountSpawnTime.set(attemptAcc.id, Date.now())
+        }
+        const parser = new StreamJsonParser()
+        this.deps.onParser?.(parser)
+        const before = snapshotConversations(attemptAcc?.dir || undefined)
+        let streamCid: string | null = null
+        // The binary seam is re-read per attempt: a retry may find a
+        // (re)installed binary even when attempt 0 failed to spawn.
+        const attemptBin = this.deps.bin() ?? bin
+        try {
+          proc = startAgyProcess({
+            bin: attemptBin,
+            args: [...(this.deps.binArgs ?? []), ...args],
+            cwd: workspaceRoot,
+            timeoutMs: cfg.timeoutMs,
+            signal: call.signal,
+            env: envFor(attemptAcc),
+            onLine: (line) => {
+              for (const ev of parser.feed(line + '\n')) {
+                if (ev.kind === 'init' && ev.conversationId) streamCid = ev.conversationId
+                if (ev.kind === 'result' && ev.conversationId !== '') streamCid = ev.conversationId
+                rec.append(ev)
+              }
+            },
+          })
+        } catch (e) {
+          // startAgyProcess funnels spawn errors into the outcome promise
+          // (child 'error' → code null); a synchronous throw is exceptional —
+          // but it used to leave the recording unsettled forever. Normalize.
+          return spawnFailed('failed to spawn agy: ' + brief(String(e)), attemptAcc)
+        }
+        if (sessionKey !== '') this.activeRuns.set(sessionKey, rec)
+        const outcome = await proc.outcome
+        if (this.activeRuns.get(sessionKey) === rec) this.activeRuns.delete(sessionKey)
+        if (sessionKey !== '') this.activeSessionPrompts.delete(sessionKey)
+        for (const ev of parser.flush()) {
+          if (ev.kind === 'result' && ev.conversationId !== '') streamCid = ev.conversationId
+          rec.append(ev)
+        }
+        const diffed = diffConversations(before, attemptAcc?.dir || undefined).conversationId
+        const conversationId = streamCid ?? diffed
+        // A result envelope the mapper will finish on: ok, or an error that
+        // still carries a usable response. Anything else leaves the live span
+        // un-finished, so the failure below reaches it through the recording.
+        const r = rec.getResultEvent()
+        // CANCELED-with-empty-response guard (Google issue #902, ~10% of long
+        // tool turns): agy ends with status=CANCELED / empty response yet exits
+        // 0, and the parser classifies it ok. The client would see an empty
+        // success; intercept it as a retryable INVALID_OUTPUT failure instead.
+        const canceledEmpty = r !== null && r.ok && r.response === '' && !rec.sawTextBefore(rec.length)
+        const consumable = r !== null && (r.ok || r.response !== '') && !canceledEmpty
+        // Error classification scans ONLY stderr and the result envelope's
+        // error field. stdout is model prose + event JSON: a run whose streamed
+        // text merely MENTIONED "rate limit"/"quota" (or contained a hash with
+        // "429") used to be misclassified as a quota failure, masking the real
+        // error and slapping a ghost cooldown on a healthy account.
+        const rawErrText = [outcome.stderrTail, parser.stats.lastResultError].filter(Boolean).join(' ')
+        const isRateLimit = looksLikeRateLimit(rawErrText)
+        let failure: { kind: 'error' | 'aborted'; code: string; message: string } | null = null
+        if (outcome.aborted) {
+          failure = { kind: 'aborted', code: 'ABORTED', message: 'agy run aborted by caller' }
+        } else if (outcome.timedOut) {
+          failure = { kind: 'error', code: Err.TIMEOUT, message: 'agy run was idle for ' + cfg.timeoutMs + 'ms without output' }
+        } else if (sawAuthFailure(parser, outcome)) {
+          failure = { kind: 'error', code: Err.AUTH, message: 'agy is not signed in — add a Google account to the pool (admin UI) to login' }
+        } else if (looksLikeValidationRequired(rawErrText)) {
+          // Google 403 re-validation: surface the challenge URL verbatim
+          // (M3 DoD) and quarantine the account like an expired login.
+          const detail = parser.stats.lastResultError ?? (outcome.stderrTail !== '' ? brief(outcome.stderrTail) : 'upstream requires re-validation (VALIDATION_REQUIRED)')
+          const url = extractValidationUrl(detail)
+          failure = { kind: 'error', code: Err.VALIDATION_REQUIRED, message: url !== undefined ? detail + ' (validation_url: ' + url + ')' : detail }
+        } else if (isRateLimit) {
+          const bestMsg = parser.stats.lastResultError || (outcome.stderrTail ? brief(outcome.stderrTail) : 'Rate limit or quota reached')
+          failure = { kind: 'error', code: Err.AGY_ERROR, message: 'Google Antigravity quota / rate limit reached: ' + bestMsg }
+        } else if (!consumable) {
+          if (outcome.code !== 0) {
+            // agy reports its failure on STDOUT as a result envelope and often
+            // exits 1 with EMPTY stderr; dropping the envelope here used to
+            // leave users with a bare "agy exited with code 1" and no cause.
+            // Prefer the envelope's error text, then the stderr tail. A null
+            // code separates the two no-envelope hazards (M5): a killed
+            // process (signal present) and a spawn failure (runner sinks the
+            // child 'error' string into stderrTail).
+            const detail = parser.stats.lastResultError ?? (outcome.stderrTail !== '' ? brief(outcome.stderrTail) : '')
+            const suffix = detail !== '' ? ': ' + detail : ''
+            if (outcome.code === null) {
+              failure = {
+                kind: 'error',
+                code: Err.PROCESS_EXIT,
+                message: outcome.signal !== null
+                  ? 'agy process was terminated (signal ' + outcome.signal + ')' + suffix
+                  : 'failed to spawn agy: ' + (detail !== '' ? detail : 'unknown spawn error (binary missing or not executable?)'),
+              }
+            } else {
+              failure = { kind: 'error', code: Err.PROCESS_EXIT, message: 'agy exited with code ' + outcome.code + suffix }
+            }
+          } else if (canceledEmpty) {
+            failure = { kind: 'error', code: Err.INVALID_OUTPUT, message: 'agy ended with an empty response (CANCELED, google antigravity #902)' }
+          } else if (parser.stats.lastResultError) {
+            failure = { kind: 'error', code: Err.AGY_ERROR, message: 'agy reported an error: ' + parser.stats.lastResultError }
+          } else {
+            failure = { kind: 'error', code: Err.INVALID_OUTPUT, message: 'agy produced no result event (' + parser.stats.garbage + ' unparseable lines)' }
+          }
+        }
+        return { failure, outcome, rawErrText, conversationId, resultEvent: r, account: attemptAcc }
       }
 
-      try {
-        proc = startAgyProcess({
-        bin,
-        args: [...(this.deps.binArgs ?? []), ...args],
-        cwd: workspaceRoot,
-        timeoutMs: cfg.timeoutMs,
-        signal: call.signal,
-        env,
-        onLine: (line) => {
-          for (const ev of parser.feed(line + '\n')) {
-            if (ev.kind === 'init' && ev.conversationId) streamCid = ev.conversationId
-            if (ev.kind === 'result' && ev.conversationId !== '') streamCid = ev.conversationId
-            rec.append(ev)
-          }
-        },
+      // ---- per-account serial queue (charter §6, p-queue concurrency:1) ----
+      // One agy process per account at a time: two concurrent requests on the
+      // same sticky account would race the per-HOME conversation discovery
+      // (two fresh .db files → ambiguous diff) and interleave on one session
+      // binding. The queue task spans the whole spawn→outcome window, so the
+      // next same-account spawn waits for the previous process to exit.
+      // Pool-off behavior is unchanged (the task runs immediately). Each
+      // retry attempt queues independently — a retry NEVER awaits inside
+      // attempt A's queue for account B's queue (concurrency:1 deadlock).
+      if (attemptAcc != null) {
+        let q = this.accountQueues.get(attemptAcc.id)
+        if (q === undefined) {
+          q = new PQueue({ concurrency: 1 })
+          this.accountQueues.set(attemptAcc.id, q)
+        }
+        return await q.add(task)
+      }
+      return await task()
+    }
+
+    function spawnFailedAbort(acc: typeof account): AttemptResult {
+      return {
+        failure: { kind: 'aborted', code: 'ABORTED', message: 'agy run aborted by caller' },
+        outcome: { code: null, signal: null, timedOut: false, aborted: true, stdout: '', stderrTail: '', durationMs: 0 },
+        rawErrText: '',
+        conversationId: null,
+        resultEvent: null,
+        account: acc,
+      }
+    }
+
+    void (async () => {
+      let attempt = 0
+      let attemptAccount = account
+      const fireRun = (r: AttemptResult, idx: number, final: boolean): void => {
+        const rawUsage = rec.getResultRawUsage()
+        this.deps.onRun?.({
+          ok: r.failure === null,
+          code: r.failure !== null ? r.failure.code : 'OK',
+          attempt: idx,
+          final,
+          ...(r.failure !== null ? { failureMessage: r.failure.message } : {}),
+          durationMs: r.outcome.durationMs,
+          model,
+          providerModel: activeModel === '' ? cfg.defaultModel : activeModel,
+          usage: rawUsage !== null ? usageFromRaw(rec.finalUsage(rawUsage)) : null,
+          ...(r.account != null ? { accountId: r.account.id } : {}),
+          ...(family !== undefined ? { family } : {}),
+          ...(r.conversationId != null && r.conversationId !== '' ? { conversationId: r.conversationId } : {}),
+          ...(call.meta !== undefined ? { meta: call.meta } : {}),
         })
-        if (sessionKey !== '') {
-          rec.requestAbort = () => proc!.kill('abort')
-          this.activeRuns.set(sessionKey, rec)
+      }
+      let last: AttemptResult
+      try {
+        for (;;) {
+          if (rec.isSettled) return // steer settled the whole run as superseded
+          last = await runOnce(attempt, attemptAccount)
+          // Retry gate (M5): only outcome-level failures with nothing on the
+          // wire. A result-shaped failure never emits span chunks (the mapper
+          // returns passively on !ok with an empty response); the #902
+          // CANCELED shape (ok + empty response) DOES ship a success finish,
+          // so it is excluded — retrying behind an already-served client
+          // would double-run. Any recorded step (text/reasoning/tool) may
+          // have streamed to the client: no replay.
+          const shapeOnly = last.resultEvent === null || (!last.resultEvent.ok && last.resultEvent.response === '')
+          const canRetry =
+            last.failure !== null &&
+            shapeOnly &&
+            RETRYABLE_CODES.includes(last.failure.code) &&
+            !rec.hasClientMappedEvents()
+          const final = !canRetry || attempt >= RETRY_POLICY.maxRetries || steerAborted || (call.signal?.aborted ?? false)
+          fireRun(last, attempt, final)
+          if (final) break
+          attempt++
+          await (this.deps.retryDelay ?? defaultRetryDelay)(RETRY_POLICY.initialDelayMs)
+          if (rec.isSettled || steerAborted || (call.signal?.aborted ?? false)) {
+            last = spawnFailedAbort(attemptAccount)
+            fireRun(last, attempt, true) // the aborted settle still books exactly one final event
+            break
+          }
+          // Same sticky selection as the first spawn, for the fixed family.
+          // A retryable failure never touches account state, so this normally
+          // returns the same account; an operator disable mid-flight keeps
+          // the settled failure instead of a secondhand POOL_EXHAUSTED.
+          if ((this.deps.pool?.getAccounts().length ?? 0) > 0) {
+            const next = this.deps.pool?.selectAccount(family) ?? undefined
+            if (next === undefined) break
+            attemptAccount = next
+          }
         }
-      } catch (e) {
-        spawnError = e
         releaseOnce()
-        gateResolve()
-        return
-      }
-      gateResolve()
-      const outcome = await proc!.outcome
-      releaseOnce()
-      if (this.activeRuns.get(sessionKey) === rec) this.activeRuns.delete(sessionKey)
-      if (sessionKey !== '') this.activeSessionPrompts.delete(sessionKey)
-      for (const ev of parser.flush()) {
-        if (ev.kind === 'result' && ev.conversationId !== '') streamCid = ev.conversationId
-        rec.append(ev)
-      }
-      const diffed = diffConversations(before, account?.dir || undefined).conversationId
-      const conversationId = streamCid ?? diffed
-      // A result envelope the mapper will finish on: ok, or an error that
-      // still carries a usable response. Anything else leaves the live span
-      // un-finished, so the failure below reaches it through the recording.
-      const r = rec.getResultEvent()
-      // CANCELED-with-empty-response guard (Google issue #902, ~10% of long
-      // tool turns): agy ends with status=CANCELED / empty response yet exits
-      // 0, and the parser classifies it ok. The client would see an empty
-      // success; intercept it as a retryable INVALID_OUTPUT failure instead.
-      const canceledEmpty = r !== null && r.ok && r.response === '' && !rec.sawTextBefore(rec.length)
-      const consumable = r !== null && (r.ok || r.response !== '') && !canceledEmpty
-      // Error classification scans ONLY stderr and the result envelope's
-      // error field. stdout is model prose + event JSON: a run whose streamed
-      // text merely MENTIONED "rate limit"/"quota" (or contained a hash with
-      // "429") used to be misclassified as a quota failure, masking the real
-      // error and slapping a ghost cooldown on a healthy account.
-      const rawErrText = [outcome.stderrTail, parser.stats.lastResultError].filter(Boolean).join(' ')
-      const isRateLimit = looksLikeRateLimit(rawErrText)
-      let failure: { kind: 'error' | 'aborted'; code: string; message: string } | null = null
-      if (outcome.aborted) {
-        failure = { kind: 'aborted', code: 'ABORTED', message: 'agy run aborted by caller' }
-      } else if (outcome.timedOut) {
-        failure = { kind: 'error', code: Err.TIMEOUT, message: 'agy run was idle for ' + cfg.timeoutMs + 'ms without output' }
-      } else if (sawAuthFailure(parser, outcome)) {
-        failure = { kind: 'error', code: Err.AUTH, message: 'agy is not signed in — add a Google account to the pool (admin UI) to login' }
-      } else if (looksLikeValidationRequired(rawErrText)) {
-        // Google 403 re-validation: surface the challenge URL verbatim
-        // (M3 DoD) and quarantine the account like an expired login.
-        const detail = parser.stats.lastResultError ?? (outcome.stderrTail !== '' ? brief(outcome.stderrTail) : 'upstream requires re-validation (VALIDATION_REQUIRED)')
-        const url = extractValidationUrl(detail)
-        failure = { kind: 'error', code: Err.VALIDATION_REQUIRED, message: url !== undefined ? detail + ' (validation_url: ' + url + ')' : detail }
-      } else if (isRateLimit) {
-        const bestMsg = parser.stats.lastResultError || (outcome.stderrTail ? brief(outcome.stderrTail) : 'Rate limit or quota reached')
-        failure = { kind: 'error', code: Err.AGY_ERROR, message: 'Google Antigravity quota / rate limit reached: ' + bestMsg }
-      } else if (!consumable) {
-        if (outcome.code !== 0) {
-          // agy reports its failure on STDOUT as a result envelope and often
-          // exits 1 with EMPTY stderr; dropping the envelope here used to
-          // leave users with a bare "agy exited with code 1" and no cause.
-          // Prefer the envelope's error text, then the stderr tail.
-          const detail = parser.stats.lastResultError ?? (outcome.stderrTail !== '' ? brief(outcome.stderrTail) : '')
-          failure = { kind: 'error', code: Err.PROCESS_EXIT, message: 'agy exited with code ' + outcome.code + (detail !== '' ? ': ' + detail : '') }
-        } else if (canceledEmpty) {
-          failure = { kind: 'error', code: Err.INVALID_OUTPUT, message: 'agy ended with an empty response (CANCELED, google antigravity #902)' }
-        } else if (parser.stats.lastResultError) {
-          failure = { kind: 'error', code: Err.AGY_ERROR, message: 'agy reported an error: ' + parser.stats.lastResultError }
+        rec.settle(last.failure)
+        if (last.failure === null) {
+          if (last.account) this.deps.pool?.recordSuccess(last.account.id, family)
+          if (sessionAccountKey !== '') {
+            const finalId = binding !== undefined ? binding.conversationId : last.conversationId
+            if (finalId) {
+              this.deps.store.set(sessionAccountKey, {
+                conversationId: finalId,
+                lastMessageCount: messages.length,
+                updatedAt: Date.now(),
+                model: activeModel,
+              })
+            }
+          }
         } else {
-          failure = { kind: 'error', code: Err.INVALID_OUTPUT, message: 'agy produced no result event (' + parser.stats.garbage + ' unparseable lines)' }
-        }
-      }
-      rec.settle(failure)
-      if (failure === null) {
-        if (account) this.deps.pool?.recordSuccess(account.id, family)
-        if (sessionAccountKey !== '') {
-          const finalId = binding !== undefined ? binding.conversationId : conversationId
-          if (finalId) {
-            this.deps.store.set(sessionAccountKey, {
-              conversationId: finalId,
-              lastMessageCount: messages.length,
-              updatedAt: Date.now(),
-              model: activeModel,
-            })
+          const effectiveRateLimit = looksLikeRateLimit(last.rawErrText) || looksLikeRateLimit(last.failure.message)
+          // Cooldown is a costly local penalty (account leaves rotation): only
+          // HARD server-issued signatures may trigger it. Soft signals (model
+          // overloaded) shape the message above but never cool the account.
+          if (last.account && looksLikeHardRateLimit(last.rawErrText)) {
+            this.deps.pool?.recordFailure(last.account.id, family, last.failure.message)
+          }
+          if (last.account && (last.failure.code === Err.AUTH || last.failure.code === Err.VALIDATION_REQUIRED || /invalid_grant|not signed in|auth/i.test(last.failure.message))) {
+            this.deps.pool?.markAuthRequired(last.account.id, last.failure.message)
+          }
+          if (sessionAccountKey !== '') {
+            if (
+              last.failure.code === Err.AUTH ||
+              effectiveRateLimit ||
+              (last.failure.message && /conversation.*(not found|invalid|not recognized|expired|does not exist)|session.*(expired|invalid)/i.test(last.failure.message))
+            ) {
+              // If auth expired or rate limit hit or conversation rejected, drop stale binding
+              this.deps.store.delete(sessionAccountKey)
+            }
           }
         }
-      } else {
-        const effectiveRateLimit = isRateLimit || looksLikeRateLimit(failure.message)
-        // Cooldown is a costly local penalty (account leaves rotation): only
-        // HARD server-issued signatures may trigger it. Soft signals (model
-        // overloaded) shape the message above but never cool the account.
-        if (account && looksLikeHardRateLimit(rawErrText)) {
-          this.deps.pool?.recordFailure(account.id, family, failure.message)
-        }
-        if (account && (failure.code === Err.AUTH || failure.code === Err.VALIDATION_REQUIRED || /invalid_grant|not signed in|auth/i.test(failure.message))) {
-          this.deps.pool?.markAuthRequired(account.id, failure.message)
-        }
-        if (sessionAccountKey !== '') {
-          if (
-            failure.code === Err.AUTH ||
-            effectiveRateLimit ||
-            (failure.message && /conversation.*(not found|invalid|not recognized|expired|does not exist)|session.*(expired|invalid)/i.test(failure.message))
-          ) {
-            // If auth expired or rate limit hit or conversation rejected, drop stale binding
-            this.deps.store.delete(sessionAccountKey)
-          }
-        }
+      } catch (err) {
+        releaseOnce()
+        rec.settle({ kind: 'error', code: Err.PROCESS_EXIT, message: 'internal error: ' + brief(String(err)) })
       }
-      const rawUsage = rec.getResultRawUsage()
-      this.deps.onRun?.({
-        ok: failure === null,
-        code: failure !== null ? failure.code : 'OK',
-        durationMs: outcome.durationMs,
-        model,
-        providerModel: activeModel === '' ? cfg.defaultModel : activeModel,
-        usage: rawUsage !== null ? usageFromRaw(rec.finalUsage(rawUsage)) : null,
-        ...(account != null ? { accountId: account.id } : {}),
-        ...(family !== undefined ? { family } : {}),
-        ...(conversationId != null && conversationId !== '' ? { conversationId } : {}),
-        ...(call.meta !== undefined ? { meta: call.meta } : {}),
-      })
-    }
-
-    const runFailed = (err: unknown): void => {
-      releaseOnce()
-      rec.settle({ kind: 'error', code: Err.PROCESS_EXIT, message: 'internal error: ' + brief(String(err)) })
-    }
-    if (account != null) {
-      let q = this.accountQueues.get(account.id)
-      if (q === undefined) {
-        q = new PQueue({ concurrency: 1 })
-        this.accountQueues.set(account.id, q)
-      }
-      void q.add(runTask).catch(runFailed)
-    } else {
-      void runTask().catch(runFailed)
-    }
-    // A queued spawn failure surfaces synchronously (pre-queue parity).
-    await spawnGate
-    if (spawnError !== null) {
-      throw new EngineError('failed to spawn agy: ' + brief(String(spawnError)), Err.PROCESS_EXIT)
-    }
+    })()
 
     // First span of the run: stream recorded events until the first
-    // completed tool step cuts it (or the result finishes it).
+    // completed tool step cuts it (or the result finishes it). The dispatch
+    // loop above keeps the recording unsettled until the final attempt, so
+    // this span simply never sees a failure frame until retries are done.
     yield* this.driveSpan(rec, 0, true)
   }
 

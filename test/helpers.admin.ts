@@ -60,6 +60,7 @@ export function makeAdminServer(cfgOverrides: Partial<GatewayConfig> = {}) {
     binArgs: [fakeScript],
     acquire: () => sem.acquire(),
     runs: new RunRegistry(),
+    retryDelay: async () => {}, // M5: failing runs retry once - keep tests fast (timing pinned in engine-retry.test)
   })
   const log = buildLogger({ AGY_PROXY_LOG_LEVEL: 'warn' })
   const built = buildServer({

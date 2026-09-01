@@ -26,6 +26,12 @@
 //                   process-tree kill verification)
 //   slow          — init, then FAKE_AGY_SILENCE_MS of pure silence, then a
 //                   short text + result (SSE heartbeat verification)
+//   kill-early    — SIGKILLs itself BEFORE any output (the engine-level
+//                   retry rescue shape: attempt 1 dies silently, attempt 2
+//                   serves the normal run). win32: exit code 1, signal null
+//                   (TerminateProcess); POSIX: signal SIGKILL, code null.
+//   kill-mid      — init + a text delta, THEN SIGKILL (partial output on the
+//                   wire ⇒ the no-replay guard must end the run, single spawn)
 //
 // FAKE_AGY_EVENTS_FILE (any mode): when set, every line of that file is
 // written to stdout verbatim — the golden-case runner replays recorded event
@@ -38,11 +44,23 @@
 //
 // Records its argv (JSON, one per line) to FAKE_AGY_ARGS_FILE when set;
 // records cwd to FAKE_AGY_CWD_FILE when set.
+//
+// FAKE_AGY_MODE_FILE (M5): path to a file holding the mode name, read at
+// every PROCESS START — lets a drill flip the failure mode between engine
+// retry attempts without re-reading the parent env (the engine snapshots
+// process.env once per run). Unreadable/missing file falls back to
+// FAKE_AGY_MODE; when the file is set both are re-read here, file wins.
 
 import { appendFileSync, readFileSync } from 'node:fs'
 
 const argv = process.argv.slice(2)
-const mode = process.env.FAKE_AGY_MODE ?? 'ok'
+let mode = process.env.FAKE_AGY_MODE ?? 'ok'
+if (process.env.FAKE_AGY_MODE_FILE) {
+  try {
+    const fileMode = readFileSync(process.env.FAKE_AGY_MODE_FILE, 'utf8').trim()
+    if (fileMode !== '') mode = fileMode
+  } catch {}
+}
 if (process.env.FAKE_AGY_ARGS_FILE) {
   try { appendFileSync(process.env.FAKE_AGY_ARGS_FILE, JSON.stringify(argv) + '\n') } catch {}
 }
@@ -81,6 +99,23 @@ if (mode === 'hang') {
   // Never prints, never exits: exercised by the watchdog and abort-kill
   // tests (process-tree kill must end this process).
   setInterval(() => {}, 1000)
+  await new Promise(() => {})
+}
+
+if (mode === 'kill-early') {
+  // M5 retry-rescue drill: die before any stdout byte. The engine sees
+  // code null + SIGKILL on POSIX, code 1 + no signal on win32 — both funnel
+  // to PROCESS_EXIT, and the retry (if wired) serves attempt 2 as 'ok'.
+  process.kill(process.pid, 'SIGKILL')
+  await new Promise(() => {}) // never reached; belt in case SIGKILL is soft
+}
+
+if (mode === 'kill-mid') {
+  // Partial-output drill: init + one text delta on the wire, then die.
+  emit({ event: 'init', conversation_id: conv, model: 'gemini-3-6-flash' })
+  emit({ event: 'step_update', step_update: { conversation_id: conv, step_index: 0, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'partial answer ' } })
+  await sleep(Number(process.env.FAKE_AGY_DELAY_MS ?? 40))
+  process.kill(process.pid, 'SIGKILL')
   await new Promise(() => {})
 }
 

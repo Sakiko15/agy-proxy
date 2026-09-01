@@ -46,6 +46,7 @@ function makeServer(cfgOverrides: Partial<GatewayConfig> = {}, withStore = true)
     binArgs: [fakeScript],
     acquire: () => sem.acquire(),
     runs: new RunRegistry(),
+    retryDelay: async () => {}, // M5: failing runs retry once - keep tests fast (timing pinned in engine-retry.test)
     ...({} as Partial<EngineDeps>),
   })
   const built = buildServer({

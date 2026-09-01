@@ -13,7 +13,9 @@
 // `agytc-<runId>-<eventIndex>` are enough to re-derive a span cursor from the
 // request message list alone — retries and replays stay idempotent with no
 // mutable per-stream state.
-// Ported from dsh-agy-link src/host/recording.ts @ 46984db (verbatim).
+// Ported from dsh-agy-link src/host/recording.ts @ 46984db (verbatim;
+// modified M5: hasClientMappedEvents() getter added — the engine-level
+// retry guard needs to know whether any client-visible step ever shipped).
 import { randomUUID } from 'node:crypto'
 import type { AgyEvent, RawUsage } from '../common/types.ts'
 
@@ -149,6 +151,22 @@ export class RunRecording {
       if (ev !== undefined && ev.kind === 'step' && ev.stepKind === 'text' && ev.text !== '') return true
     }
     return false
+  }
+
+  /**
+   * Whether any client-visible step is already recorded (any step event —
+   * text, reasoning or tool activity all map onto client chunks). The
+   * engine-level retry (M5) uses this as its no-replay guard: once a client
+   * may have seen output, a replayed spawn could duplicate it.
+   *
+   * Result envelopes are deliberately NOT counted: the mapper emits chunks
+   * from a result only when it finishes the span, and the engine's retry
+   * gate independently excludes every finish-capable result shape (ok, or
+   * error-with-response). A passive error envelope (`!ok`, empty response)
+   * maps to zero chunks, so retrying past it stays invisible.
+   */
+  hasClientMappedEvents(): boolean {
+    return this.events.some((ev) => ev.kind === 'step')
   }
 
   /**

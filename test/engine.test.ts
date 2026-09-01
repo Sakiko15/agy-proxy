@@ -50,6 +50,7 @@ function makeEngine(cfgOverrides: Partial<GatewayConfig> = {}, deps: Partial<Eng
     binArgs: [fakeScript],
     acquire: () => Promise.resolve(() => {}),
     runs,
+    retryDelay: async () => {}, // M5: failing runs retry once — keep tests fast (timing pinned in engine-retry.test)
     ...deps,
   })
   return { engine, store, argsFile, runs }
@@ -283,6 +284,7 @@ describe('engine: real-shape runs and error mapping', () => {
       bin: () => '/nonexistent/agy-binary-x',
       acquire: () => Promise.resolve(() => {}),
       runs: new RunRegistry(),
+      retryDelay: async () => {}, // M5: failing runs retry once — keep tests fast (timing pinned in engine-retry.test)
     })
     const chunks = await collect(broken.stream(call([msg('user', 'hi')])))
     const finish = chunks[chunks.length - 1] as { type: string; reason: { kind: string; failure?: { code: string } } }

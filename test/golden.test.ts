@@ -162,6 +162,7 @@ async function makeServer(caseCfg: CaseConfig): Promise<{ app: ReturnType<typeof
     binArgs: [join(import.meta.dirname, 'fake-agy.mjs')],
     acquire: () => sem.acquire(),
     runs: new RunRegistry(),
+    retryDelay: async () => {}, // M5: failing runs retry once - keep tests fast (timing pinned in engine-retry.test)
   })
   const built = buildServer({ getConfig: () => cfg, engine, catalog, log: buildLogger({ AGY_PROXY_LOG_LEVEL: 'warn' }) })
   return { app: built.app, workDir }

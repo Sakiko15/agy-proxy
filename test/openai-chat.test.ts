@@ -44,6 +44,7 @@ function makeServer(cfgOverrides: Partial<GatewayConfig> = {}, deps: Partial<Eng
     binArgs: [fakeScript],
     acquire: () => sem.acquire(),
     runs: new RunRegistry(),
+    retryDelay: async () => {}, // M5: failing runs retry once - keep tests fast (timing pinned in engine-retry.test)
     ...deps,
   })
   const built = buildServer({ getConfig: () => cfg, engine, catalog, log: buildLogger({ AGY_PROXY_LOG_LEVEL: 'warn' }) })
