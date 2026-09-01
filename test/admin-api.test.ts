@@ -80,7 +80,11 @@ describe('keys lifecycle over the admin API (DoD ⑤)', () => {
     expect(created.statusCode).toBe(201)
     const body = created.json() as { key: { id: string; prefix: string }; plaintext: string }
     expect(body.plaintext).toMatch(/^sk-agy-/)
-    expect(body.key.prefix).toBe(body.plaintext.slice(0, 8))
+    // M5 red-line fix: prefix derives from the secret part (the create
+    // response body legitimately carries the plaintext, but the echoed key
+    // record must not carry the constant marker as its prefix).
+    expect(body.key.prefix).toBe(body.plaintext.slice(7, 15))
+    expect(body.key.prefix).not.toContain('sk-agy-')
 
     // The list endpoint must not carry the plaintext, and creating a second
     // key must not echo the first one's plaintext (明文仅一次).

@@ -9,6 +9,7 @@
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import Database from 'better-sqlite3'
+import { KEY_MARK } from './key-store.ts'
 
 export const SCHEMA_VERSION = 2
 
@@ -75,6 +76,7 @@ export function openDb(path: string): Database.Database {
   if (version < SCHEMA_VERSION) {
     db.exec(DDL)
     migrateUsageErrorText(db)
+    migrateKeyPrefixMarker(db)
     db.pragma(`user_version = ${SCHEMA_VERSION}`)
   }
   return db
@@ -88,6 +90,17 @@ function migrateUsageErrorText(db: Database.Database): void {
   const cols = db.prepare('PRAGMA table_info(usage)').all() as Array<{ name: string }>
   if (cols.some((c) => c.name === 'error_text')) return
   db.exec('ALTER TABLE usage ADD COLUMN error_text TEXT')
+}
+
+/** v2 data fix (M5 drill finding): pre-fix rows stored `sk-agy-` + 1 secret
+ *  char as the display prefix — the constant key marker must never rest in
+ *  the DB (security red line) and left the prefix only 1 distinguishing
+ *  char. Keep the varying tail as the identified prefix (idempotent: fixed
+ *  rows no longer match the LIKE). */
+function migrateKeyPrefixMarker(db: Database.Database): void {
+  db.prepare(`UPDATE api_keys SET prefix = substr(prefix, ${KEY_MARK.length + 1}) WHERE prefix LIKE ? ESCAPE '\\'`).run(
+    KEY_MARK.replace(/[-\\%_]/g, (c) => '\\' + c) + '_%',
+  )
 }
 
 /** Flush the WAL back into the main file and close cleanly (shutdown path). */

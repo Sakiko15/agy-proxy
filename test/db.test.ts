@@ -125,6 +125,10 @@ describe('schema v2 migration (error_text)', () => {
     `)
     db.pragma('user_version = 1')
     db.prepare(`INSERT INTO usage (request_id, model, family, protocol, status, created_at) VALUES ('v1-row', 'gemini-3.7-flash', 'google', 'openai', 'OK', 1234)`).run()
+    // Legacy M3 rows (pre-M5 drill finding): the constant key marker was
+    // stored as the display prefix — a shape the v2 data fix must normalize.
+    db.prepare(`INSERT INTO api_keys (id, name, key_hash, prefix, created_at) VALUES ('kA', 'legacy-a', 'hash-a', 'sk-agy-Qw8n', 10)`).run()
+    db.prepare(`INSERT INTO api_keys (id, name, key_hash, prefix, created_at) VALUES ('kB', 'clean-b', 'hash-b', 'Zx45Kq9p', 20)`).run()
     return { db, ts: 1234 }
   }
 
@@ -141,6 +145,14 @@ describe('schema v2 migration (error_text)', () => {
     // existing rows and their projection survive the ALTER
     const row = reopened.prepare('SELECT request_id, status, error_text FROM usage').get() as { request_id: string; status: string; error_text: string | null }
     expect(row).toEqual({ request_id: 'v1-row', status: 'OK', error_text: null })
+    // v2 data fix: the constant marker is stripped from legacy display
+    // prefixes (red line: 'sk-agy-' never rests in the DB), clean rows keep
+    // their prefix untouched.
+    const keys = reopened.prepare('SELECT id, prefix FROM api_keys ORDER BY id').all() as Array<{ id: string; prefix: string }>
+    expect(keys).toEqual([
+      { id: 'kA', prefix: 'Qw8n' },
+      { id: 'kB', prefix: 'Zx45Kq9p' },
+    ])
     checkpointAndClose(reopened)
   })
 

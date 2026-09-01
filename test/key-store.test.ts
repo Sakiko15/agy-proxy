@@ -29,7 +29,12 @@ describe('KeyStore create', () => {
     const { store, db, path } = mkStore()
     const created = store.create({ name: 'ci' })
     expect(created.plaintext).toMatch(/^sk-agy-[A-Za-z0-9_-]{32}$/)
-    expect(created.prefix).toBe(created.plaintext.slice(0, 8))
+    // M5 red-line fix: the prefix derives from the SECRET part (after the
+    // constant 'sk-agy-' marker) — the marker itself never rests in the DB
+    // and the prefix stays 8 distinguishing chars.
+    expect(created.prefix).toBe(created.plaintext.slice(7, 15))
+    expect(created.prefix).toMatch(/^[A-Za-z0-9_-]{8}$/)
+    expect(created.prefix).not.toContain('sk-agy-')
     expect(created.name).toBe('ci')
     expect(created.dailyTokenLimit).toBe(0)
     expect(created.disabledAt).toBeNull()
@@ -48,8 +53,8 @@ describe('KeyStore create', () => {
     const { store, db } = mkStore()
     const { plaintext } = generateApiKey()
     const hash = hashKey(plaintext)
-    db.prepare(`INSERT INTO api_keys (id, name, key_hash, prefix, created_at) VALUES ('k1', 'a', ?, 'sk-agy-xx', 1)`).run(hash)
-    expect(() => db.prepare(`INSERT INTO api_keys (id, name, key_hash, prefix, created_at) VALUES ('k2', 'b', ?, 'sk-agy-yy', 2)`).run(hash)).toThrow()
+    db.prepare(`INSERT INTO api_keys (id, name, key_hash, prefix, created_at) VALUES ('k1', 'a', ?, 'legacy-fix', 1)`).run(hash)
+    expect(() => db.prepare(`INSERT INTO api_keys (id, name, key_hash, prefix, created_at) VALUES ('k2', 'b', ?, 'legacy-fix2', 2)`).run(hash)).toThrow()
     expect(store.count()).toBe(1)
     checkpointAndClose(db)
   })

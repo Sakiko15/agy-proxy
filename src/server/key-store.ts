@@ -33,6 +33,9 @@ export function hashKey(plaintext: string): string {
   return createHash('sha256').update(plaintext, 'utf8').digest('hex')
 }
 
+/** The constant plaintext marker — 7 chars. Never stored anywhere. */
+export const KEY_MARK = 'sk-agy-'
+
 /**
  * Parse a stored scope list (model ids separated by newline, comma or
  * semicolon) into ids. null or an empty/cleaned-out string means
@@ -47,10 +50,14 @@ export function parseKeyScopes(scopes: string | null | undefined): string[] | nu
   return parts.length > 0 ? parts : null
 }
 
-/** `sk-agy-` + 24 random bytes, base64url: 32 url-safe chars of entropy. */
+/** `sk-agy-` (KEY_MARK) + 24 random bytes, base64url: 32 url-safe chars of entropy. */
 export function generateApiKey(): { plaintext: string; prefix: string } {
-  const plaintext = 'sk-agy-' + randomBytes(24).toString('base64url')
-  return { plaintext, prefix: plaintext.slice(0, 8) }
+  const plaintext = KEY_MARK + randomBytes(24).toString('base64url')
+  // The display prefix must come from the SECRET part: the leading `sk-agy-`
+  // marker is constant, so slicing from 0 would store that marker in the DB
+  // (security red line: it never rests in the DB) and leave the 8-char prefix
+  // only 1 distinguishing char.
+  return { plaintext, prefix: plaintext.slice(KEY_MARK.length, KEY_MARK.length + 8) }
 }
 
 export class KeyStore {
