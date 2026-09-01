@@ -1,10 +1,15 @@
 // Entry: theme init (pre-paint ran in index.html), i18n, router, query cache.
-// Code-based TanStack Router tree (no codegen step; type-safety identical).
+// Code-based TanStack Router tree (no codegen step). Protected pages call
+// requireAuth in beforeLoad; /login renders bare (no sidebar shell).
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { createRootRoute, createRoute, createRouter, Outlet, RouterProvider } from '@tanstack/react-router'
+import { createRootRoute, createRoute, createRouter, redirect, RouterProvider } from '@tanstack/react-router'
+import { Toaster } from 'sonner'
 import './i18n/index.ts'
+import { requireAuth } from './auth.ts'
+import { AppShell } from './shell/AppShell.tsx'
+import { LoginPage } from './routes/login.tsx'
 import './app.css'
 
 const queryClient = new QueryClient({
@@ -13,23 +18,53 @@ const queryClient = new QueryClient({
   },
 })
 
-const rootRoute = createRootRoute({
-  component: () => (
-    <div className="min-h-dvh bg-background text-foreground">
-      <Outlet />
-    </div>
-  ),
-  notFoundComponent: () => <div className="p-8 text-sm text-muted-foreground">404</div>,
-})
+const rootRoute = createRootRoute({})
 
-// Placeholder index — replaced by the dashboard in the M4 page commits.
-const indexRoute = createRoute({
+const appRoute = createRoute({
   getParentRoute: () => rootRoute,
-  path: '/',
-  component: () => <div className="p-8 text-sm">agy-proxy</div>,
+  id: 'app', // layout route: auth-guarded, renders the shell
+  beforeLoad: async () => {
+    await requireAuth()
+  },
+  component: AppShell,
 })
 
-const routeTree = rootRoute.addChildren([indexRoute])
+const indexRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: '/',
+  component: () => <div className="text-sm text-muted-foreground">dashboard placeholder</div>,
+})
+
+// Page stubs — replaced one per M4 commit (accounts/keys/usage/settings).
+function pageStub(name: string) {
+  return () => <div className="text-sm text-muted-foreground">{name} placeholder</div>
+}
+
+const accountsRoute = createRoute({ getParentRoute: () => appRoute, path: '/accounts', component: pageStub('accounts') })
+const keysRoute = createRoute({ getParentRoute: () => appRoute, path: '/keys', component: pageStub('keys') })
+const usageRoute = createRoute({ getParentRoute: () => appRoute, path: '/usage', component: pageStub('usage') })
+const settingsRoute = createRoute({ getParentRoute: () => appRoute, path: '/settings', component: pageStub('settings') })
+
+const loginRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/login',
+  beforeLoad: async () => {
+    // Already signed in → skip the form.
+    try {
+      await requireAuth()
+      throw redirect({ to: '/' })
+    } catch (error) {
+      if ((error as { to?: string }).to === '/') throw error
+      // 401: fall through and show the form
+    }
+  },
+  component: LoginPage,
+})
+
+const routeTree = rootRoute.addChildren([
+  appRoute.addChildren([indexRoute, accountsRoute, keysRoute, usageRoute, settingsRoute]),
+  loginRoute,
+])
 const router = createRouter({ routeTree, context: { queryClient } })
 
 declare module '@tanstack/react-router' {
@@ -44,6 +79,7 @@ createRoot(root).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
       <RouterProvider router={router} />
+      <Toaster position="top-center" />
     </QueryClientProvider>
   </StrictMode>,
 )
