@@ -229,6 +229,32 @@ describe('pool: AccountPoolManager', () => {
     expect(pool.getAccount(accA.id)?.authRequired).toBeUndefined()
   })
 
+  it('onChange fires once per mutation and unsubscribe stops the stream', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-pool-onchange-'))
+    const pool = new AccountPoolManager(dir)
+    const seen: string[] = []
+    const unsubscribe = pool.onChange(() => { seen.push('change') })
+    try {
+      pool.createAccountSlot('alpha')
+      expect(seen).toEqual(['change']) // one callback per mutating call
+      pool.deleteAccount(pool.getAccounts()[0]!.id)
+      expect(seen).toEqual(['change', 'change'])
+
+      unsubscribe()
+      pool.createAccountSlot('beta')
+      expect(seen).toEqual(['change', 'change']) // no further notifies
+
+      // Reads and no-op lookups (unknown account) never notify.
+      expect(seen).toEqual(['change', 'change'])
+      const noopCount = seen.length
+      pool.getAccount('does-not-exist')
+      pool.getPoolData()
+      expect(seen.length).toBe(noopCount)
+    } finally {
+      unsubscribe()
+    }
+  })
+
   it('sweepOldLogs sweeps log files older than retention days', () => {
     const dir = mkdtempSync(join(tmpdir(), 'agy-pool-logs-'))
     const pool = new AccountPoolManager(dir)

@@ -5,7 +5,8 @@
 // normalizeLegacyPrimary / setPrimaryAccount and the primary branch of
 // finishWithCode do not apply to a headless gateway (no desktop login);
 // defaultPoolDir re-roots to the gateway state dir; pool file shape and
-// scheduling untouched).
+// scheduling untouched; M4 adds an additive onChange() mutation hook fired at
+// the end of persist() — no scheduling/persistence behavior change).
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { stateDir } from '../common/config.ts'
@@ -62,6 +63,25 @@ export class AccountPoolManager {
     } catch {
       // Best-effort persistence
     }
+    this.notify()
+  }
+
+  // ---- mutation observers (M4): every mutating method funnels through
+  // persist(), so a single notify point keeps observers in lockstep with
+  // both the in-memory data and the persisted file. Used by the admin event
+  // bus to debounce full pool snapshots over /admin/events. ----
+  private readonly listeners = new Set<() => void>()
+
+  /** Subscribe to pool mutations; returns an unregister function. */
+  onChange(fn: () => void): () => void {
+    this.listeners.add(fn)
+    return () => {
+      this.listeners.delete(fn)
+    }
+  }
+
+  private notify(): void {
+    for (const fn of this.listeners) fn()
   }
 
   getPoolData(): Readonly<AccountPoolData> {
