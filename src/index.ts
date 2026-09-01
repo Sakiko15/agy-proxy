@@ -20,6 +20,7 @@ import { buildLogger } from './server/logger.ts'
 import { buildServer } from './server/app.ts'
 import { GatewaySemaphore } from './server/semaphore.ts'
 import { installShutdown } from './server/shutdown.ts'
+import { AdminEventBus } from './server/events.ts'
 import { openDb } from './server/db.ts'
 import { KeyStore } from './server/key-store.ts'
 import { UsageLedger } from './server/usage-ledger.ts'
@@ -111,6 +112,12 @@ async function main(): Promise<void> {
   pool.sweepStaleStaging()
   pool.sweepOldLogs(getConfig().logRetentionDays)
 
+  // ---- admin event bus (M4): /admin/events SSE. Run events share the
+  // ledger row's fields (both fed from the onRun hook below); pool snapshots
+  // are debounced off the pool mutation hook. ----
+  const bus = new AdminEventBus({ getPool: () => pool.getPoolData() })
+  pool.onChange(() => bus.schedulePoolChange())
+
   const bin = await resolveAgyBin(getConfig().agyBin)
   if (bin === null) {
     // Unreachable after startup() unless the binary vanished in between.
@@ -152,19 +159,45 @@ async function main(): Promise<void> {
         i.ok ? 'agy run finished' : 'agy run failed',
       )
       const meta = (i.meta ?? {}) as { reqId?: unknown; keyId?: unknown; protocol?: unknown }
+      const reqId = typeof meta.reqId === 'string' ? meta.reqId : randomUUID()
+      const keyId = typeof meta.keyId === 'string' ? meta.keyId : null
+      const protocol = meta.protocol === 'anthropic' ? ('anthropic' as const) : ('openai' as const)
       ledger.record({
-        requestId: typeof meta.reqId === 'string' ? meta.reqId : randomUUID(),
-        keyId: typeof meta.keyId === 'string' ? meta.keyId : null,
+        requestId: reqId,
+        keyId,
         accountId: i.accountId ?? null,
         model: i.providerModel,
         family: i.family ?? 'unknown',
-        protocol: meta.protocol === 'anthropic' ? 'anthropic' : 'openai',
+        protocol,
         promptTokens: i.usage?.inputTokens ?? 0,
         completionTokens: i.usage?.outputTokens ?? 0,
         ...(i.usage?.reasoningTokens !== undefined ? { reasoningTokens: i.usage.reasoningTokens } : {}),
         ...(i.usage?.cacheReadTokens !== undefined ? { cacheReadTokens: i.usage.cacheReadTokens } : {}),
         status: i.code,
         durationMs: i.durationMs,
+      })
+      // The SSE event mirrors the ledger row (same source hook) so the
+      // dashboard can never disagree with the audited accounting.
+      bus.publishRun({
+        ok: i.ok,
+        status: i.code,
+        durationMs: i.durationMs,
+        model: i.providerModel,
+        ...(i.family !== undefined ? { family: i.family } : {}),
+        ...(i.conversationId !== undefined ? { conversationId: i.conversationId } : {}),
+        accountId: i.accountId ?? null,
+        keyId,
+        protocol,
+        reqId,
+        usage:
+          i.usage !== null
+            ? {
+                promptTokens: i.usage.inputTokens,
+                completionTokens: i.usage.outputTokens,
+                ...(i.usage.reasoningTokens !== undefined ? { reasoningTokens: i.usage.reasoningTokens } : {}),
+                ...(i.usage.cacheReadTokens !== undefined ? { cacheReadTokens: i.usage.cacheReadTokens } : {}),
+              }
+            : null,
       })
     },
   })
@@ -186,6 +219,7 @@ async function main(): Promise<void> {
       ledger,
       sessions,
       catalog,
+      events: bus,
       verifyPassword: (pw) => verifyAdminPassword(db, pw),
     },
   })
@@ -209,6 +243,7 @@ async function main(): Promise<void> {
     teardown: async () => {
       clearTimeout(bootRefresh)
       clearInterval(poller)
+      bus.closeAll() // ends hijacked /admin/events streams — app.close() does not
       await poolAuth.cancel().catch(() => undefined)
       await ledger.close().catch(() => undefined) // flush → WAL checkpoint → close
     },

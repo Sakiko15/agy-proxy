@@ -16,6 +16,7 @@ import { PoolAuthFlow } from '../src/host/pool-auth.ts'
 import { buildServer } from '../src/server/app.ts'
 import { buildLogger } from '../src/server/logger.ts'
 import { GatewaySemaphore } from '../src/server/semaphore.ts'
+import { AdminEventBus } from '../src/server/events.ts'
 import { openDb } from '../src/server/db.ts'
 import { KeyStore } from '../src/server/key-store.ts'
 import { UsageLedger } from '../src/server/usage-ledger.ts'
@@ -45,6 +46,8 @@ export function makeAdminServer(cfgOverrides: Partial<GatewayConfig> = {}) {
   const ledger = new UsageLedger(db, { flushIntervalMs: 50 })
   const sessions = new AdminSessionStore(db, { ttlMs: 60_000 })
   const pool = new AccountPoolManager(join(dir, 'accounts'))
+  const events = new AdminEventBus({ getPool: () => pool.getPoolData(), debounceMs: 30 })
+  pool.onChange(() => events.schedulePoolChange())
   const quota = new QuotaService(pool)
   const poolAuth = new PoolAuthFlow(pool, quota, () => {})
   const catalog = new ModelCatalog(async () => { throw new Error('no discovery in tests') }, cfg.fallbackModels, 300_000)
@@ -76,10 +79,11 @@ export function makeAdminServer(cfgOverrides: Partial<GatewayConfig> = {}) {
       ledger,
       sessions,
       catalog,
+      events,
       verifyPassword: async (pw: string) => pw === 'drill-admin',
     },
   })
-  return { built, keys, ledger, db, pool, poolAuth }
+  return { built, keys, ledger, db, pool, poolAuth, events }
 }
 
 export type ServerRef = ReturnType<typeof makeAdminServer>['built']

@@ -84,10 +84,13 @@ export class SseWriter {
     await this.writeRaw('data: ' + body + '\n\n')
   }
 
-  /** `event: <name>\ndata: <json>\n\n` (Anthropic event style). */
-  async event(name: string, payload: unknown): Promise<void> {
+  /** `event: <name>\ndata: <json>\n\n` (Anthropic event style). With `id`,
+   *  an `id: <seq>` line is prepended so EventSource tracks lastEventId for
+   *  Last-Event-ID reconnects (admin event stream, M4). */
+  async event(name: string, payload: unknown, id?: number): Promise<void> {
     this.lastSendAt = Date.now()
-    await this.writeRaw('event: ' + name + '\ndata: ' + JSON.stringify(payload) + '\n\n')
+    const idLine = typeof id === 'number' ? 'id: ' + id + '\n' : ''
+    await this.writeRaw('event: ' + name + '\n' + idLine + 'data: ' + JSON.stringify(payload) + '\n\n')
   }
 
   /** End the stream: [DONE] is the caller's job; this closes our side cleanly. */

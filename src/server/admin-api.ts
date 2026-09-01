@@ -25,6 +25,8 @@ import type { UsageLedger } from './usage-ledger.ts'
 import type { AdminSessionStore } from './admin-session.ts'
 import { parseCookieHeader, serializeClearCookie, serializeSetCookie } from './admin-session.ts'
 import { sanitizeSettings, settingsView, writeOverridesPatch } from './settings.ts'
+import { SseWriter } from './sse.ts'
+import type { AdminEventBus, AdminEvent } from './events.ts'
 
 export interface AdminDeps {
   getConfig: () => GatewayConfig
@@ -36,6 +38,8 @@ export interface AdminDeps {
   ledger: UsageLedger
   sessions: AdminSessionStore
   catalog: ModelCatalog
+  /** M4 admin event bus; absent → the JSON-only surface (M3 shape). */
+  events?: AdminEventBus
   /** argon2 verify against the stored admin hash (wired in index.ts). */
   verifyPassword: (password: string) => Promise<boolean>
 }
@@ -140,6 +144,48 @@ export function registerAdminApi(app: AdminInstance, deps: AdminDeps): void {
 
   app.get('/admin/me', guarded(), async (_request, reply) => {
     await reply.code(200).send({ ok: true })
+    return reply
+  })
+
+  // ---- SSE event stream (M4; charter §9: 实时数据全部 SSE + Last-Event-ID
+  // 续传). EventSource rides the session cookie same-origin; GET needs no
+  // CSRF header. Reconnect semantics are snapshot XOR replay — never both. ----
+  app.get('/admin/events', guarded(), async (request, reply) => {
+    const bus = deps.events
+    if (bus === undefined) {
+      await reply.code(404).send({ ok: false, error: 'event stream is not wired up (no event bus)' })
+      return reply
+    }
+    const cfg = deps.getConfig()
+    const sse = new SseWriter(reply, { heartbeatMs: cfg.sseHeartbeatMs, keepalive: () => ': ping\n\n' })
+    await sse.open()
+
+    // Idempotent teardown in both orders: the socket closes first (raw 'close'
+    // resolves sse.done) or closeAll() fires the registered end callback.
+    const unsubscribe = bus.subscribe((ev: AdminEvent) => {
+      void sse.event(ev.type, ev, ev.seq).catch(() => undefined)
+    })
+    const registerRef = bus.registerClient(() => end())
+    let ended = false
+    function end(): void {
+      if (ended) return
+      ended = true
+      registerRef()
+      unsubscribe()
+      void sse.close().catch(() => undefined)
+    }
+    void sse.done.then(end, end)
+
+    // Initial delivery: replay what the client missed, otherwise a snapshot.
+    const header = request.headers['last-event-id']
+    const lastRaw = Array.isArray(header) ? header[0] : header
+    const last = typeof lastRaw === 'string' && /^\d+$/.test(lastRaw) ? Number(lastRaw) : null
+    if (last === null || !bus.canReplayFrom(last)) {
+      const snap = bus.publishSnapshot()
+      await sse.event('snapshot', snap, snap.seq).catch(() => undefined)
+    } else {
+      for (const ev of bus.replayAfter(last)) await sse.event(ev.type, ev, ev.seq).catch(() => undefined)
+    }
     return reply
   })
 
