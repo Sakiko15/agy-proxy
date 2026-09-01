@@ -18,10 +18,9 @@ FROM node:24-slim
 RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install the official agy CLI at build time (pinned via build arg).
-# Verify the pin resolves: the install script fetches the latest manifest and
-# honors AGY_CLI_VERSION for a pinned install.
-ARG AGY_CLI_VERSION=latest
+# Install the official agy CLI at build time (version-locked: m1.md verified
+# the real binary as 1.1.22; charter L148 requires the pin, no floating tags).
+ARG AGY_CLI_VERSION=1.1.22
 RUN curl -fsSL https://antigravity.google/cli/install.sh \
     | AGY_CLI_VERSION=${AGY_CLI_VERSION} bash \
     && /root/.local/bin/agy --version

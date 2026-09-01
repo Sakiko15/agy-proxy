@@ -1,0 +1,14 @@
+# Keep the build context lean — everything needed is package.json, dist/,
+# web/ (source for the web stage), and this file's siblings.
+.git
+node_modules
+web/node_modules
+web/dist
+docs
+*.log
+*.md
+test
+scripts
+.env
+0
+CLAUDE.md
