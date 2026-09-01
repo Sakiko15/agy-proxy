@@ -24,7 +24,7 @@ import { GatewaySemaphore } from './server/semaphore.ts'
 import { installShutdown } from './server/shutdown.ts'
 import { AdminEventBus } from './server/events.ts'
 import { openDb } from './server/db.ts'
-import { KeyStore } from './server/key-store.ts'
+import { KeyStore, parseKeyScopes } from './server/key-store.ts'
 import { UsageLedger } from './server/usage-ledger.ts'
 import { AdminSessionStore, ensureAdminPassword, verifyAdminPassword } from './server/admin-session.ts'
 
@@ -152,6 +152,14 @@ async function main(): Promise<void> {
     bin: () => resolveAgyBin(getConfig().agyBin),
     acquire: () => sem.acquire(),
     runs,
+    // Per-key model whitelist (M5): resolved per call from the keys table.
+    // Root key (null) and unknown ids stay unrestricted — the root key is a
+    // charter red line. Parsed once per request; the table is small.
+    getScopes: (keyId) => {
+      if (keyId === null) return null
+      const rec = keys.get(keyId)
+      return rec !== undefined ? parseKeyScopes(rec.scopes) : null
+    },
     log: (m) => log.warn({ src: 'engine' }, redactLine(m)),
     onRun: (i) => {
       // Enriched settle hook (one per actual agy spawn attempt — continuations

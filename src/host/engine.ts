@@ -168,6 +168,15 @@ export interface EngineDeps {
    *  resolved promise to keep failing-run suites fast. Absent = the
    *  RETRY_POLICY jittered delay. */
   retryDelay?: (ms: number) => Promise<void>
+  /**
+   * Per-key model whitelist (M5): resolve a managed key id to its allowed
+   * model ids, or null when the key has no whitelist (unrestricted). Absent
+   * callback = the feature is off. The engine checks the model actually
+   * SERVED (post-fallback resolution) and rejects with Err.MODEL_NOT_ALLOWED
+   * (403, both protocols). The root key (keyId=null) must resolve null —
+   * charter red line: the bootstrap key is unrestricted.
+   */
+  getScopes?: (keyId: string | null) => string[] | null
   /** Reads image bytes from protocol-layer attachment storage. */
   readImage?: (ref: ImageRefLike) => Promise<Uint8Array | null>
   /**
@@ -457,6 +466,24 @@ export class AgyEngine {
           `All Antigravity accounts in pool are in cooldown for ${family}${waitStr}. Add an account or wait for reset.`,
           Err.POOL_EXHAUSTED,
           countdownMs !== null ? Math.max(1, Math.ceil(countdownMs / 1000)) : undefined,
+        )
+      }
+    }
+
+    // ---- per-key model whitelist (M5): the key's scopes constraint applies
+    // to the model ACTUALLY SERVED — after fallback resolution, since the
+    // fallback switch silently redirects the request — not to the request's
+    // model label. Root (keyless) requests and an absent callback bypass. ----
+    const getScopes = this.deps.getScopes
+    if (getScopes !== undefined) {
+      const metaScopes = (call.meta ?? {}) as { keyId?: unknown }
+      const scopesKey = typeof metaScopes.keyId === 'string' && metaScopes.keyId !== '' ? metaScopes.keyId : null
+      const allowedModels = getScopes(scopesKey)
+      const servingModel = activeModel === '' ? cfg.defaultModel : activeModel
+      if (allowedModels !== null && allowedModels.length > 0 && !allowedModels.includes(servingModel)) {
+        throw new EngineError(
+          `model ${servingModel} is not in this key's allowed model list — patch the key scopes in the admin UI (MODEL_NOT_ALLOWED)`,
+          Err.MODEL_NOT_ALLOWED,
         )
       }
     }

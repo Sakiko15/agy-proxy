@@ -33,6 +33,20 @@ export function hashKey(plaintext: string): string {
   return createHash('sha256').update(plaintext, 'utf8').digest('hex')
 }
 
+/**
+ * Parse a stored scope list (model ids separated by newline, comma or
+ * semicolon) into ids. null or an empty/cleaned-out string means
+ * UNRESTRICTED — a key without a configured whitelist serves every model.
+ */
+export function parseKeyScopes(scopes: string | null | undefined): string[] | null {
+  if (scopes === null || scopes === undefined) return null
+  const parts = scopes
+    .split(/[\n,;]/)
+    .map((s) => s.trim())
+    .filter((s) => s !== '')
+  return parts.length > 0 ? parts : null
+}
+
 /** `sk-agy-` + 24 random bytes, base64url: 32 url-safe chars of entropy. */
 export function generateApiKey(): { plaintext: string; prefix: string } {
   const plaintext = 'sk-agy-' + randomBytes(24).toString('base64url')
@@ -79,18 +93,21 @@ export class KeyStore {
 
   update(
     id: string,
-    patch: { name?: string; disabled?: boolean; dailyTokenLimit?: number; rpmLimit?: number },
+    patch: { name?: string; disabled?: boolean; dailyTokenLimit?: number; rpmLimit?: number; scopes?: string | null },
   ): ApiKeyRecord | undefined {
     const current = this.get(id)
     if (current === undefined) return undefined
     const disabledAt = patch.disabled === undefined ? current.disabledAt : patch.disabled ? Date.now() : null
+    // scopes: undefined = leave as is; '' or null clears the whitelist (NULL).
+    const scopes = patch.scopes === undefined ? current.scopes : patch.scopes === null || patch.scopes === '' ? null : patch.scopes
     this.db
-      .prepare(`UPDATE api_keys SET name = ?, disabled_at = ?, daily_token_limit = ?, rpm_limit = ? WHERE id = ?`)
+      .prepare(`UPDATE api_keys SET name = ?, disabled_at = ?, daily_token_limit = ?, rpm_limit = ?, scopes = ? WHERE id = ?`)
       .run(
         patch.name?.trim() || current.name,
         disabledAt,
         positiveIntOrZero(patch.dailyTokenLimit ?? current.dailyTokenLimit),
         positiveIntOrZero(patch.rpmLimit ?? current.rpmLimit),
+        scopes,
         id,
       )
     return this.get(id)

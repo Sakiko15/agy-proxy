@@ -160,6 +160,8 @@ export const Err = {
   POOL_EXHAUSTED: 'POOL_EXHAUSTED',
   /** Upstream 403 re-validation (validation_url rides the message) → 403. */
   VALIDATION_REQUIRED: 'VALIDATION_REQUIRED',
+  /** Per-key model whitelist violation (M5) → 403, both protocol tables. */
+  MODEL_NOT_ALLOWED: 'MODEL_NOT_ALLOWED',
 } as const
 
 // Raw usage object as emitted by agy stream-json (snake_case).
