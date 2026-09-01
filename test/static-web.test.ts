@@ -15,8 +15,8 @@ afterEach(() => {
 })
 
 describe('no built frontend (JSON-only mode, M3 behavior)', () => {
-  it('boots without a web root; / falls through to the protocol 404 shape', async () => {
-    process.env.AGY_PROXY_WEB_DIST = '/definitely/not/a/dir'
+  it('AGY_PROXY_WEB_DIST=none opts out; / falls through to the protocol 404 shape', async () => {
+    process.env.AGY_PROXY_WEB_DIST = 'none'
     const { built } = makeAdminServer()
     const res = await built.app.inject({ method: 'GET', url: '/' })
     expect(res.statusCode).toBe(404)

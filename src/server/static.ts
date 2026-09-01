@@ -14,10 +14,15 @@ import type { SetHeadersResponse } from '@fastify/static'
 import type { GatewayConfig } from '../common/types.ts'
 
 /** Directory candidates, in precedence order. The winner must contain
- *  index.html — a stale/empty dir must never take over. */
+ *  index.html — a stale/empty dir must never take over. Set
+ *  AGY_PROXY_WEB_DIST=none (or config webDist='none') to run JSON-only even
+ *  when a build exists (the cwd fallback would otherwise always find the
+ *  repo's web/dist after `npm run web:build`). */
 export function resolveWebDist(cfg: GatewayConfig, env: NodeJS.ProcessEnv = process.env): string | null {
   const candidates: string[] = []
+  if (cfg.webDist === 'none') return null
   if (cfg.webDist !== '') candidates.push(cfg.webDist)
+  if (env.AGY_PROXY_WEB_DIST === 'none') return null
   if (env.AGY_PROXY_WEB_DIST !== undefined && env.AGY_PROXY_WEB_DIST !== '') candidates.push(env.AGY_PROXY_WEB_DIST)
   // The bundled entry is dist/index.js (tsx dev runs from src/server/); the
   // repo layout keeps the SPA build at <repoRoot>/web/dist, which the docker

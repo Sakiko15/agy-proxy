@@ -54,11 +54,15 @@ describe('server skeleton', () => {
   })
 
   it('unknown routes get the OpenAI 404 body', async () => {
+    // JSON-only posture: opt out explicitly — cwd web/dist can exist in the
+    // repo after a web build (see test/static-web.test.ts for the WebUI pose).
+    process.env.AGY_PROXY_WEB_DIST = 'none'
     const { built } = makeServer()
     const res = await built.app.inject({ method: 'GET', url: '/nope' })
     expect(res.statusCode).toBe(404)
     expect(res.json()).toEqual({ error: { message: 'Not found.', type: 'invalid_request_error', code: 'not_found' } })
     await built.app.close()
+    delete process.env.AGY_PROXY_WEB_DIST
   })
 
   it('malformed JSON body → 400 invalid_request_error', async () => {
