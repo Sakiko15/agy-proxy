@@ -1,8 +1,8 @@
 // API Keys page (charter §9 page 4): list with prefix/tokensToday/limits,
 // create-once dialog (plaintext shown exactly once, "I saved it" gates the
-// close), disable/enable + limits edit via PATCH, delete with confirm. The
-// M5 scopes column renders as a read-only badge — enforcement is deferred,
-// and a dead edit form would be worse than a labelled placeholder.
+// close), disable/enable + limits + model-whitelist (M5 scopes) edits via
+// PATCH, delete with confirm. Empty scopes = unrestricted (the placeholder
+// says so); a configured whitelist shows its model count on the row badge.
 import { useState, type FormEvent } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
@@ -56,7 +56,9 @@ function KeyRow({ apiKey, onChanged }: { apiKey: ApiKeyWithToday; onChanged: () 
   const [editing, setEditing] = useState(false)
   const [dailyLimit, setDailyLimit] = useState(String(apiKey.dailyTokenLimit))
   const [rpmLimit, setRpmLimit] = useState(String(apiKey.rpmLimit))
+  const [scopes, setScopes] = useState(apiKey.scopes ?? '')
 
+  const scopeModels = parseModels(apiKey.scopes)
   const disabled = apiKey.disabledAt !== null
   return (
     <Card className={disabled ? 'opacity-60' : undefined}>
@@ -65,7 +67,9 @@ function KeyRow({ apiKey, onChanged }: { apiKey: ApiKeyWithToday; onChanged: () 
           <div className="flex items-center gap-2">
             <span className="font-mono text-sm font-medium">{apiKey.prefix}…</span>
             <Badge variant={disabled ? 'muted' : 'success'}>{disabled ? t('common.disabled') : t('common.enabled')}</Badge>
-            {apiKey.scopes !== null && <Badge variant="outline">{t('keys.scopesM5')}</Badge>}
+            <Badge variant="outline">
+              {scopeModels === null ? t('keys.scopesAll') : t('keys.scopesModels', { n: scopeModels.length })}
+            </Badge>
           </div>
           <div className="mt-0.5 text-xs text-muted-foreground">{apiKey.name}</div>
         </div>
@@ -116,7 +120,13 @@ function KeyRow({ apiKey, onChanged }: { apiKey: ApiKeyWithToday; onChanged: () 
             onSubmit={(e: FormEvent<HTMLFormElement>) => {
               e.preventDefault()
               void api
-                .patchKey(apiKey.id, { dailyTokenLimit: Number(dailyLimit) || 0, rpmLimit: Number(rpmLimit) || 0 })
+                .patchKey(apiKey.id, {
+                  dailyTokenLimit: Number(dailyLimit) || 0,
+                  rpmLimit: Number(rpmLimit) || 0,
+                  // '' clears the whitelist (server stores NULL) — the input's
+                  // empty state IS the "unrestricted" affordance.
+                  scopes,
+                })
                 .then(() => {
                   toast.success(t('settings.saved'))
                   setEditing(false)
@@ -133,6 +143,16 @@ function KeyRow({ apiKey, onChanged }: { apiKey: ApiKeyWithToday; onChanged: () 
               <Label htmlFor={`rpm-${apiKey.id}`}>{t('keys.rpmLimit')}</Label>
               <Input id={`rpm-${apiKey.id}`} type="number" min={0} value={rpmLimit} onChange={(e) => setRpmLimit(e.currentTarget.value)} />
             </div>
+            <div className="flex min-w-64 flex-1 flex-col gap-1">
+              <Label htmlFor={`scopes-${apiKey.id}`}>{t('keys.scopesEdit')}</Label>
+              <Input
+                id={`scopes-${apiKey.id}`}
+                value={scopes}
+                placeholder={t('keys.scopesHint')}
+                onChange={(e) => setScopes(e.currentTarget.value)}
+                className="font-mono text-xs"
+              />
+            </div>
             <Button size="sm" type="submit">{t('common.save')}</Button>
           </form>
         )}
@@ -143,6 +163,13 @@ function KeyRow({ apiKey, onChanged }: { apiKey: ApiKeyWithToday; onChanged: () 
 
 function showError(error: unknown): void {
   toast.error(error instanceof ApiError ? error.message : String(error))
+}
+
+/** Mirror of the server's parseKeyScopes for display: null = unrestricted. */
+function parseModels(scopes: string | null): string[] | null {
+  if (scopes === null) return null
+  const parts = scopes.split(/[\n,;]/).map((s) => s.trim()).filter((s) => s !== '')
+  return parts.length > 0 ? parts : null
 }
 
 function CreateKeyDialog({

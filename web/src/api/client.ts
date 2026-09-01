@@ -99,7 +99,7 @@ export const api = {
   keys: () => apiGet<{ ok: boolean; keys: ApiKeyWithToday[] }>('/admin/keys'),
   createKey: (body: { name?: string; dailyTokenLimit?: number; rpmLimit?: number }) =>
     apiSend<{ ok: boolean; key: ApiKeyRecord; plaintext: string }>('POST', '/admin/keys', body),
-  patchKey: (id: string, patch: { name?: string; disabled?: boolean; dailyTokenLimit?: number; rpmLimit?: number }) =>
+  patchKey: (id: string, patch: { name?: string; disabled?: boolean; dailyTokenLimit?: number; rpmLimit?: number; scopes?: string | null }) =>
     apiSend<{ ok: boolean; key: ApiKeyRecord }>('PATCH', `/admin/keys/${encodeURIComponent(id)}`, patch),
   deleteKey: (id: string) => apiSend<{ ok: boolean }>('DELETE', `/admin/keys/${encodeURIComponent(id)}`),
   usage: (query: string) => apiGet<{ ok: boolean; total: number; rows: UsageRow[] }>(`/admin/usage${query}`),
