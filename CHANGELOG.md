@@ -2,6 +2,32 @@
 
 All notable changes to agy-proxy are documented here. Format based on Keep a Changelog; versions follow semver.
 
+## [Unreleased] (M5 加固发布)
+
+### Added
+- **Engine-level single retry** (src/host/engine.ts): `RETRYABLE_CODES`/`RETRY_POLICY` existed since the ADR-11 port with zero consumers. Now: retryable failure classes (TIMEOUT / PROCESS_EXIT / no-result INVALID_OUTPUT) get exactly one dispatch-level retry with the jittered policy delay, one recording per LOGICAL run so the span streams seamlessly across the attempt boundary and a failure frame can never reach the client before retries are exhausted. No-replay guards: any recorded step event (`hasClientMappedEvents()`, recording.ts's third documented modification) plus every finish-capable result shape (ok, error-with-response, and the #902 CANCELED empty success) block the retry. Spawn failures joined the loop (the old spawnGate throw leaked the recording unsettled) with explicit 'failed to spawn agy: …' / 'terminated (signal …)' messages; `deps.bin()` re-read per attempt. `onRun` gains `{attempt, final, failureMessage?}`.
+- **Busy-aware account spread** (src/host/pool.ts + engine.ts): selection was not busy-aware — three same-family arrivals before any settle stacked onto one account's queue (measured ratio 0.9× where two-and-a-half was required). `selectAccount(family, busy?)` skips tracked accounts and recurses to unfiltered selection when the whole pool is busy; the engine tracks selected accounts until the dispatch finally block.
+- **Per-key model whitelist enforcement** (engine + key-store + errors): `EngineDeps.getScopes(keyId)` → the engine judges the model ACTUALLY SERVED (deliberately after fallback-model resolution) pre-spawn; violations answer `Err.MODEL_NOT_ALLOWED` → 403 permission_error in both protocol tables. Root key / absent callback / cleared whitelist bypass (empty = unrestricted, not deny-all). `KeyStore.update` patches scopes; `parseKeyScopes` splits on newline/comma/semicolon.
+- **Usage ledger schema v2 `error_text`** (db.ts + usage-ledger.ts): terminal failure text stored next to its row, truncated 500 chars at record(); `PRAGMA table_info`-guarded in-place migration for v1 databases (rows preserved, idempotent); first-wins request-id idempotency untouched. `GET /admin/usage` rows carry `errorText`.
+- **Usage page error detail + CSV column**: failed rows expand an in-place error-detail row under the clickable status chip (aria-expanded); CSV export adds the `error_text` column (empty on OK rows).
+- **Keys page scopes editor**: the "planned M5" placeholder badge became a live whitelist-size badge plus a monospace scopes input (empty IS the unrestricted affordance); `patchKey` carries `scopes: string | null`.
+- **Soak harness + perf baseline** (scripts/soak.mts, scripts/perf.mts — acceptance §4): soak = mixed 3-lane load with mode-file failure windows + admin recovery + /healthz probes + RSS/handle sampling; error matrix (six modes incl. kill-early rescue and kill-mid no-replay); `taskkill /T /F` ×3 with exact ledger reconciliation. perf = 8 legs vs a bare-pipe reference — all green on this host (first-delta delta 13ms, non-stream 3ms, ledger P95 939ms, 3-account 2.7×, flood 20k error-free, models cold 4ms, RPM 429 + Retry-After).
+- **`AGY_PROXY_DEBUG_METRICS_MS`** (config `debugMetricsMs`): the gateway emits one NDJSON `{"debug":"metrics", rss, handles, uptime}` line per tick for the harness (raw stdout, not pino). Registered in README.
+- **fake-agy**: `FAKE_AGY_MODE_FILE` (mode re-read per process start — the mechanism for flipping failure modes between retry attempts), `kill-early`/`kill-mid` self-SIGKILL rescue/no-replay drills (win32 documents exit 1/no-signal, POSIX signal SIGKILL — both PROCESS_EXIT), `flood` mode (20k events, no awaits).
+
+### Fixed
+- **Usage ledger flush never aborts the process**: a failed transaction escaped the throwaway `void`-flush chain as an unhandled rejection (disk full = process kill, violating the DoD). Bounded requeue (`MAX_PENDING_ROWS=5000`, oldest dropped beyond it), failure warning throttled to one per 60 s, and a fully guarded `close()`.
+- **Settings overrides writer strands the .tmp on failure**: now unlinked best-effort and rethrown — a failed write leaves exactly the pre-call state.
+- **Pool-auth done-reset timer unref'd** — the 30 s 'done' hold kept the event loop alive past shutdown intent.
+- **Media TTL sweeper wired at boot + hourly interval** (src/host/media-sweeper.ts, new file — media.ts is a verbatim port and stays diffable): `sweepDir()` had been ported and pinned since M1 but never scheduled; staged client images accumulated without bound. `mediaTtlMs <= 0` disables; the engine's mediaDir resolution is mirrored.
+- **Client-boundary token scrub**: terminal failure text crossed to clients unscrubbed; new narrow `scrubTokenMaterial()` (ya29.*/Bearer/anchored `4/` codes; URLs and prose untouched — redactLine() would destroy the validation_url feature passthrough) wired at the single funnel `EventMapper.emitFailure`.
+- **Dockerfile `AGY_CLI_VERSION` pinned to 1.1.22** (m1.md record), closing the charter L148 floating-tag violation; compose + .dockerignore added.
+
+### Deliberate deviations (M5)
+- **`hasClientMappedEvents()` counts step events only**, not result envelopes: the mapper emits chunks from a result only for finish-capable shapes, and the retry gate excludes those independently — a passive error envelope (`!ok`, empty response) maps to zero chunks, so the plan's "任一 step/result 事件" shorthand is implemented to its stated intent (客户端可见输出) rather than its letter.
+- **Retry re-selection keeps the settled failure on an empty-pool miss** instead of raising secondhand POOL_EXHAUSTED: the first attempt's outcome is the client-visible truth; pool emptiness mid-retry is only reachable via operator action, not retryable failures.
+- charter "中途重放 M5 复议" (§6) **decided: maintain the M3 decision** — the new engine-level retry is orthogonal (nothing-on-the-wire failures only) and does not reintroduce transparent replay; documented in charter §6.
+
 ## [Unreleased] (M4 管理 WebUI)
 
 ### Added
@@ -16,9 +42,9 @@ All notable changes to agy-proxy are documented here. Format based on Keep a Cha
 - CI push trigger corrected `main` → `master` — the default branch had never run push CI (pre-existing mismatch).
 
 ### Deliberate deviations (M4)
-- **No error-text column in the usage page**: ledger schema v1 has none; the page shows status codes (chip per code) and the raw text stays in gateway logs. `errorText` is a schema-v2/M5 candidate. This deviates from charter §9 page-5 wording and is recorded here instead of faking a field.
+- **No error-text column in the usage page**: ledger schema v1 has none; the page shows status codes (chip per code) and the raw text stays in gateway logs. `errorText` is a schema-v2/M5 candidate. This deviates from charter §9 page-5 wording and is recorded here instead of faking a field. *(Landed in M5: schema v2 `error_text` + usage-page detail row + CSV column.)*
 - **TanStack Virtual not introduced** (charter §9 principle): the log table is server-paginated ≤500 rows where virtualization costs a11y and bundle for no gain; charter §8 WebUI row annotated. Revisit if M5 adds an unbounded live log.
-- **Per-key model whitelist (scopes)**: enforcement deliberately deferred to M5 (user decision); the keys UI shows a read-only "planned M5" badge instead of a dead edit form.
+- **Per-key model whitelist (scopes)**: enforcement deliberately deferred to M5 (user decision); the keys UI shows a read-only "planned M5" badge instead of a dead edit form. *(Landed in M5: engine pre-spawn enforcement via `getScopes` + keys-page scopes editor.)*
 - Dashboard "success rate" derives from two from-midnight ledger queries (all vs `status=OK`) because the day summary carries no status split.
 
 ## [Unreleased] (M3 池与记账)

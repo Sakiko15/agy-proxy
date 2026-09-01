@@ -143,8 +143,9 @@ agy-proxy 是自托管的 LLM 网关：把 Google Antigravity 官方 `agy` CLI �
 - **SSE 心跳**：反代/Cloudflare 存活（OpenAI 端发注释行 `: ping`，Anthropic 端发 `ping` 事件）
 - **优雅停机**：SIGTERM → 停止接新 → 等待在跑 agy（带上限，docker `stop_grace_period: 30s`）→ kill 残留进程组 → SQLite checkpoint → 关闭 DB
 - **崩溃恢复**：SQLite `journal_mode=WAL; synchronous=FULL; busy_timeout`；usage 记账以请求 id 幂等去重；pool.json/sessions.json 损坏时自动备份重建
-- **并发防护**：每账号串行队列（p-queue `concurrency:1`，已实现——同时消除同账号并发互踩会话绑定的竞态）+ 全局队列深度上限（超出即 429 BUSY）+ 客户端断连（AbortSignal）级联取消 agy 进程
-- **硬限流语义（M3 修订，用户定案）**：in-flight 请求遇上游硬限流 = 该请求失败（上游真实错误透传），账号进冷却；**自下一个请求起自动切换**到池内其他账号——请求粒度的透明切换，而非中途透明重放（agy 无部分续传，跨进程重放需重新计费且会破坏会话绑定；M5 复议）。全池冷却/隔离时返回 429 `POOL_EXHAUSTED` + `Retry-After`（取最早重置时刻倒计时）
+- **并发防护**：每账号串行队列（p-queue `concurrency:1`，已实现——同时消除同账号并发互踩会话绑定的竞态）+ 全局队列深度上限（超出即 429 BUSY）+ 客户端断连（AbortSignal）级联取消 agy 进程。调度补强（M5）：选择时跳过有在跑/排队的账号（busy-aware 参与参数），并发请求横向铺开而非堆叠一个账号的队列——验收 §4「互不阻塞 / ≥2.5× 吞吐」的结构性前提
+- **引擎级单次重试（M5 落地）**：仅覆盖无线上输出的故障类别（TIMEOUT / PROCESS_EXIT / 无结果 INVALID_OUTPUT），按 RETRY_POLICY 抖动延迟后重选账号重跑；任何已下发客户端可见输出（任一 step 事件）或结果形态可终止 span 的失败一律不重放。`RETRYABLE_CODES/RETRY_POLICY` 自 ADR-11 移植以来首次接入消费者
+- **硬限流语义（M3 修订，用户定案）**：in-flight 请求遇上游硬限流 = 该请求失败（上游真实错误透传），账号进冷却；**自下一个请求起自动切换**到池内其他账号——请求粒度的透明切换，而非中途透明重放（agy 无部分续传，跨进程重放需重新计费且会破坏会话绑定；**M5 复议定案：维持本决策**——重试机器已落地为引擎级单次重试，仅覆盖无线上输出的故障类别，与透明重放语义正交，见 §6 重试行）。全池冷却/隔离时返回 429 `POOL_EXHAUSTED` + `Retry-After`（取最早重置时刻倒计时）
 - **版本锁定**：Docker 构建期固定 agy 版本 + `AGY_CLI_DISABLE_AUTO_UPDATE=true`；启动探测 `agy --version`（最低版本可配置）
 - **PID 1**：容器内 tini（或 `docker run --init`）——转发 SIGTERM + 回收 zombie（每请求 spawn 短命子进程，zombie 回收不可省）
 
@@ -189,7 +190,7 @@ agy-proxy 是自托管的 LLM 网关：把 Google Antigravity 官方 `agy` CLI �
 
 ## 10. 安全设计
 
-- **API key**：sha256 哈希 + 前 8 位前缀辨识；每 key RateLimiterMemory 限流 + 429 带 Retry-After；模型白名单预留
+- **API key**：sha256 哈希 + 前 8 位前缀辨识；每 key RateLimiterMemory 限流 + 429 带 Retry-After；模型白名单**已落地（M5）**——`getScopes(keyId)` 引擎预 spawn 对实际服务模型（fallback 解析后）判定，`Err.MODEL_NOT_ALLOWED` → 双协议 403 permission_error；根 key 与未配置白名单的 key 旁路（空=不限，非 deny-all）
 - **Admin 面**：argon2 密码 + DB session（哈希落库、可吊销）；同源 SPA + SameSite=Lax；admin 变更路由要求自定义头（X-Requested-With）作 CSRF 双保险；默认监听 127.0.0.1、由反代对外
 - **agy 权限（受控工具执行）**：workspace 限定网关专用目录（每账号独立子目录），权限模式默认 `plan`；`--dangerously-skip-permissions` 默认关闭，设置页开启需二次确认 + 全程警示横幅（skip = key 持有者可在容器内执行任意命令——本立项最大单点风险）；`--sandbox` 兼容性评估列入 M5（官方 issue #36：不可与 skip 组合）
 - **凭证卫生**：OAuth token 文件永不读取/复制/入日志；doctor 式脱敏（auth URL / `4/` 授权码 / `ya29.` / Bearer 全 scrub）
@@ -216,7 +217,7 @@ agy-proxy 是自托管的 LLM 网关：把 Google Antigravity 官方 `agy` CLI �
 - **M2 双协议完整**（1 周）：流式两端、tool_calls/tool_use 往返、count_tokens、models、错误模型、SSE 心跳
 - **M3 池与记账**（1 周）：账号池全功能（粘贴 URL 登录/配额/冷却/熔断）+ key 管理 + SQLite 记账
 - **M4 WebUI**（1-1.5 周）：§9 全部页面 + SSE 实时推送
-- **M5 加固发布**（1 周）：镜像发布、反代文档（nginx/Caddy/Cloudflare）、压测、错误矩阵演练、v0.1.0
+- **M5 加固发布**（1 周）：镜像发布、反代文档（nginx/Caddy/Cloudflare）、压测、错误矩阵演练、v0.1.0。**M5 交付状态**：加固面全部落地（账本 flush 容错 / settings .tmp 清理 / 计时器 unref / media TTL 清扫 / 客户端边界 token 脱敏 / 引擎级单次重试 + busy-aware 铺开 / 每 key 白名单 enforcement / errorText schema v2 / soak.mts + perf.mts / compose + deploy runbook）；演练归档进行中（docs/verify/m5.md）。真实登录、配额条人工核对、容器强杀（VPS）、48h 长稳为用户执行项。版本保持 0.1.0，发版动作等待显式发布指令
 
 **M5 验收标准**：fake-agy 全部测试 + 真实账号端到端双协议（流式/非流式/tool 往返）回归；48h 长稳跑无进程/句柄/内存泄漏；容器强杀重启自动恢复；错误场景矩阵（断网/过期 token/429/杀 agy 进程/磁盘满）全部按预期降级。
 

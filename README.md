@@ -4,11 +4,11 @@ Self-hosted LLM gateway: Google Antigravity (official `agy` CLI) as the upstream
 exposed as OpenAI Chat Completions + Anthropic Messages compatible HTTP APIs with per-key
 quotas and a management WebUI. Runs in Docker on a VPS behind a reverse proxy.
 
-**Status: M4 (management WebUI) — under active development.** The six-page zh-CN console
+**Status: M5 (hardening release) — release-ready; publishing awaits an explicit command.** The six-page zh-CN console
 (login / dashboard / accounts / keys / usage / settings) rides the same admin API, with live
 updates over `/admin/events` SSE and same-process static hosting. See
 [docs/charter.md](docs/charter.md) (立项文档), [docs/development.md](docs/development.md),
-[docs/acceptance.md](docs/acceptance.md).
+[docs/acceptance.md](docs/acceptance.md), [docs/deploy.md](docs/deploy.md) (部署 runbook).
 
 ## Risk disclaimer
 
