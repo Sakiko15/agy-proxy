@@ -15,6 +15,8 @@ import { RunRegistry } from './host/recording.ts'
 import { AccountPoolManager } from './host/pool.ts'
 import { QuotaService } from './host/quota.ts'
 import { PoolAuthFlow } from './host/pool-auth.ts'
+import { defaultMediaDir } from './host/media.ts'
+import { startMediaSweeper } from './host/media-sweeper.ts'
 import { redactLine } from './host/diagnostics.ts'
 import { buildLogger } from './server/logger.ts'
 import { buildServer } from './server/app.ts'
@@ -238,11 +240,21 @@ async function main(): Promise<void> {
   }, Math.max(60_000, getConfig().quotaPollIntervalMs))
   poller.unref()
 
+  // Media sweeper (M5): staged request images live on the volume until the
+  // TTL prunes them — the same dir resolution the engine's stager uses.
+  const mediaSweeper = startMediaSweeper(
+    getConfig().mediaDir !== '' ? getConfig().mediaDir : defaultMediaDir(stateDir()),
+    getConfig().mediaTtlMs,
+    3_600_000,
+    (m) => log.info({ src: 'media-sweeper' }, redactLine(m)),
+  )
+
   installShutdown(built, {
     log,
     teardown: async () => {
       clearTimeout(bootRefresh)
       clearInterval(poller)
+      mediaSweeper.stop()
       bus.closeAll() // ends hijacked /admin/events streams — app.close() does not
       await poolAuth.cancel().catch(() => undefined)
       await ledger.close().catch(() => undefined) // flush → WAL checkpoint → close

@@ -133,6 +133,8 @@ Layering: `AGY_PROXY_*` environment variables > `~/.agy-proxy/gateway/runtime-ov
 | `AGY_PROXY_TRUSTED_PROXIES` | *(empty)* | Comma-separated proxy IPs/CIDRs; when the client IP is in this set, `X-Forwarded-For` decides the admin-CIDR client address. |
 | `AGY_PROXY_QUOTA_POLL_INTERVAL_MS` | `900000` (15min) | Background per-account quota poll interval (clamped ≥ 60s). |
 | `AGY_PROXY_LOG_RETENTION_DAYS` | `7` | Account-pool auth-log retention before the boot sweep prunes. |
+| `AGY_PROXY_MEDIA_DIR` | `<dataDir>/gateway/media` | Directory where inbound request images are staged for agy (absolute paths handed to the engine via `--add-dir`). |
+| `AGY_PROXY_MEDIA_TTL_MS` | `86400000` (24h) | Staged image lifetime; a boot + hourly sweeper deletes expired files. `0` (or negative) disables sweeping entirely. |
 | `AGY_PROXY_WEB_DIST` | *(auto)* | Static WebUI directory override. Empty = auto-detect (`web/dist` beside the entry, `AGY_PROXY_WEB_DIST` env wins); absent → JSON-only mode, `/v1`+`/admin` behave exactly as without a UI. |
 
 Authorization headers and cookies are never written to logs (pino redaction + metadata-only
