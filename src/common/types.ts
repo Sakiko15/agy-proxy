@@ -88,6 +88,10 @@ export interface GatewayConfig {
   /** Static WebUI directory override. Empty = auto-detect (env
    *  AGY_PROXY_WEB_DIST, then the entry's sibling web/dist, then cwd). */
   webDist: string
+  /** M5 soak observability: >0 emits an NDJSON `{"debug":"metrics",…}` line
+   *  (rss, handle count, uptime) on stdout every N ms. 0 = off. The soak
+   *  harness parses these lines; no admin surface, no persistence. */
+  debugMetricsMs: number
 }
 
 // Fallback line-up, mined from the agy 1.1.13 binary (inherited from
@@ -128,6 +132,7 @@ export function defaultConfig(): GatewayConfig {
     logRetentionDays: 7,
     quotaPollIntervalMs: 15 * 60_000,
     disableTelemetry: true,
+    debugMetricsMs: 0,
     dataDir: '',
     port: 8080,
     host: '0.0.0.0',

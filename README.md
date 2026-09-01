@@ -136,6 +136,7 @@ Layering: `AGY_PROXY_*` environment variables > `~/.agy-proxy/gateway/runtime-ov
 | `AGY_PROXY_MEDIA_DIR` | `<dataDir>/gateway/media` | Directory where inbound request images are staged for agy (absolute paths handed to the engine via `--add-dir`). |
 | `AGY_PROXY_MEDIA_TTL_MS` | `86400000` (24h) | Staged image lifetime; a boot + hourly sweeper deletes expired files. `0` (or negative) disables sweeping entirely. |
 | `AGY_PROXY_WEB_DIST` | *(auto)* | Static WebUI directory override. Empty = auto-detect (`web/dist` beside the entry, `AGY_PROXY_WEB_DIST` env wins); absent → JSON-only mode, `/v1`+`/admin` behave exactly as without a UI. |
+| `AGY_PROXY_DEBUG_METRICS_MS` | `0` (off) | Soak-harness observability: emit an NDJSON `{"debug":"metrics", rss, handles, uptime}` line on stdout every N ms. No admin surface, no persistence. |
 
 Authorization headers and cookies are never written to logs (pino redaction + metadata-only
 log sites). To verify: send a request with a fake key, then grep the log output for the key.

@@ -172,6 +172,10 @@ export function resolveConfig(
     if (t && t >= 60_000) cfg.adminSessionTtlMs = t
   }
   if (env.AGY_PROXY_WEB_DIST) cfg.webDist = env.AGY_PROXY_WEB_DIST
+  if (env.AGY_PROXY_DEBUG_METRICS_MS) {
+    const d = asNum(env.AGY_PROXY_DEBUG_METRICS_MS)
+    if (d !== undefined && d >= 0) cfg.debugMetricsMs = d
+  }
   // Static API key: environment-only (never the overrides file) so a
   // plaintext key cannot rest on disk. An explicitly-set empty string
   // disables auth, distinct from leaving it unset.

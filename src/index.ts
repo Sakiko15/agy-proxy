@@ -81,6 +81,27 @@ export function compareVersions(a: string, b: string): number {
   return 0
 }
 
+/** NDJSON process-metrics ticker for the soak harness (M5): `{"debug":"metrics",
+ *  rss, handles, uptime}` on stdout every `intervalMs`; intervalMs <= 0 or NaN
+ *  keeps it off. The handle count uses the same read the doctor report uses. */
+export function startDebugMetrics(intervalMs: number): { stop: () => void } {
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) return { stop: () => {} }
+  const emit = (): void => {
+    const handles = (process as unknown as { _getActiveHandles?: () => unknown[] })._getActiveHandles?.().length ?? -1
+    process.stdout.write(
+      JSON.stringify({ debug: 'metrics', rss: process.memoryUsage().rss, handles, uptime: Math.round(process.uptime()) }) + '\n',
+    )
+  }
+  emit()
+  const timer = setInterval(emit, Math.max(250, intervalMs))
+  timer.unref()
+  return {
+    stop: () => {
+      clearInterval(timer)
+    },
+  }
+}
+
 async function main(): Promise<void> {
   const log = buildLogger()
   const report = await startup()
@@ -263,11 +284,17 @@ async function main(): Promise<void> {
     (m) => log.info({ src: 'media-sweeper' }, redactLine(m)),
   )
 
+  // Soak observability (M5): raw process metrics for the harness — one NDJSON
+  // line per tick on stdout, deliberately NOT through pino (the harness
+  // greps for the `"debug":"metrics"` marker). Off by default.
+  const metricsTimer = startDebugMetrics(getConfig().debugMetricsMs)
+
   installShutdown(built, {
     log,
     teardown: async () => {
       clearTimeout(bootRefresh)
       clearInterval(poller)
+      metricsTimer.stop()
       mediaSweeper.stop()
       bus.closeAll() // ends hijacked /admin/events streams — app.close() does not
       await poolAuth.cancel().catch(() => undefined)
