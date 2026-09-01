@@ -17,6 +17,7 @@ import type { GatewayConfig } from '../common/types.ts'
 import { redactLine } from '../host/diagnostics.ts'
 import { buildAuthHook, requestKey } from './auth.ts'
 import { registerAdminApi, type AdminDeps } from './admin-api.ts'
+import { registerStaticWeb, resolveWebDist } from './static.ts'
 import {
   GatewayHttpError,
   engineFailureToHttp,
@@ -203,7 +204,38 @@ export function buildServer(deps: ServerDeps): BuiltServer {
     }
   })
 
+  // M4 static WebUI: registered LAST (after every API literal route) and
+  // no-op when no built frontend exists — dev/tests stay exactly as in M3.
+  let webRoot: string | null = null
+  try {
+    webRoot = resolveWebDist(deps.getConfig())
+  } catch {
+    webRoot = null // a broken webDist override never takes the server down
+  }
+  registerStaticWeb(
+    app as unknown as Parameters<typeof registerStaticWeb>[0],
+    { webRoot, log: deps.log },
+  )
+
+  // Single not-found handler (Fastify allows exactly one): the M4 SPA
+  // fallback for dot-free GET non-API paths rides in front of the M2/M3
+  // protocol-shaped 404 bodies, which stay byte-identical.
   app.setNotFoundHandler((request, reply) => {
+    if (webRoot !== null) {
+      const url = request.url.split('?')[0] ?? request.url
+      if (
+        (request.method === 'GET' || request.method === 'HEAD') &&
+        !url.startsWith('/v1/') &&
+        !url.startsWith('/admin/') &&
+        url !== '/v1' &&
+        url !== '/admin' &&
+        url !== '/healthz' &&
+        !/\.[\w]+$/.test(url.split('/').pop() ?? '')
+      ) {
+        void reply.header('cache-control', 'no-store').type('text/html; charset=utf-8').sendFile('index.html')
+        return
+      }
+    }
     if (isAnthropicPath(request.url)) {
       void reply.code(404).send(anthropicError('not_found_error', 'Not found.'))
     } else {

@@ -170,6 +170,7 @@ agy-proxy 是自托管的 LLM 网关：把 Google Antigravity 官方 `agy` CLI �
 | API key 存储 | **sha256 哈希 + 前缀明文**（LiteLLM 模式） | — | 高熵 key 无需慢哈希；argon2 仅用于管理员登录密码 |
 | Admin 会话 | **DB opaque session（自研 ~50 行）** | — | Lucia 已弃用（2025-03）；httpOnly+SameSite=Lax cookie；jose JWT 备选 |
 | 日志 | **pino → stdout NDJSON** | ^10 | Fastify 原生；pino-pretty 仅 dev worker 传输；OTel 推迟（Logs SDK 仍 Development 状态） |
+| 静态 WebUI 托管 | **@fastify/static** | ^8 | M4 增补（用户定案）；`wildcard:false`（逐文件路由，不遮蔽 /v1、/admin、/healthz）+ 应用层 SPA fallback（保留协议形 404）；备选零依赖手写 handler（未采信——Range/MIME/缓存边角自担成本更高）。**§9 表格虚拟滚动在 M4 未引入**（usage 服务端分页 ≤500 行） |
 | 测试 | **vitest** | ^4.1 | 原生 TS/ESM；Fastify `inject()` 测路由 + 真监听 fetch/ReadableStream 测 SSE + fake-agy 桩测全链路（fake-agy 思路继承自 dsh-agy-link） |
 | i18n | **react-i18next，zh-CN 默认** | 17 / 26 | new-api 同款模式：首次访问语言探测 + 手动切换持久化 |
 | 容器 | **tini 作 PID 1 + Node 24 LTS** | — | zombie 回收 + 信号转发；agy 官方 install.sh 构建期安装 + 版本锁定 |

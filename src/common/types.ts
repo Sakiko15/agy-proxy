@@ -85,6 +85,9 @@ export interface GatewayConfig {
   dbPath: string
   /** Admin session lifetime in ms (default 7 days). */
   adminSessionTtlMs: number
+  /** Static WebUI directory override. Empty = auto-detect (env
+   *  AGY_PROXY_WEB_DIST, then the entry's sibling web/dist, then cwd). */
+  webDist: string
 }
 
 // Fallback line-up, mined from the agy 1.1.13 binary (inherited from
@@ -135,6 +138,7 @@ export function defaultConfig(): GatewayConfig {
     sseHeartbeatMs: 60_000,
     dbPath: '',
     adminSessionTtlMs: 7 * 86_400_000,
+    webDist: '',
   }
 }
 
