@@ -6,7 +6,8 @@
 // finishWithCode do not apply to a headless gateway (no desktop login);
 // defaultPoolDir re-roots to the gateway state dir; pool file shape and
 // scheduling untouched; M4 adds an additive onChange() mutation hook fired at
-// the end of persist() — no scheduling/persistence behavior change).
+// the end of persist() — no scheduling/persistence behavior change; M5 adds
+// clearAuthRequired() — the administrative inverse of markAuthRequired).
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { stateDir } from '../common/config.ts'
@@ -299,6 +300,23 @@ export class AccountPoolManager {
   }
 
   /**
+   * Administrative inverse of markAuthRequired (M5): a misplaced
+   * validation/quota quarantine must be recoverable — recordSuccess is the
+   * only other path out of isolation, but an isolated account is never
+   * selected, so it can never earn a success. Idempotent: an account not in
+   * isolation is left untouched. (The pre-existing delete-based clearAuth
+   * below is the same operation without the guard; this named wrapper is
+   * what the admin route wires.)
+   */
+  clearAuthRequired(id: string): void {
+    const acc = this.getAccount(id)
+    if (!acc) return
+    delete acc.authRequired
+    delete acc.authError
+    this.persist()
+  }
+
+  /**
    * External re-login detected (agy logout + new login): identity-bound
    * state from the PREVIOUS account (cooldowns, quotas, auth quarantine)
    * must not leak onto the new one. Resets everything email-bound while
@@ -310,14 +328,6 @@ export class AccountPoolManager {
     acc.email = newEmail
     acc.cooldowns = {}
     acc.quotas = {}
-    delete acc.authRequired
-    delete acc.authError
-    this.persist()
-  }
-
-  clearAuthRequired(id: string): void {
-    const acc = this.getAccount(id)
-    if (!acc) return
     delete acc.authRequired
     delete acc.authError
     this.persist()

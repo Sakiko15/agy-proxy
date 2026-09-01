@@ -308,6 +308,20 @@ export function registerAdminApi(app: AdminInstance, deps: AdminDeps): void {
     return reply
   })
 
+  // M5: undo an auth/VALIDATION_REQUIRED quarantine once the account actually
+  // re-logged (or the quarantine was a misfire) — without this, isolation is
+  // one-way: recordSuccess can never reach an unselectable account.
+  app.post('/admin/pool/accounts/:id/clear-auth', guarded({ mutating: true }), async (request, reply) => {
+    const { id } = request.params as { id: string }
+    if (deps.pool.getAccount(id) === undefined) {
+      await reply.code(404).send({ ok: false, error: 'unknown account id' })
+      return reply
+    }
+    deps.pool.clearAuthRequired(id)
+    await reply.code(200).send({ ok: true, pool: deps.pool.getPoolData() })
+    return reply
+  })
+
   app.post('/admin/pool/accounts/:id/refresh-quota', guarded({ mutating: true }), async (request, reply) => {
     const { id } = request.params as { id: string }
     const account = deps.pool.getAccount(id)
@@ -376,12 +390,16 @@ export function registerAdminApi(app: AdminInstance, deps: AdminDeps): void {
 
   app.patch('/admin/keys/:id', guarded({ mutating: true }), async (request, reply) => {
     const { id } = request.params as { id: string }
-    const body = (request.body ?? {}) as { name?: unknown; disabled?: unknown; dailyTokenLimit?: unknown; rpmLimit?: unknown }
+    const body = (request.body ?? {}) as { name?: unknown; disabled?: unknown; dailyTokenLimit?: unknown; rpmLimit?: unknown; scopes?: unknown }
     const updated = deps.keys.update(id, {
       ...(typeof body.name === 'string' && body.name !== '' ? { name: body.name } : {}),
       ...(typeof body.disabled === 'boolean' ? { disabled: body.disabled } : {}),
       ...(typeof body.dailyTokenLimit === 'number' && Number.isFinite(body.dailyTokenLimit) ? { dailyTokenLimit: body.dailyTokenLimit } : {}),
       ...(typeof body.rpmLimit === 'number' && Number.isFinite(body.rpmLimit) ? { rpmLimit: body.rpmLimit } : {}),
+      // M5 scopes: string sets the model whitelist ('' clears it → NULL),
+      // explicit null also clears; absent/other types leave it untouched.
+      ...(typeof body.scopes === 'string' ? { scopes: body.scopes } : {}),
+      ...(body.scopes === null ? { scopes: null } : {}),
     })
     if (updated === undefined) {
       await reply.code(404).send({ ok: false, error: 'not found' })
