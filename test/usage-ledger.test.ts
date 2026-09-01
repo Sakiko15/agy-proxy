@@ -72,6 +72,26 @@ describe('buffer + flush', () => {
     await new Promise((r) => setTimeout(r, 20))
     expect(ledger.pending).toBeLessThanOrEqual(1)
   })
+
+  it('errorText lands in its column, truncated to 500 chars (schema v2)', async () => {
+    const { ledger, db } = mkLedger()
+    const long = 'x'.repeat(600)
+    ledger.record(rec('err-1', { status: 'PROCESS_EXIT', errorText: long }))
+    ledger.record(rec('ok-1'))
+    await ledger.flush()
+    const rows = db
+      .prepare('SELECT request_id, error_text, LENGTH(error_text) AS n FROM usage ORDER BY request_id')
+      .all() as Array<{ request_id: string; error_text: string | null; n: number | null }>
+    const fail = rows.find((r) => r.request_id === 'err-1')
+    const ok = rows.find((r) => r.request_id === 'ok-1')
+    expect(fail?.error_text).toBe(long.slice(0, 500))
+    expect(fail?.n).toBe(500)
+    expect(ok?.error_text ?? null).toBe(null)
+    // the query projection carries it for GET /admin/usage rows
+    const q = ledger.query({}).rows.find((r) => r.requestId === 'err-1')
+    expect(q?.errorText).toBe(long.slice(0, 500))
+    checkpointAndClose(db)
+  })
 })
 
 describe('request-id idempotency (DoD ⑥)', () => {

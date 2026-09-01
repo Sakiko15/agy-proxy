@@ -188,6 +188,9 @@ async function main(): Promise<void> {
         ...(i.usage?.cacheReadTokens !== undefined ? { cacheReadTokens: i.usage.cacheReadTokens } : {}),
         status: i.code,
         durationMs: i.durationMs,
+        // terminal failure text for the audit column (schema v2, truncated at
+        // 500 by the ledger)
+        ...(i.failureMessage !== undefined && i.failureMessage !== '' ? { errorText: i.failureMessage } : {}),
       })
       // The SSE event mirrors the ledger row (same source hook) so the
       // dashboard can never disagree with the audited accounting.

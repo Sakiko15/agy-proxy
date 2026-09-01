@@ -10,7 +10,7 @@ import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import Database from 'better-sqlite3'
 
-export const SCHEMA_VERSION = 1
+export const SCHEMA_VERSION = 2
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -45,6 +45,10 @@ CREATE TABLE IF NOT EXISTS usage (
   duration_ms       INTEGER,
   created_at        INTEGER NOT NULL
 );
+-- v2 (M5): terminal failure text for the audit trail. The column is attached
+-- by the guarded migration below (PRAGMA table_info) so a v1 database is
+-- upgraded in place; fresh databases get it from the DDL only via the same
+-- guard (SQLite has no ADD COLUMN IF NOT EXISTS).
 CREATE INDEX IF NOT EXISTS idx_usage_key_time ON usage(key_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_usage_time     ON usage(created_at);
 
@@ -70,9 +74,20 @@ export function openDb(path: string): Database.Database {
   const version = db.pragma('user_version', { simple: true }) as number
   if (version < SCHEMA_VERSION) {
     db.exec(DDL)
+    migrateUsageErrorText(db)
     db.pragma(`user_version = ${SCHEMA_VERSION}`)
   }
   return db
+}
+
+/** v2 migration: attach usage.error_text when the column is missing — guarded
+ *  by PRAGMA table_info so v1 databases upgrade in place, fresh ones no-op,
+ *  and a second restart never re-runs the ALTER (SQLite has no
+ *  ADD COLUMN IF NOT EXISTS). */
+function migrateUsageErrorText(db: Database.Database): void {
+  const cols = db.prepare('PRAGMA table_info(usage)').all() as Array<{ name: string }>
+  if (cols.some((c) => c.name === 'error_text')) return
+  db.exec('ALTER TABLE usage ADD COLUMN error_text TEXT')
 }
 
 /** Flush the WAL back into the main file and close cleanly (shutdown path). */

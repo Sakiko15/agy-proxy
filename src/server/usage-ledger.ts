@@ -41,6 +41,10 @@ export interface UsageRecord {
   /** 'OK' or an Err code / 'ABORTED'. */
   status: string
   durationMs?: number
+  /** Terminal failure text (schema v2 error_text) — stored truncated to 500
+   *  chars for the audit trail. DB scrubbing targets key/token material, not
+   *  failure prose; a validation_url is feature data, not a secret. */
+  errorText?: string
 }
 
 export interface UsageRow extends UsageRecord {
@@ -74,6 +78,7 @@ interface InsertParams {
   totalTokens: number
   status: string
   durationMs: number | null
+  errorText: string | null
   createdAt: number
 }
 
@@ -90,6 +95,8 @@ export class UsageLedger {
   private warnedClosed = false
   /** Timestamp of the last flush-failure warning (throttle state). */
   private lastWarnAt = 0
+  /** Row cap for stored failure text (schema v2 error_text). */
+  private static readonly ERROR_TEXT_MAX = 500
 
   constructor(
     private readonly db: BetterSqlite3.Database,
@@ -108,10 +115,10 @@ export class UsageLedger {
       INSERT OR IGNORE INTO usage
         (request_id, key_id, account_id, model, family, protocol,
          prompt_tokens, completion_tokens, reasoning_tokens, cache_read_tokens,
-         total_tokens, status, duration_ms, created_at)
+         total_tokens, status, duration_ms, error_text, created_at)
       VALUES (@requestId, @keyId, @accountId, @model, @family, @protocol,
          @promptTokens, @completionTokens, @reasoningTokens, @cacheReadTokens,
-         @totalTokens, @status, @durationMs, @createdAt)
+         @totalTokens, @status, @durationMs, @errorText, @createdAt)
     `)
     this.armTimer()
   }
@@ -141,6 +148,10 @@ export class UsageLedger {
       totalTokens: (rec.promptTokens || 0) + (rec.completionTokens || 0),
       status: rec.status,
       durationMs: rec.durationMs ?? null,
+      errorText:
+        rec.errorText !== undefined && rec.errorText !== ''
+          ? rec.errorText.slice(0, UsageLedger.ERROR_TEXT_MAX)
+          : null,
       createdAt: 0, // stamped at flush time
     })
     if (this.buffer.length >= 500) void this.flush()
@@ -301,6 +312,7 @@ interface RawUsageDbRow {
   total_tokens: number
   status: string
   duration_ms: number | null
+  error_text: string | null
   created_at: number
 }
 
@@ -320,6 +332,7 @@ function fromDbRow(r: RawUsageDbRow): UsageRow {
     totalTokens: r.total_tokens,
     status: r.status,
     durationMs: r.duration_ms ?? undefined,
+    errorText: r.error_text ?? undefined,
     createdAt: r.created_at,
   }
 }
