@@ -28,6 +28,9 @@
   "engines": {
     "node": ">=24.0.0"
   },
+  "allowScripts": {
+    "better-sqlite3": true
+  },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^24.13.3",

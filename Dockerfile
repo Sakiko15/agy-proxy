@@ -15,8 +15,12 @@ RUN npm ci
 COPY tsconfig.json tsdown.config.ts ./
 COPY src/ ./src/
 # tsdown only (host bundle); the WebUI builds in the web stage below.
-# Prune dev deps so the runtime stage reuses this node_modules verbatim.
-RUN npx tsdown && npm prune --omit=dev
+# Prune dev deps so the runtime stage reuses this node_modules verbatim,
+# then prove the native binding actually loads (npm >= 11.6 skips
+# install scripts unless the package is allowlisted — fail the build,
+# not the VPS runtime, if it is missing).
+RUN npx tsdown && npm prune --omit=dev \
+    && node -e "require('better-sqlite3')(':memory:'); console.log('better-sqlite3 binding OK')"
 
 # ---- stage 1: build the WebUI (web/dist for the static hosting in dist/) ----
 FROM node:24-slim AS web
@@ -48,7 +52,7 @@ COPY package.json ./
 # prod node_modules come verbatim from the build stage (dev deps pruned there)
 COPY --from=build /app/node_modules ./node_modules
 
-COPY --from=build dist/ ./dist/
+COPY --from=build /app/dist/ ./dist/
 COPY --from=web /web/dist/ ./web/dist/
 
 # All mutable state lives under /data (pool, sessions, accounts, media, sqlite).

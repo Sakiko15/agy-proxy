@@ -370,7 +370,14 @@ unchanged — agy still runs its own tool loop; the gateway remains a mirror.
 - **Self-contained image build** (`Dockerfile`): a new `build` stage compiles
   the gateway bundle (tsdown) inside the image, so `docker build .` no longer
   requires a prebuilt `dist/` on the build host — Node 24 + `npm run build`
-  locally are no longer prerequisites.
+  locally are no longer prerequisites. The build stage installs the native
+  toolchain (python3/make/g++ — node:24-slim ships none, and the
+  better-sqlite3 prebuild download misses on this target, forcing a source
+  build), `COPY --from=build` uses absolute paths (relative sources resolved
+  against the stage root, not its WORKDIR), `allowScripts` in package.json
+  keeps better-sqlite3's install script running under the npm ≥ 11.6
+  install-scripts gate, and a post-prune `require('better-sqlite3')` gate
+  fails the build instead of the VPS runtime if the binding is missing.
 - **compose default image** (`docker-compose.yml`): `image` now defaults to
   `ghcr.io/sakiko15/agy-proxy:0.2.0` (still overridable via `AGY_PROXY_IMAGE`
   in `.env`), and the file is trimmed to the 23-line core config — the tutorial
