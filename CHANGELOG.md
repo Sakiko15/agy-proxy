@@ -90,7 +90,10 @@ perf 8/8 legs).
   constructor and touches are debounced to one write per key per 60s window, with
   skipped refreshes buffered (latest wins) and landed by `flushTouch()` at teardown
   (wired in src/index.ts ahead of `ledger.close()`). `last_used_at` is admin-UI
-  display data — zero wire impact.
+  display data — zero wire impact. (Test hardening: on fast CI runners the two
+  touches in the debounce test landed inside one wall-clock millisecond, making
+  the flush-differs assertion flake red — the test now pins the second touch's
+  clock to first + 1s, still inside the window; product code untouched.)
 - **UsageLedger `tokensUsedToday` prepared once** (`src/server/usage-ledger.ts`): it
   rides every authenticated request (daily budget check) — same prepare-once pattern.
 - **runtime-overrides.json read memoized on mtime+size** (`src/common/config.ts`, B-M3):

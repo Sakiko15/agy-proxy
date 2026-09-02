@@ -121,7 +121,17 @@ describe('KeyStore touch debounce (B-M2)', () => {
     expect(first).not.toBeNull()
 
     // A repeat inside the 60s window must NOT fire the autocommit UPDATE.
-    store.touch(a.id) // a few ms later — same window
+    // Fast CI runners land the two touches inside one wall-clock millisecond,
+    // which would buffer the SAME timestamp the first touch wrote and turn
+    // the flush assertion below into a coin flip — pin the second touch 1s
+    // later (still inside the window, so the debounce branch is exercised).
+    const realNow = Date.now
+    Date.now = () => (first ?? 0) + 1000
+    try {
+      store.touch(a.id) // debounced → pending
+    } finally {
+      Date.now = realNow
+    }
     expect(store.get(a.id)?.lastUsedAt).toBe(first)
 
     // The skipped refresh still lands at flushTouch (teardown contract) with
