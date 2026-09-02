@@ -2,6 +2,71 @@
 
 All notable changes to agy-proxy are documented here. Format based on Keep a Changelog; versions follow semver.
 
+## [Unreleased] (协议格式补齐)
+
+Protocol-surface audit (OpenAI Chat Completions + Anthropic Messages) against the current
+official specs: seven quick wins, four behavioral fixes, docs synced. Architecture
+unchanged — agy still runs its own tool loop; the gateway remains a mirror.
+
+### Added
+- **Streaming `stop_sequences` enforced on both legs** (src/server/stream-guards.ts, new
+  `StopHoldback`): the SSE layer withholds any text tail that could still be the prefix
+  of one of the stop sequences and cuts at the first full hit — across delta boundaries,
+  text stream only (reasoning deltas never cut). OpenAI answers `finish_reason:'stop'`;
+  Anthropic answers `stop_reason:'stop_sequence'` with the matched sequence echoed in
+  `stop_sequence` (previously always `null` in streams). A stop hit never overrides a
+  `tool-calls` terminal — the tool_use block already streamed and the client must keep
+  its loop. Held tails flush before the terminal events so no generated text is lost.
+  Earliest match wins; exact ties keep the client's first-listed stop.
+- **Streaming `max_tokens` enforced on both legs** (`OutputBudget`): output estimate
+  accumulates via the same `estimateTokens` heuristic as count_tokens (text + reasoning
+  deltas + tool-call arguments, delta granularity — no tokenizer), and reaching the cap
+  aborts the agy process mid-generation instead of letting it run on. OpenAI answers
+  `finish_reason:'length'`, Anthropic `stop_reason:'max_tokens'` (previously never
+  surfaced on streaming). Budget accounting reads the RAW generated text, so held-back
+  stop-prefix tails count too.
+- **Anthropic trailing tool_result data preservation**: the trailing user turn collapsed
+  into one tool message per-block overwrite — with multiple `tool_result` blocks only the
+  LAST survived and sibling text blocks vanished silently. Now: texts merge with
+  `'\n\n'`, the continuation cursor takes the largest `parseMirrorCallId` eventIndex
+  (furthest replay point), and sibling text blocks ride along under a
+  `[user context] ` prefix (the engine's continuation keys on the last message being
+  role:'tool' and replays without a prompt, so the merged tool message is the only path
+  where that data survives). Foreign ids still 400, including when mixed with valid ones.
+- **`message_start.usage.input_tokens` heuristic estimate** (was hardcoded 0): the
+  Anthropic streaming opener now carries `estimateInputTokens` (messages + system + tool
+  definitions + tool_result contents), keeping cost-tracking clients from recording
+  zero-prompt turns; real engine usage still lands in the final `message_delta`.
+  Three anthropic streaming goldens re-pinned (an2/an3/an5).
+
+### Fixed
+- `response_format {"type":"text"}` — a spec-legal value — was rejected 400; now a
+  no-op. Only genuinely unknown types are rejected.
+- `stream_options.include_usage` intermediate chunks now carry `"usage": null` (OpenAI
+  spec: the key is present-but-null until the terminal frame); goldens oa2/oa3 re-pinned.
+- Silently dropped parameters now warn: OpenAI `IGNORED_PARAMS` gains
+  `logit_bias/verbosity/modalities/prediction/top_k`; the `json_object` warning no longer
+  claims a gateway-side parse check that never existed (prompt instruction only).
+- Anthropic leg warning parity: `tool_choice/betas/mcp_servers/service_tier/output_format`
+  were silently ignored; each now warns like the OpenAI leg does.
+- `count_tokens` undercounted: tool definitions (JSON-serialized, per element) and
+  `tool_result` contents (string or text-block array) now count toward the estimate;
+  images stay flat 1000.
+- Error bodies aligned with the official shapes: OpenAI errors carry `param: null`
+  (goldens oa8a/oa8b/oa8c/oa9/ma3 re-pinned); Anthropic errors carry a top-level
+  `request_id` (the gateway request id) on every path — shared handler, auth hook, quota
+  rejections, disabled-gateway 503, 404/415/400/500 fallbacks, and in-golden 401/429/400
+  bodies (an8a/an8b/an8c re-pinned).
+- Whitespace-only `model` strings (`' '`) no longer silently fall back to the default
+  model on the Anthropic leg — both legs answer 400 `model must be a non-empty string`.
+
+### Docs
+- charter §4.2/§4.3/§4.4 + README "Request surface notes" synced: streaming
+  stop/max_tokens semantics, `[user context] ` merge rule, `prompt_tokens` = uncached
+  input (client conversion hint: add `cached_tokens`), `message_start` estimate,
+  `reasoning_content` non-standard / no `content_filter`/`refusal`/`pause_turn`,
+  `n>1` + document/citations/search_result → 400, corrected json_object wording.
+
 ## [Unreleased] (M5 加固发布)
 
 ### Added

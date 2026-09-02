@@ -14,6 +14,8 @@ import { RunRegistry } from '../src/host/recording.ts'
 import { buildServer } from '../src/server/app.ts'
 import { buildLogger } from '../src/server/logger.ts'
 import { GatewaySemaphore } from '../src/server/semaphore.ts'
+import { openAiStreamFrames } from '../src/server/openai-adapter.ts'
+import type { StreamChunk } from '../src/host/stream-types.ts'
 
 const fakeBin = process.execPath
 const fakeScript = join(import.meta.dirname, 'fake-agy.mjs')
@@ -149,6 +151,44 @@ describe('OA2: streaming basics', () => {
     const usageIdx = jsons.indexOf(usageFrame as Record<string, unknown>)
     expect(usageIdx).toBeGreaterThan(finishIdx)
     await built.app.close()
+  })
+
+  it('include_usage: every intermediate chunk carries "usage": null (OpenAI spec)', () => {
+    const state = { firstSent: false, toolIndex: 0, sawToolThisSpan: false }
+    const chunks: StreamChunk[] = [
+      { type: 'text-delta', index: 0, text: 'hi' },
+      { type: 'usage', usage: { inputTokens: 2, outputTokens: 3 } },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ]
+    const frames: Array<Record<string, unknown> | string> = []
+    // Usage tracking mirrors the route (app.ts): the usage chunk feeds the
+    // generator's `usage` arg on subsequent calls.
+    let lastUsage: { inputTokens: number; outputTokens: number } | undefined
+    for (const ch of chunks) {
+      if (ch.type === 'usage') lastUsage = ch.usage
+      for (const f of openAiStreamFrames({ id: 'i', created: 0, model: 'm', chunk: ch, state, includeUsage: true, usage: lastUsage })) {
+        frames.push(f as unknown as Record<string, unknown>)
+      }
+    }
+    const jsons = frames.filter((f): f is Record<string, unknown> => typeof f === 'object')
+    // All non-final chunks (role, content, finish_reason) carry usage:null.
+    const withChoices = jsons.filter((p) => Array.isArray(p.choices) && (p.choices as unknown[]).length > 0)
+    expect(withChoices.length).toBeGreaterThanOrEqual(3)
+    for (const p of withChoices) expect(p.usage).toBeNull()
+    // The terminal usage chunk keeps the counts.
+    const usageFrame = jsons.find((p) => Array.isArray(p.choices) && (p.choices as unknown[]).length === 0)
+    expect((usageFrame?.usage as { completion_tokens: number }).completion_tokens).toBe(3)
+  })
+
+  it('include_usage off: intermediate chunks carry no usage key at all', () => {
+    const state = { firstSent: false, toolIndex: 0, sawToolThisSpan: false }
+    const frames: Array<Record<string, unknown> | string> = []
+    for (const f of openAiStreamFrames({ id: 'i', created: 0, model: 'm', chunk: { type: 'text-delta', index: 0, text: 'hi' }, state, includeUsage: false })) {
+      frames.push(f as unknown as Record<string, unknown>)
+    }
+    for (const f of frames) {
+      if (typeof f === 'object') expect('usage' in f).toBe(false)
+    }
   })
 })
 

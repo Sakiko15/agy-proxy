@@ -4,6 +4,7 @@
   "error": {
     "message": "model 'no-such-model' was not found",
     "type": "invalid_request_error",
-    "code": "model_not_found"
+    "code": "model_not_found",
+    "param": null
   }
 }

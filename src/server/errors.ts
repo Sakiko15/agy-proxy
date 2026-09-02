@@ -9,11 +9,13 @@ export interface OpenAiErrorBody {
     message: string
     type: string
     code: string
+    /** Official error-object anatomy; we never attribute a param, so null. */
+    param: string | null
   }
 }
 
 export function openAiError(message: string, type: string, code: string): OpenAiErrorBody {
-  return { error: { message, type, code } }
+  return { error: { message, type, code, param: null } }
 }
 
 export class GatewayHttpError extends Error {
@@ -82,10 +84,22 @@ export interface AnthropicErrorBody {
     type: string
     message: string
   }
+  /** Top-level echo of the gateway's own request id (official API shape). */
+  request_id?: string
 }
 
-export function anthropicError(type: string, message: string): AnthropicErrorBody {
-  return { type: 'error', error: { type, message } }
+export function anthropicError(type: string, message: string, requestId?: string): AnthropicErrorBody {
+  return { type: 'error', error: { type, message }, ...(requestId !== undefined ? { request_id: requestId } : {}) }
+}
+
+/**
+ * Attach the gateway request id to a body on its way out of the shared error
+ * handler. Anthropic bodies get the top-level `request_id`; OpenAI bodies are
+ * returned untouched (their anatomy has no such field).
+ */
+export function stampRequestId(body: OpenAiErrorBody | AnthropicErrorBody, requestId: string): OpenAiErrorBody | AnthropicErrorBody {
+  // 'type' exists only on the Anthropic body shape.
+  return 'type' in body ? { ...body, request_id: requestId } : body
 }
 
 /** Requests under the Anthropic protocol paths get Anthropic error bodies. */
@@ -146,9 +160,9 @@ export function engineFailureToAnthropic(
  * the Anthropic error shape ({type:'error',error:{...}}), OpenAI paths keep
  * {error:{...}}. Same status/type rows as anthropicStatusFor for AUTH.
  */
-export function authErrorFor(url: string, message: string): GatewayHttpError {
+export function authErrorFor(url: string, message: string, requestId?: string): GatewayHttpError {
   if (isAnthropicPath(url)) {
-    return new GatewayHttpError(401, anthropicError('authentication_error', message))
+    return new GatewayHttpError(401, anthropicError('authentication_error', message, requestId))
   }
   return httpError(401, message, 'authentication_error', 'invalid_api_key')
 }
@@ -159,10 +173,10 @@ export function authErrorFor(url: string, message: string): GatewayHttpError {
  * per-protocol branching as auth errors. The message must name the quota
  * type (RPM limit / daily_token_limit) and the reset time (MA5).
  */
-export function quotaRejectFor(url: string, message: string, retryAfterSec: number): GatewayHttpError {
+export function quotaRejectFor(url: string, message: string, retryAfterSec: number, requestId?: string): GatewayHttpError {
   const headers = { 'retry-after': String(Math.max(1, Math.round(retryAfterSec))) }
   if (isAnthropicPath(url)) {
-    return new GatewayHttpError(429, anthropicError('rate_limit_error', message), headers)
+    return new GatewayHttpError(429, anthropicError('rate_limit_error', message, requestId), headers)
   }
   return new GatewayHttpError(429, openAiError(message, 'rate_limit_error', 'rate_limit_exceeded'), headers)
 }

@@ -4,6 +4,7 @@
   "error": {
     "message": "the legacy functions API is not supported — use tools",
     "type": "invalid_request_error",
-    "code": "invalid_request"
+    "code": "invalid_request",
+    "param": null
   }
 }

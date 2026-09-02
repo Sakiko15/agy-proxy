@@ -74,14 +74,14 @@ agy-proxy 是自托管的 LLM 网关：把 Google Antigravity 官方 `agy` CLI �
 | OpenAI | Anthropic | agy | 说明 |
 |---|---|---|---|
 | model | model | `--model` | 统一别名表；Gemini `-low/-medium/-high` effort 后缀折叠（复用 foldEfforts） |
-| max_completion_tokens | max_tokens | 无直接对应 | 用于截断防护与记账；OpenAI 旧 `max_tokens` 接受但按弃用处理 |
+| max_completion_tokens | max_tokens | 无直接对应 | 用于截断防护与记账；OpenAI 旧 `max_tokens` 接受但按弃用处理。**流式**：按 estimateTokens 启发式累计输出（text + reasoning + 工具参数，无 tokenizer，粒度为单个 delta），达上限即 abort agy 并终结——OpenAI `finish_reason:'length'` / Anthropic `stop_reason:'max_tokens'`；**非流式**：比例截断（现状） |
 | reasoning_effort: none/minimal/low/medium/high/xhigh/max | thinking: {type:enabled(budget_tokens)/adaptive/disabled} | `--effort low/medium/high`（仅 Gemini） | 映射：none→不传 effort；minimal/low→low；medium→medium；high/xhigh/max→high；Anthropic enabled(budget) 按预算分档到 low/medium/high；adaptive→模型默认。**M2 budget 档位边界：budget_tokens ≤4096→low / ≤16384→medium / >16384→high** |
 | temperature / top_p / top_k | （三者均已弃用，4.6+ 仅接受近似值） | 忽略 | 接受不报错；差异在文档注明 |
-| stop / stop_sequences | stop_sequences | 不支持 | agy 无对应；v1 记日志并后处理截断，finish_reason/stop_reason 如实返回（文档标注"尽力"） |
-| response_format json_object | — | 无 | 系统提示注入 + 网关侧 JSON 校验，文档标注非硬保证 |
+| stop / stop_sequences | stop_sequences | 不支持 | agy 无对应；两腿均网关侧后处理（"尽力"，字符串粒度）：**流式** SSE 层 holdback 缓冲——可能是任一 stop 前缀的文本尾巴扣留，命中即截断终结（只作用 text 流，reasoning 不截）；OpenAI `finish_reason:'stop'`，Anthropic `stop_reason:'stop_sequence'` + `stop_sequence` 回显；**非流式**最先命中截断 |
+| response_format json_object | — | 无 | 系统提示注入（prompt instruction only——无网关侧 parse check，输出合法性非硬保证，warning 如实描述） |
 | response_format json_schema{name,description,schema,strict} | output_config.format{type:'json_schema',schema} | `--json-schema`（原生） | 三方直接映射；解析结果取 result 事件的 `structured_output`；strict 仅透传语义 |
-| tools + tool_choice | tools(input_schema) + tool_choice | agy 自有工具循环 | **受控工具执行（已确认）**：agy 工具循环开启；权限模式默认 `plan`；workspace 限定网关专用目录；agy 工具活动经移植的镜像机制切成 tool-call 块，两侧分别呈现为 OpenAI tool_calls（delta.tool_calls）往返 / Anthropic tool_use（content_block + tool_result）往返；`--dangerously-skip-permissions` 默认关闭，设置页显式开启并双重警示（§10）。**M2 决策：客户端 tools 定义接受但不执行**（不转发 agy、不注入 prompt，仅 warning），仅 agy 自有工具镜像为往返 |
-| image_url（detail 忽略）| image(base64) | 文件 staging + `--add-dir` | 复用 media.ts staging。**M2 仅支持 `data:`/base64**，http(s) URL → 400 明确报错；SSRF 安全 fetch 列为 M5 候选 |
+| tools + tool_choice | tools(input_schema) + tool_choice | agy 自有工具循环 | **受控工具执行（已确认）**：agy 工具循环开启；权限模式默认 `plan`；workspace 限定网关专用目录；agy 工具活动经移植的镜像机制切成 tool-call 块，两侧分别呈现为 OpenAI tool_calls（delta.tool_calls）往返 / Anthropic tool_use（content_block + tool_result）往返；`--dangerously-skip-permissions` 默认关闭，设置页显式开启并双重警示（§10）。**M2 决策：客户端 tools 定义接受但不执行**（不转发 agy、不注入 prompt，仅 warning），仅 agy 自有工具镜像为往返。**Anthropic 收尾 tool_result 保全**：末条 user 消息内多条 tool_result 文本 `'\n\n'` 合并、游标取 eventIndex 最大者、兄弟 text 块以 `[user context] ` 前缀并入 tool 消息（agy 已自执行工具，客户端结果仅为镜像续播的建议数据；engine 续播只看最后一条 role:'tool' 消息，并入是数据唯一存活路径） |
+| image_url（detail 忽略）| image(base64) | 文件 staging + `--add-dir` | 复用 media.ts staging。**M2 仅支持 `data:`/base64**，http(s) URL → 400 明确报错；SSRF 安全 fetch 列为 M5 候选。document(PDF)/citations/search_result 块 → 400（上游能力 + v2 候选） |
 | input_audio / audio 输出 | — | — | 不支持 → 400 明确报错 |
 | stream_options.include_usage | usage 内建 | usage 事件 | OpenAI 端默认每块 usage:null，末块带 usage |
 | metadata / safety_identifier / user | metadata.user_id | — | 仅入日志，不上游 |
@@ -91,13 +91,14 @@ agy-proxy 是自托管的 LLM 网关：把 Google Antigravity 官方 `agy` CLI �
 
 | 内部 StreamChunk | OpenAI chunk | Anthropic 事件 |
 |---|---|---|
-| （流开始） | 首块 delta{role:'assistant',content:''} | message_start（usage.input_tokens 初值 0） |
+| （流开始） | 首块 delta{role:'assistant',content:''} | message_start（usage.input_tokens = estimateInputTokens 启发式估值：messages + system + tools 定义 + tool_result 内文，非精确——count_tokens 同源） |
 | reasoning-delta | delta.reasoning_content（业界惯例字段，官方文档无——实现并在文档注明） | content_block_start(thinking) + content_block_delta(thinking_delta) + signature_delta（signature 原样透传） |
 | text-delta | delta.content | content_block_start(text) + content_block_delta(text_delta) |
 | tool-call 块 | delta.tool_calls[{index,id,function{name,arguments}}] | content_block_start(tool_use,id,name) + content_block_delta(input_json_delta) |
 | usage | 末块 choices:[] + usage{prompt_tokens,completion_tokens,total_tokens,prompt_tokens_details.cached_tokens,completion_tokens_details.reasoning_tokens} | message_delta usage.output_tokens（累计）+ usage.output_tokens_details.thinking_tokens |
 | finish: stop | finish_reason='stop' + [DONE]（惯例哨兵，官方文档已不再列出——照常实现） | message_delta(stop_reason='end_turn') + message_stop |
 | finish: tool-calls | finish_reason='tool_calls' + [DONE] | message_delta(stop_reason='tool_use') + message_stop |
+| 流式 stop 命中 / max_tokens 达标（网关侧） | finish_reason='stop'（stop 命中）/ 'length'（预算截断） | message_delta(stop_reason='stop_sequence' + stop_sequence 回显 / 'max_tokens')；stop 命中不覆盖 tool-calls 终止（tool_use 块已发出，客户端须继续循环） |
 | finish: error/aborted | SSE 内 error 负载或按惯例终止 | error 事件 {type:'error',error:{type,message}} |
 
 **usage 映射**（agy → 两端）：`input_tokens`→prompt/input；`output_tokens`→completion/output（含 thinking）；`thinking_tokens`→OpenAI `reasoning_tokens` / Anthropic `output_tokens_details.thinking_tokens`；`cache_read_tokens`→OpenAI `prompt_tokens_details.cached_tokens` / Anthropic `cache_read_input_tokens`。无 cache 写入分解（两端对应字段置 0 或省略）。
@@ -108,7 +109,7 @@ agy-proxy 是自托管的 LLM 网关：把 Google Antigravity 官方 `agy` CLI �
 
 ### 4.4 错误模型
 
-- OpenAI 错误体 `{error:{message,type,code}}`；Anthropic 错误体 `{type:'error',error:{type,message}}`（invalid_request_error/authentication_error/permission_error/not_found_error/rate_limit_error/api_error/overloaded_error）
+- OpenAI 错误体 `{error:{message,type,code,param:null}}`（官方错误对象含 param，恒 null）；Anthropic 错误体 `{type:'error',error:{type,message},request_id}`（顶层 request_id = 网关请求 id；invalid_request_error/authentication_error/permission_error/not_found_error/rate_limit_error/api_error/overloaded_error）
 - EngineError 码 → HTTP 映射：AUTH→401、UNKNOWN_MODEL/BUSY/AUX→4xx、TIMEOUT/PROCESS_EXIT/INVALID_OUTPUT/AGY_ERROR→502、限流→429
 - agy 真实错误文本永远透传（继承 dsh-agy-link v0.4.21 经验：非 0 退出时优先取 result.error / stderr 尾部，而非笼统的 "exited with code 1"）；403 VALIDATION_REQUIRED 的 validation_url 必须出现在 message 中
 - 硬限流（429 / "Individual quota reached" / "quota exceeded"）→ 账号冷却 + 自动切换（复用现有窄判定正则；agy 观测到的实际文本形式与该正则匹配，无需改动）；软限流（"model overloaded"）只透传不改账号状态

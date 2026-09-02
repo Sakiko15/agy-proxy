@@ -60,7 +60,7 @@ describe('server skeleton', () => {
     const { built } = makeServer()
     const res = await built.app.inject({ method: 'GET', url: '/nope' })
     expect(res.statusCode).toBe(404)
-    expect(res.json()).toEqual({ error: { message: 'Not found.', type: 'invalid_request_error', code: 'not_found' } })
+    expect(res.json()).toEqual({ error: { message: 'Not found.', type: 'invalid_request_error', code: 'not_found', param: null } })
     await built.app.close()
     delete process.env.AGY_PROXY_WEB_DIST
   })
@@ -117,7 +117,7 @@ describe('server skeleton', () => {
     const { built } = makeServer({}, failing)
     const res = await built.app.inject(REQ)
     expect(res.statusCode).toBe(418)
-    expect(res.json()).toEqual({ error: { message: 'teapot', type: 'api_error', code: 'teapot' } })
+    expect(res.json()).toEqual({ error: { message: 'teapot', type: 'api_error', code: 'teapot', param: null } })
     await built.app.close()
 
     const unknown: AgyEngine = stubEngine({
@@ -152,6 +152,197 @@ describe('server skeleton', () => {
     const { built } = makeServer({ enabled: false })
     const res = await built.app.inject(REQ)
     expect(res.statusCode).toBe(503)
+    await built.app.close()
+  })
+})
+
+// ---- T2: streaming stop-sequence holdback + output budget ------------------
+// The SSE legs share StopHoldback/OutputBudget (stream-guards.ts); these
+// tests drive both routes with a stub engine so delta boundaries are exact.
+
+/** Split an SSE wire body into {event, data} frames (comments excluded). */
+function sseEvents(body: string): Array<{ event: string; data: Record<string, unknown> }> {
+  return body
+    .split('\n\n')
+    .map((b) => b.trim())
+    .filter((b) => b.startsWith('event:'))
+    .map((b) => {
+      const event = (b.split('\n').find((l) => l.startsWith('event:')) ?? '').slice(6).trim()
+      const dataLine = b.split('\n').find((l) => l.startsWith('data:')) ?? ''
+      return { event, data: JSON.parse(dataLine.slice(5).trim()) as Record<string, unknown> }
+    })
+}
+
+/** Stub engine streaming the given chunks, recording the abort signal. */
+function scriptedEngine(chunks: Array<Record<string, unknown>>, signals: Array<AbortSignal>): AgyEngine {
+  return stubEngine({
+    stream: async function* (call: { signal?: AbortSignal }) {
+      if (call?.signal !== undefined) signals.push(call.signal)
+      for (const c of chunks) yield c as never
+    },
+  } as Partial<AgyEngine>)
+}
+
+const TEXT_THEN_STOP: Array<Record<string, unknown>> = [
+  { type: 'text-delta', index: 0, text: 'hello ' },
+  { type: 'text-delta', index: 0, text: 'ST' },
+  { type: 'text-delta', index: 0, text: 'OP' },
+  { type: 'text-delta', index: 0, text: ' more' },
+  { type: 'usage', usage: { inputTokens: 1, outputTokens: 3 } },
+  { type: 'finish', reason: { kind: 'stop' } },
+]
+
+describe('streaming stop_sequences (T2-8)', () => {
+  afterEach(() => {
+    delete process.env.AGY_PROXY_API_KEY
+  })
+
+  it('Anthropic leg: held text never emitted; message_delta echoes the stop', async () => {
+    const signals: Array<AbortSignal> = []
+    const { built } = makeServer({}, scriptedEngine(TEXT_THEN_STOP, signals))
+    const res = await built.app.inject({
+      method: 'POST',
+      url: '/v1/messages',
+      payload: {
+        model: 'gemini-3.7-flash',
+        max_tokens: 100,
+        stream: true,
+        stop_sequences: ['STOP'],
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    })
+    expect(res.statusCode).toBe(200)
+    const events = sseEvents(res.body)
+    const text = events
+      .filter((e) => e.event === 'content_block_delta')
+      .map((e) => (e.data.delta as { text?: string }).text ?? '')
+      .join('')
+    expect(text).toBe('hello ')
+    const md = events.find((e) => e.event === 'message_delta')
+    expect(md?.data.delta).toEqual({ stop_reason: 'stop_sequence', stop_sequence: 'STOP' })
+    await built.app.close()
+  })
+
+  it('OpenAI leg: held text never emitted; finish_reason stays stop', async () => {
+    const signals: Array<AbortSignal> = []
+    const { built } = makeServer({}, scriptedEngine(TEXT_THEN_STOP, signals))
+    const res = await built.app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'gemini-3.7-flash',
+        stream: true,
+        stop: ['STOP'],
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    })
+    expect(res.statusCode).toBe(200)
+    const payloads = res.body
+      .split('\n\n')
+      .map((b) => b.trim())
+      .filter((b) => b.startsWith('data:') && !b.includes('[DONE]'))
+      .map((b) => JSON.parse((b.split('\n').find((l) => l.startsWith('data:')) ?? '').slice(5).trim()) as Record<string, unknown>)
+    const content = payloads
+      .map((p) => (p.choices as Array<{ delta: { content?: string } }> | undefined)?.[0]?.delta.content)
+      .filter((c): c is string => typeof c === 'string')
+      .join('')
+    expect(content).toBe('hello ')
+    const finish = payloads.find((p) => (p.choices as Array<{ finish_reason: string | null }>)?.[0]?.finish_reason !== null)
+    expect((finish?.choices as Array<{ finish_reason: string }>)[0]?.finish_reason).toBe('stop')
+    await built.app.close()
+  })
+
+  it('reasoning deltas are never cut by the holdback', async () => {
+    const signals: Array<AbortSignal> = []
+    const engine = scriptedEngine(
+      [
+        { type: 'reasoning-delta', index: 0, text: 'STOP is a word in reasoning' },
+        { type: 'text-delta', index: 0, text: 'answer' },
+        { type: 'finish', reason: { kind: 'stop' } },
+      ],
+      signals,
+    )
+    const { built } = makeServer({}, engine)
+    const res = await built.app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: { model: 'gemini-3.7-flash', stream: true, stop: ['STOP'], messages: [{ role: 'user', content: 'hi' }] },
+    })
+    expect(res.statusCode).toBe(200)
+    const payloads = res.body
+      .split('\n\n')
+      .map((b) => b.trim())
+      .filter((b) => b.startsWith('data:') && !b.includes('[DONE]'))
+      .map((b) => JSON.parse((b.split('\n').find((l) => l.startsWith('data:')) ?? '').slice(5).trim()) as Record<string, unknown>)
+    const reasoning = payloads
+      .map((p) => (p.choices as Array<{ delta: { reasoning_content?: string } }> | undefined)?.[0]?.delta.reasoning_content)
+      .filter((r): r is string => typeof r === 'string')
+      .join('')
+    expect(reasoning).toBe('STOP is a word in reasoning')
+    await built.app.close()
+  })
+})
+
+describe('streaming max_tokens budget (T2-10)', () => {
+  afterEach(() => {
+    delete process.env.AGY_PROXY_API_KEY
+  })
+
+  const LONG_OUTPUT: Array<Record<string, unknown>> = [
+    { type: 'reasoning-delta', index: 0, text: 'thinking ' },
+    { type: 'text-delta', index: 0, text: 'x'.repeat(80) },
+    { type: 'text-delta', index: 0, text: 'y'.repeat(80) },
+    { type: 'usage', usage: { inputTokens: 1, outputTokens: 50 } },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+
+  it('Anthropic leg: engine aborted mid-stream; stop_reason max_tokens', async () => {
+    const signals: Array<AbortSignal> = []
+    const { built } = makeServer({}, scriptedEngine(LONG_OUTPUT, signals))
+    const res = await built.app.inject({
+      method: 'POST',
+      url: '/v1/messages',
+      payload: {
+        model: 'gemini-3.7-flash',
+        max_tokens: 10,
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    })
+    expect(res.statusCode).toBe(200)
+    const events = sseEvents(res.body)
+    const md = events.find((e) => e.event === 'message_delta')
+    expect((md?.data.delta as { stop_reason: string }).stop_reason).toBe('max_tokens')
+    // The engine was told to stop generating.
+    expect(signals.length).toBeGreaterThan(0)
+    expect(signals.every((s) => s.aborted)).toBe(true)
+    // The stream terminates at the cut: only the first long delta streams.
+    const text = events
+      .filter((e) => e.event === 'content_block_delta')
+      .map((e) => (e.data.delta as { text?: string }).text ?? '')
+      .join('')
+    expect(text).toBe('x'.repeat(80))
+    await built.app.close()
+  })
+
+  it('OpenAI leg: engine aborted mid-stream; finish_reason length', async () => {
+    const signals: Array<AbortSignal> = []
+    const { built } = makeServer({}, scriptedEngine(LONG_OUTPUT, signals))
+    const res = await built.app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: { model: 'gemini-3.7-flash', stream: true, max_completion_tokens: 10, messages: [{ role: 'user', content: 'hi' }] },
+    })
+    expect(res.statusCode).toBe(200)
+    const payloads = res.body
+      .split('\n\n')
+      .map((b) => b.trim())
+      .filter((b) => b.startsWith('data:') && !b.includes('[DONE]'))
+      .map((b) => JSON.parse((b.split('\n').find((l) => l.startsWith('data:')) ?? '').slice(5).trim()) as Record<string, unknown>)
+    const finish = payloads.find((p) => (p.choices as Array<{ finish_reason: string | null }> | undefined)?.[0]?.finish_reason !== null)
+    expect((finish?.choices as Array<{ finish_reason: string }>)[0]?.finish_reason).toBe('length')
+    expect(signals.length).toBeGreaterThan(0)
+    expect(signals.every((s) => s.aborted)).toBe(true)
     await built.app.close()
   })
 })

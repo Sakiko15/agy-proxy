@@ -192,16 +192,37 @@ log sites). To verify: send a request with a fake key, then grep the log output 
   the available list; when no discovery has happened (not signed in), the fallback catalog
   stays advisory and unknown ids pass through to agy (its real error text comes back as a
   502 `error.message`).
-- **Truncation** (`max_completion_tokens`/`max_tokens`): proportional text cut, approximate
-  by design (no tokenizer); tool-call spans are never truncated; `finish_reason:'length'`.
+- **Truncation** (`max_completion_tokens`/`max_tokens`): non-streaming does a proportional
+  text cut, approximate by design (no tokenizer); tool-call spans are never truncated;
+  `finish_reason:'length'`. Streaming enforces the cap with the same `estimateTokens`
+  heuristic (text + reasoning + tool arguments, delta granularity): once the estimate
+  reaches the cap the gateway aborts agy mid-generation and ends the stream with
+  `finish_reason:'length'` / Anthropic `stop_reason:'max_tokens'`.
+- **Stop sequences** (`stop`/`stop_sequences`) are gateway-side post-processing ("best
+  effort", string granularity — agy has no knob). Streaming holds back text tails that
+  could still be a stop prefix across delta boundaries and cuts at the first hit (text
+  stream only, reasoning never cut): OpenAI `finish_reason:'stop'`, Anthropic
+  `stop_reason:'stop_sequence'` with the matched sequence echoed in `stop_sequence`.
+  A stop hit never overrides a `tool-calls` terminal (the tool_use block already
+  streamed).
 - **Thinking**: agy reports thinking as token-count turns, rendered as
   `[agy thinking turn · N thinking tokens]` annotations. Anthropic thinking budget tiers:
   ≤4096 → low effort, ≤16384 → medium, >16384 → high. No `signature_delta` is ever emitted
-  and inbound signatures are not validated.
-- Legacy OpenAI `functions`/`function_call` → 400 (use `tools`).
-- Errors: OpenAI bodies `{error:{message,type,code}}`, Anthropic bodies
-  `{type:'error',error:{type,message}}` — agy's real error text always passes through;
-  an upstream `/overloaded/i` message maps to Anthropic 529 `overloaded_error`.
+  and inbound signatures are not validated. `reasoning_content` (OpenAI leg) is an
+  ecosystem-convention field, not part of the official Chat Completions schema; no
+  `content_filter`/`refusal`/`pause_turn` terminal reasons exist here.
+- **Usage semantics**: this gateway reports `prompt_tokens`/`input_tokens` as *uncached*
+  input (engine counts are disjoint); cached reads ride
+  `prompt_tokens_details.cached_tokens` / `cache_read_input_tokens`. OpenAI-semantics
+  clients wanting total prompt should add cached: `prompt_tokens + cached_tokens`.
+  Anthropic streaming `message_start.usage.input_tokens` is the same heuristic estimate
+  as `count_tokens` (real engine usage lands in the final `message_delta`).
+- Legacy OpenAI `functions`/`function_call` → 400 (use `tools`). `n > 1` → 400. Documents
+  (PDF), `citations`, and `search_result` blocks → 400 (v2 candidates).
+- Errors: OpenAI bodies `{error:{message,type,code,param}}` (`param` always `null`),
+  Anthropic bodies `{type:'error',error:{type,message},request_id}` — agy's real error text
+  always passes through; an upstream `/overloaded/i` message maps to Anthropic 529
+  `overloaded_error`.
 
 ## Development quick start
 

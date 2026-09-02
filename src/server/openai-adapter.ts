@@ -204,9 +204,12 @@ export async function mapChatRequest(
 
   if (b.stream !== undefined && typeof b.stream !== 'boolean') throw bad('stream must be a boolean')
 
-  const model = typeof b.model === 'string' && b.model.trim() !== '' ? b.model : cfg.defaultModel
+  if (b.model !== undefined && typeof b.model !== 'string') throw bad('model must be a string')
+  // A whitespace-only model string is a client bug — reject instead of
+  // silently substituting the default model.
+  if (typeof b.model === 'string' && b.model.trim() === '') throw bad('model must be a non-empty string')
+  const model = typeof b.model === 'string' ? b.model : cfg.defaultModel
   if (model === '') throw bad('model is required')
-  if (typeof b.model !== 'string' && b.model !== undefined) throw bad('model must be a string')
 
   // OA8: when a LIVE catalog was discovered, an unknown id is rejected up
   // front with the list of available models. With only the fallback catalog
@@ -308,6 +311,7 @@ export async function mapChatRequest(
   const IGNORED_PARAMS = [
     'temperature', 'top_p', 'frequency_penalty', 'presence_penalty',
     'seed', 'logprobs', 'top_logprobs', 'service_tier', 'store', 'parallel_tool_calls',
+    'logit_bias', 'verbosity', 'modalities', 'prediction', 'top_k',
   ] as const
   for (const k of IGNORED_PARAMS) {
     if (b[k] !== undefined) warnings.push(k + ' is accepted but not forwarded (agy has no corresponding knob)')
@@ -335,7 +339,7 @@ export async function mapChatRequest(
     const rf = b.response_format as Record<string, unknown>
     if (rf.type === 'json_object') {
       systemParts.push('Respond with a single valid JSON document and nothing else.')
-      warnings.push('response_format json_object is enforced by prompt + gateway-side parse check, not a hard guarantee')
+      warnings.push('response_format json_object is best-effort: enforced by prompt instruction only, output validity is not a hard guarantee')
     } else if (rf.type === 'json_schema') {
       const js = rf.json_schema as Record<string, unknown> | undefined
       const schema = js?.schema
@@ -343,6 +347,9 @@ export async function mapChatRequest(
         throw bad('response_format json_schema requires json_schema.schema')
       }
       jsonSchema = schema // native --json-schema passthrough; `strict` is semantic only
+    } else if (rf.type === 'text') {
+      // Spec-legal default (plain text output) — a no-op for this gateway.
+      // Only genuinely unknown types are rejected.
     } else {
       throw bad('unsupported response_format type: ' + String(rf.type))
     }
@@ -553,7 +560,10 @@ export function openAiChunkOf(id: string, created: number, model: string, chunk:
  * Map one StreamChunk onto 0..n OpenAI SSE frames. The first frame of a span
  * carries delta:{role:'assistant',content:''} (OA2); tool-call blocks are
  * emitted from block-end so id/name/arguments land complete in one frame;
- * usage is emitted only at finish and only when include_usage was set.
+ * usage is emitted only at finish and only when include_usage was set — with
+ * one spec addition: with stream_options.include_usage every INTERMEDIATE
+ * chunk carries "usage": null (only the terminal choices:[] chunk carries
+ * the counts), matching the official stream anatomy.
  */
 export function* openAiStreamFrames(args: {
   id: string
@@ -563,6 +573,26 @@ export function* openAiStreamFrames(args: {
   state: { firstSent: boolean; toolIndex: number; sawToolThisSpan: boolean }
   includeUsage: boolean
   /** Usage from the preceding usage chunk (protocol invariant: arrives before finish). */
+  usage?: TokenUsage
+}): Generator<OpenAiChunk | '[DONE]'> {
+  if (!args.includeUsage) {
+    yield* openAiStreamFramesCore(args)
+    return
+  }
+  for (const frame of openAiStreamFramesCore(args)) {
+    // The core emits the usage key only on the terminal choices:[] chunk;
+    // every other chunk gets the spec's explicit null.
+    yield typeof frame === 'string' || frame.usage !== undefined ? frame : { ...frame, usage: null }
+  }
+}
+
+function* openAiStreamFramesCore(args: {
+  id: string
+  created: number
+  model: string
+  chunk: StreamChunk
+  state: { firstSent: boolean; toolIndex: number; sawToolThisSpan: boolean }
+  includeUsage: boolean
   usage?: TokenUsage
 }): Generator<OpenAiChunk | '[DONE]'> {
   const { id, created, model, chunk, state, includeUsage, usage } = args

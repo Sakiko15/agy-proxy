@@ -213,7 +213,11 @@ export async function mapMessagesRequest(
   const warnings: string[] = []
   const imageBytes = new Map<string, Uint8Array>()
 
-  const model = typeof b.model === 'string' && b.model.trim() !== '' ? b.model : cfg.defaultModel
+  if (b.model !== undefined && typeof b.model !== 'string') throw bad('model must be a string')
+  // A whitespace-only model string is a client bug — reject instead of
+  // silently substituting the default model (same rule as the OpenAI leg).
+  if (typeof b.model === 'string' && b.model.trim() === '') throw bad('model must be a non-empty string')
+  const model = typeof b.model === 'string' ? b.model : cfg.defaultModel
   if (model === '') throw bad('model is required')
 
   // OA8 mirror: same pre-validation policy as the OpenAI leg (live catalog
@@ -265,28 +269,47 @@ export async function mapMessagesRequest(
   }
 
   // Continuation cursor: Anthropic tool_result blocks addressed to our
-  // mirror tool are surfaced as the engine's role:'tool' continuation.
+  // mirror tool are surfaced as the engine's role:'tool' continuation. The
+  // engine keys on the LAST message being a tool result, so the whole
+  // trailing user turn collapses into ONE tool message: multiple
+  // tool_results merge (client results are advisory mirror data — agy
+  // already executed everything), sibling text blocks ride along under a
+  // marker prefix instead of being silently dropped, and the cursor resumes
+  // from the furthest event index.
   const lastMsg = b.messages[b.messages.length - 1] as Record<string, unknown> | undefined
   if (lastMsg !== undefined && lastMsg.role === 'user' && Array.isArray(lastMsg.content)) {
+    const parts: string[] = []
+    let callId: string | undefined
+    let furthest = -1
     for (const block of lastMsg.content) {
       if (block === null || typeof block !== 'object') continue
       const bl = block as Record<string, unknown>
-      if (bl.type !== 'tool_result') continue
-      const callId = typeof bl.tool_use_id === 'string' ? bl.tool_use_id : undefined
-      if (callId === undefined || parseMirrorCallId(callId) === null) {
-        throw bad('tool_result blocks are only accepted as continuations of this gateway\'s own tool_use blocks (agytc- ids)')
+      if (bl.type === 'tool_result') {
+        const id = typeof bl.tool_use_id === 'string' ? bl.tool_use_id : undefined
+        const parsed = id === undefined ? null : parseMirrorCallId(id)
+        if (id === undefined || parsed === null) {
+          throw bad('tool_result blocks are only accepted as continuations of this gateway\'s own tool_use blocks (agytc- ids)')
+        }
+        parts.push(typeof bl.content === 'string'
+          ? bl.content
+          : Array.isArray(bl.content)
+            ? (bl.content as Array<{ type?: unknown; text?: unknown }>)
+                .filter((p) => p && p.type === 'text' && typeof p.text === 'string')
+                .map((p) => p.text as string)
+                .join('')
+            : 'ok')
+        if (parsed.eventIndex > furthest) {
+          furthest = parsed.eventIndex
+          callId = id
+        }
+        continue
       }
-      // The engine's continuation path keys on the LAST message being a tool
-      // result. Replace the trailing user turn with the tool message.
-      const text = typeof bl.content === 'string'
-        ? bl.content
-        : Array.isArray(bl.content)
-          ? (bl.content as Array<{ type?: unknown; text?: unknown }>)
-              .filter((p) => p && p.type === 'text' && typeof p.text === 'string')
-              .map((p) => p.text as string)
-              .join('')
-          : 'ok'
-      messages[messages.length - 1] = { role: 'tool', text, toolCallId: callId }
+      if (bl.type === 'text' && typeof bl.text === 'string' && bl.text !== '') {
+        parts.push('[user context] ' + bl.text)
+      }
+    }
+    if (callId !== undefined) {
+      messages[messages.length - 1] = { role: 'tool', text: parts.join('\n\n'), toolCallId: callId }
     }
   }
 
@@ -326,6 +349,11 @@ export async function mapMessagesRequest(
   }
   if (b.metadata !== undefined) warnings.push('metadata is logged context only — never forwarded upstream')
   for (const k of ['temperature', 'top_p', 'top_k'] as const) {
+    if (b[k] !== undefined) warnings.push(k + ' is accepted but not forwarded (agy has no corresponding knob)')
+  }
+  // Same visibility rule as the OpenAI leg: an accepted-but-ignored request
+  // field must not vanish silently.
+  for (const k of ['tool_choice', 'betas', 'mcp_servers', 'service_tier', 'output_format'] as const) {
     if (b[k] !== undefined) warnings.push(k + ' is accepted but not forwarded (agy has no corresponding knob)')
   }
 
@@ -483,6 +511,13 @@ export function estimateInputTokens(body: unknown): number {
   if (body !== null && typeof body === 'object') {
     const b = body as Record<string, unknown>
     tokens += estimateTokens(systemText(b.system))
+    // Tool definitions ride the request as JSON — count them the same way
+    // the engine's prompt will carry them.
+    if (Array.isArray(b.tools)) {
+      for (const tool of b.tools) {
+        if (tool !== null && typeof tool === 'object') tokens += estimateTokens(JSON.stringify(tool))
+      }
+    }
     if (Array.isArray(b.messages)) {
       for (const m of b.messages) {
         if (m === null || typeof m !== 'object') continue
@@ -496,6 +531,18 @@ export function estimateInputTokens(body: unknown): number {
               if (typeof bl.text === 'string') tokens += estimateTokens(bl.text)
               if (bl.type === 'image') tokens += 1000
               if (typeof bl.thinking === 'string') tokens += estimateTokens(bl.thinking)
+              // tool_result payloads ride the next prompt verbatim.
+              if (bl.type === 'tool_result') {
+                const inner = bl.content
+                if (typeof inner === 'string') tokens += estimateTokens(inner)
+                else if (Array.isArray(inner)) {
+                  for (const p of inner) {
+                    if (p && typeof p === 'object' && (p as { type?: unknown }).type === 'text' && typeof (p as { text?: unknown }).text === 'string') {
+                      tokens += estimateTokens((p as { text: string }).text)
+                    }
+                  }
+                }
+              }
             }
           }
         }
@@ -533,6 +580,13 @@ export function* anthropicStreamEvents(args: {
     openType: 'text' | 'thinking' | 'tool_use' | null
   }
   usage?: TokenUsage
+  /** message_start fires before engine usage arrives, so callers pass the
+   * heuristic input estimate (estimateInputTokens) to keep cost-tracking
+   * clients from recording a zero-prompt turn. */
+  inputTokens?: number
+  /** Streaming stop-sequence hit (StopHoldback): overrides the terminal
+   * stop_reason/stop_sequence pair on the finish chunk's message_delta. */
+  stopSequence?: string
 }): Generator<AnthropicStreamEvent> {
   const { id, model, chunk, state, usage } = args
   if (!state.messageStarted) {
@@ -549,7 +603,7 @@ export function* anthropicStreamEvents(args: {
           content: [],
           stop_reason: null,
           stop_sequence: null,
-          usage: { input_tokens: 0, output_tokens: 0 },
+          usage: { input_tokens: args.inputTokens ?? 0, output_tokens: 0 },
         },
       },
     }
@@ -622,13 +676,14 @@ export function* anthropicStreamEvents(args: {
         yield anthropicStreamErrorEvent(chunk.reason.failure.message, type)
         return
       }
-      const stopReason = chunk.reason.kind === 'tool-calls' ? 'tool_use' : chunk.reason.kind === 'max-tokens' ? 'max_tokens' : 'end_turn'
+      const stopSeq = args.stopSequence ?? null
+      const stopReason = stopSeq !== null ? 'stop_sequence' : chunk.reason.kind === 'tool-calls' ? 'tool_use' : chunk.reason.kind === 'max-tokens' ? 'max_tokens' : 'end_turn'
       const u = mapAnthropicUsage(usage ?? { inputTokens: 0, outputTokens: 0 })
       yield {
         event: 'message_delta',
         data: {
           type: 'message_delta',
-          delta: { stop_reason: stopReason, stop_sequence: null },
+          delta: { stop_reason: stopReason, stop_sequence: stopSeq },
           usage: { output_tokens: u.output_tokens, ...(u.output_tokens_details !== undefined ? { output_tokens_details: u.output_tokens_details } : {}) },
         },
       }

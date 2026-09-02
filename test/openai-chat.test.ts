@@ -122,6 +122,15 @@ describe('mapChatRequest', () => {
     expect(meta.warnings).toEqual([])
   })
 
+  it('rejects a whitespace-only model instead of falling back silently', async () => {
+    mapThrows({ ...BASE, model: ' ' }, /non-empty/)
+    mapThrows({ ...BASE, model: '  ' }, /non-empty/)
+    // Non-string models keep their own error.
+    mapThrows({ ...BASE, model: 7 }, /model must be a string/)
+    // An unset model still falls back to the configured default.
+    await expect(map({ ...BASE, model: undefined }, { ...cfg, defaultModel: 'fallback-m' })).resolves.toBeTruthy()
+  })
+
   it('joins system and developer messages in arrival order', async () => {
     const { call } = await map({
       ...BASE,
@@ -218,6 +227,20 @@ describe('mapChatRequest', () => {
     expect(streamed.meta.stream).toBe(true)
   })
 
+  it('warns for every silently-dropped sampling/verbosity param', async () => {
+    const { meta } = await map({
+      ...BASE,
+      logit_bias: { x: 1 },
+      verbosity: 'low',
+      modalities: ['text'],
+      prediction: { content: 'x' },
+      top_k: 5,
+    })
+    for (const k of ['logit_bias', 'verbosity', 'modalities', 'prediction', 'top_k']) {
+      expect(meta.warnings.some((w) => w.startsWith(k + ' is accepted but not forwarded'))).toBe(true)
+    }
+  })
+
   it('validates stop and max-token fields; warns on deprecations', async () => {
     const { call: _c, meta } = await map({
       ...BASE,
@@ -238,11 +261,20 @@ describe('mapChatRequest', () => {
   it('json_object injects a system instruction; json_schema passes through natively', async () => {
     const rf = await map({ ...BASE, response_format: { type: 'json_object' } })
     expect(rf.call.system).toContain('valid JSON')
+    // The warning must not overclaim: there is no gateway-side parse check.
+    expect(rf.meta.warnings.some((w) => w.includes('prompt instruction') && !w.includes('parse check'))).toBe(true)
     const schema = { type: 'object', properties: { a: { type: 'number' } }, required: ['a'] }
     const rs = await map({ ...BASE, response_format: { type: 'json_schema', json_schema: { name: 'r', schema } } })
     expect(rs.call.jsonSchema).toEqual(schema)
     mapThrows({ ...BASE, response_format: { type: 'yaml' } }, /response_format/)
     mapThrows({ ...BASE, response_format: { type: 'json_schema', json_schema: {} } }, /schema/)
+  })
+
+  it('accepts response_format {type:"text"} as a no-op; only unknown types 400', async () => {
+    const rf = await map({ ...BASE, response_format: { type: 'text' } })
+    expect(rf.call.system).toBeUndefined()
+    expect(rf.call.jsonSchema).toBeUndefined()
+    expect(rf.meta.warnings).toEqual([])
   })
 
   it('OA8: unknown model 404s against a discovered catalog; fallback stays advisory', async () => {
@@ -461,6 +493,9 @@ describe('POST /v1/chat/completions end-to-end (fake agy)', () => {
       expect(res.statusCode).toBe(400)
       expect(res.json().error.type).toBe('invalid_request_error')
     }
+    // Official error-object anatomy carries param (always null from us).
+    const res = await post(built, { model: 'm', messages: [{ role: 'user', content: 'hi' }], functions: [] })
+    expect(res.json().error.param).toBeNull()
     await built.app.close()
   })
 

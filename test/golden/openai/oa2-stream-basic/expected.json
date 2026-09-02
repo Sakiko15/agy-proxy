@@ -1,12 +1,113 @@
 {
   "_provenance": "test/golden/openai/oa2-stream-basic/PROVENANCE.md — SSE stream chunk sequence: first frame carries delta:{role,content:\"\"}, tool-call rides block-end, finish frame then the include_usage choices:[] frame, then [DONE]. Sentinels: __ID__ (chatcmpl id), __AGYTC__ (mirror tool-call id), created → 0, __UUID__ (embedded run id inside mirror arguments).",
   "sse": [
-    { "id": "__ID__", "object": "chat.completion.chunk", "created": 0, "model": "gemini-3.7-flash", "choices": [{ "index": 0, "delta": { "role": "assistant", "content": "" }, "finish_reason": null }] },
-    { "id": "__ID__", "object": "chat.completion.chunk", "created": 0, "model": "gemini-3.7-flash", "choices": [{ "index": 0, "delta": { "reasoning_content": "Thinking..." }, "finish_reason": null }] },
-    { "id": "__ID__", "object": "chat.completion.chunk", "created": 0, "model": "gemini-3.7-flash", "choices": [{ "index": 0, "delta": { "reasoning_content": " carefully" }, "finish_reason": null }] },
-    { "id": "__ID__", "object": "chat.completion.chunk", "created": 0, "model": "gemini-3.7-flash", "choices": [{ "index": 0, "delta": { "tool_calls": [{ "index": 0, "id": "__AGYTC__", "type": "function", "function": { "name": "agy_tool", "arguments": "{\"run\":\"__UUID__\",\"step\":4,\"tool\":\"read_file\",\"input\":{\"path\":\"/tmp/x\"}}" } }] }, "finish_reason": null }] },
-    { "id": "__ID__", "object": "chat.completion.chunk", "created": 0, "model": "gemini-3.7-flash", "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }] },
-    { "id": "__ID__", "object": "chat.completion.chunk", "created": 0, "model": "gemini-3.7-flash", "choices": [], "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "prompt_tokens_details": { "cached_tokens": 0 }, "completion_tokens_details": { "reasoning_tokens": 0 } } },
+    {
+      "id": "__ID__",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "gemini-3.7-flash",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "role": "assistant",
+            "content": ""
+          },
+          "finish_reason": null
+        }
+      ],
+      "usage": null
+    },
+    {
+      "id": "__ID__",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "gemini-3.7-flash",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "reasoning_content": "Thinking..."
+          },
+          "finish_reason": null
+        }
+      ],
+      "usage": null
+    },
+    {
+      "id": "__ID__",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "gemini-3.7-flash",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "reasoning_content": " carefully"
+          },
+          "finish_reason": null
+        }
+      ],
+      "usage": null
+    },
+    {
+      "id": "__ID__",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "gemini-3.7-flash",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "__AGYTC__",
+                "type": "function",
+                "function": {
+                  "name": "agy_tool",
+                  "arguments": "{\"run\":\"__UUID__\",\"step\":4,\"tool\":\"read_file\",\"input\":{\"path\":\"/tmp/x\"}}"
+                }
+              }
+            ]
+          },
+          "finish_reason": null
+        }
+      ],
+      "usage": null
+    },
+    {
+      "id": "__ID__",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "gemini-3.7-flash",
+      "choices": [
+        {
+          "index": 0,
+          "delta": {},
+          "finish_reason": "tool_calls"
+        }
+      ],
+      "usage": null
+    },
+    {
+      "id": "__ID__",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "gemini-3.7-flash",
+      "choices": [],
+      "usage": {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      }
+    },
     "[DONE]"
   ]
 }

@@ -16,7 +16,8 @@ import {
   mapThinking,
   newMessageId,
 } from '../src/server/anthropic-adapter.ts'
-import { engineFailureToAnthropic, isAnthropicPath } from '../src/server/errors.ts'
+import { anthropicError, engineFailureToAnthropic, isAnthropicPath, openAiError, stampRequestId } from '../src/server/errors.ts'
+import { estimateTokens } from '../src/server/tokens.ts'
 import { CallId, type StreamChunk } from '../src/host/stream-types.ts'
 import type { Catalog } from '../src/host/models.ts'
 
@@ -78,6 +79,13 @@ describe('mapMessagesRequest', () => {
     await mapThrows({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }, /max_tokens is required/)
     await mapThrows({ ...BASE, max_tokens: 0 }, /positive integer/)
     await mapThrows({ ...BASE, max_tokens: 'many' }, /positive integer/)
+  })
+
+  it('rejects a whitespace-only model instead of falling back silently', async () => {
+    await mapThrows({ ...BASE, model: ' ' }, /non-empty/)
+    // Non-string models keep their own error; unset falls back to default.
+    await mapThrows({ ...BASE, model: 7 }, /model must be a string/)
+    await expect(map({ ...BASE, model: undefined }, { ...cfg, defaultModel: 'fallback-m' })).resolves.toBeTruthy()
   })
 
   it('OA8 mirror: unknown model 404s on a discovered catalog; aliases pass (M2)', async () => {
@@ -180,6 +188,67 @@ describe('mapMessagesRequest', () => {
     )
   })
 
+  it('merges multiple trailing tool_results and keeps the furthest cursor', async () => {
+    const { call } = await map({
+      ...BASE,
+      messages: [
+        { role: 'user', content: 'go' },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'agytc-run-1-3', content: 'result A' },
+            { type: 'tool_result', tool_use_id: 'agytc-run-1-5', content: 'result B' },
+          ],
+        },
+      ],
+    })
+    expect(call.messages[call.messages.length - 1]).toEqual({
+      role: 'tool',
+      text: 'result A\n\nresult B',
+      toolCallId: 'agytc-run-1-5',
+    })
+  })
+
+  it('folds sibling text blocks into the tool message with a marker prefix', async () => {
+    const { call } = await map({
+      ...BASE,
+      messages: [
+        { role: 'user', content: 'go' },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'agytc-run-1-3', content: 'out' },
+            { type: 'text', text: 'note from the client' },
+          ],
+        },
+      ],
+    })
+    expect(call.messages[call.messages.length - 1]).toEqual({
+      role: 'tool',
+      text: 'out\n\n[user context] note from the client',
+      toolCallId: 'agytc-run-1-3',
+    })
+  })
+
+  it('still rejects when any trailing tool_result carries a foreign id', async () => {
+    await mapThrows(
+      {
+        ...BASE,
+        messages: [
+          { role: 'user', content: 'go' },
+          {
+            role: 'user',
+            content: [
+              { type: 'tool_result', tool_use_id: 'agytc-run-1-3', content: 'out' },
+              { type: 'tool_result', tool_use_id: 'tu_foreign', content: 'x' },
+            ],
+          },
+        ],
+      },
+      /only accepted as continuations/,
+    )
+  })
+
   it('maps stop_sequences and rejects oversize lists', async () => {
     const { meta } = await map({ ...BASE, stop_sequences: ['END', 'STOP'] })
     expect(meta.stop).toEqual(['END', 'STOP'])
@@ -199,6 +268,20 @@ describe('mapMessagesRequest', () => {
     expect(meta.warnings.some((w) => w.includes('tools were accepted but are not executed'))).toBe(true)
     expect(meta.warnings.some((w) => w.includes('temperature'))).toBe(true)
     expect(meta.warnings.some((w) => w.includes('top_k'))).toBe(true)
+  })
+
+  it('warns for every silently-ignored extra param (parity with the OpenAI leg)', async () => {
+    const { meta } = await map({
+      ...BASE,
+      tool_choice: { type: 'auto' },
+      betas: ['prompt-caching-2024-07-31'],
+      mcp_servers: [{ name: 'm', url: 'https://mcp.example' }],
+      service_tier: 'auto',
+      output_format: { type: 'text' },
+    })
+    for (const k of ['tool_choice', 'betas', 'mcp_servers', 'service_tier', 'output_format']) {
+      expect(meta.warnings.some((w) => w.startsWith(k + ' is accepted but not forwarded'))).toBe(true)
+    }
   })
 
   it('marks streaming requests', async () => {
@@ -299,9 +382,41 @@ describe('estimateInputTokens (AN7 heuristic)', () => {
     })
     expect(n3).toBe(1000)
   })
+
+  it('counts tools definitions (JSON-serialized) and tool_result contents', () => {
+    const tools = [
+      { name: 'get_weather', description: '天气查询', input_schema: { type: 'object', properties: { city: { type: 'string' } } } },
+    ]
+    const withTools = estimateInputTokens({ tools, messages: [{ role: 'user', content: 'hi' }] })
+    const without = estimateInputTokens({ messages: [{ role: 'user', content: 'hi' }] })
+    expect(withTools - without).toBe(tools.reduce((acc, t) => acc + estimateTokens(JSON.stringify(t)), 0))
+
+    const withResult = estimateInputTokens({
+      messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'agytc-x-1', content: '一二三四五' }] }],
+    })
+    expect(withResult).toBe(5)
+    // Block-array tool_result content counts too.
+    const withBlocks = estimateInputTokens({
+      messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'agytc-x-1', content: [{ type: 'text', text: 'abcdefgh' }] }] }],
+    })
+    expect(withBlocks).toBe(2)
+  })
 })
 
 describe('error helpers', () => {
+  it('anthropicError carries the gateway request id when provided', () => {
+    expect(anthropicError('invalid_request_error', 'x').request_id).toBeUndefined()
+    expect(anthropicError('invalid_request_error', 'x', 'req-1').request_id).toBe('req-1')
+  })
+
+  it('stampRequestId adds request_id to Anthropic bodies only', () => {
+    const an = stampRequestId(anthropicError('invalid_request_error', 'm'), 'rid')
+    expect(an).toMatchObject({ type: 'error', request_id: 'rid' })
+    const oa = stampRequestId(openAiError('m', 't', 'c'), 'rid') as { error: { param: string | null } }
+    expect('request_id' in oa).toBe(false)
+    expect(oa.error.param).toBeNull()
+  })
+
   it('routes anthropic paths but not openai ones', () => {
     expect(isAnthropicPath('/v1/messages')).toBe(true)
     expect(isAnthropicPath('/v1/messages/count_tokens?x=1')).toBe(true)
@@ -338,6 +453,17 @@ describe('anthropicStreamEvents', () => {
     expect(events[0]?.event).toBe('message_start')
     const msg = events[0]?.data.message as Record<string, unknown>
     expect(msg).toMatchObject({ id: 'msg_x', type: 'message', role: 'assistant', content: [] })
+  })
+
+  it('message_start.usage.input_tokens carries the provided estimate', () => {
+    const state = { messageStarted: false, blockIndex: 0, openType: null as 'text' | 'thinking' | 'tool_use' | null }
+    const out: Array<{ event: string; data: Record<string, unknown> }> = []
+    for (const ev of anthropicStreamEvents({ id: 'msg_x', model: 'm', chunk: { type: 'text-delta', index: 0, text: 'hi' }, state, inputTokens: 42 })) {
+      out.push(ev)
+    }
+    const msg = out[0]?.data.message as Record<string, unknown>
+    expect((msg.usage as Record<string, unknown>).input_tokens).toBe(42)
+    expect((msg.usage as Record<string, unknown>).output_tokens).toBe(0)
   })
 
   it('blocks open/close around thinking → text transitions (AN3)', () => {
@@ -418,5 +544,15 @@ describe('anthropicStreamEvents', () => {
       { type: 'finish', reason: { kind: 'aborted', failure: { message: 'stop', code: 'AUTH' } } },
     ])
     expect(ab[ab.length - 1]?.data.error).toMatchObject({ type: 'authentication_error', message: 'stop' })
+  })
+
+  it('stop_sequence override lands in message_delta (streaming stop echo)', () => {
+    const state = { messageStarted: false, blockIndex: 0, openType: null as 'text' | 'thinking' | 'tool_use' | null }
+    const out: Array<{ event: string; data: Record<string, unknown> }> = []
+    for (const ev of anthropicStreamEvents({ id: 'msg_x', model: 'm', chunk: { type: 'finish', reason: { kind: 'stop' } }, state, stopSequence: 'STOP' })) {
+      out.push(ev)
+    }
+    const md = out.find((e) => e.event === 'message_delta')
+    expect(md?.data.delta).toEqual({ stop_reason: 'stop_sequence', stop_sequence: 'STOP' })
   })
 })

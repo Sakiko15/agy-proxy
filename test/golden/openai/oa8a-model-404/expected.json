@@ -4,6 +4,7 @@
   "error": {
     "message": "model 'no-such-model' was not found by this gateway — available models: gemini-3-7-flash, claude-sonnet-4-6",
     "type": "invalid_request_error",
-    "code": "model_not_found"
+    "code": "model_not_found",
+    "param": null
   }
 }

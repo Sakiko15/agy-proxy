@@ -5,5 +5,6 @@
   "error": {
     "type": "overloaded_error",
     "message": "Google Antigravity quota / rate limit reached: model overloaded"
-  }
+  },
+  "request_id": "__UUID__"
 }

@@ -94,6 +94,7 @@ export function buildAuthHook(deps: AuthDeps): preHandlerHookHandler {
           authErrorFor(
             request.url,
             'Missing API key. Pass it as `Authorization: Bearer <key>` or `x-api-key: <key>`.',
+            request.id,
           ).body,
         )
       return
@@ -110,13 +111,13 @@ export function buildAuthHook(deps: AuthDeps): preHandlerHookHandler {
     if (deps.keys === undefined) {
       if (cfg.apiKey === '') return // auth disabled
       if (keyMatches(cfg.apiKey, provided)) return
-      await reply.code(401).send(authErrorFor(request.url, 'Invalid API key provided.').body)
+      await reply.code(401).send(authErrorFor(request.url, 'Invalid API key provided.', request.id).body)
       return
     }
 
     const verdict = deps.keys.verify(provided)
     if (verdict.verdict === 'unknown') {
-      await reply.code(401).send(authErrorFor(request.url, 'Invalid API key provided.').body)
+      await reply.code(401).send(authErrorFor(request.url, 'Invalid API key provided.', request.id).body)
       return
     }
     if (verdict.verdict === 'disabled') {
@@ -125,7 +126,7 @@ export function buildAuthHook(deps: AuthDeps): preHandlerHookHandler {
         .code(403)
         .send(
           isAnthropicPath(request.url)
-            ? anthropicError('permission_error', message)
+            ? anthropicError('permission_error', message, request.id)
             : httpError(403, message, 'permission_error', 'key_disabled').body,
         )
       return
@@ -139,7 +140,7 @@ export function buildAuthHook(deps: AuthDeps): preHandlerHookHandler {
         await limiter.consume(1)
       } catch (res) {
         const sec = Math.max(1, Math.ceil(((res as { msBeforeNext?: number }).msBeforeNext ?? 1000) / 1000))
-        await sendError(reply, quotaRejectFor(request.url, `Requests per-minute limit reached for this key (rpm=${rpm}). Retry in ${sec}s.`, sec))
+        await sendError(reply, quotaRejectFor(request.url, `Requests per-minute limit reached for this key (rpm=${rpm}). Retry in ${sec}s.`, sec, request.id))
         return
       }
     }
@@ -152,7 +153,7 @@ export function buildAuthHook(deps: AuthDeps): preHandlerHookHandler {
         const resetMs = msUntilLocalMidnight()
         const sec = Math.max(1, Math.ceil(resetMs / 1000))
         const message = `Daily token limit reached for this key: used ${used} of ${daily} tokens (daily_token_limit). Resets at ${new Date(Date.now() + resetMs).toISOString()} (in ${sec}s).`
-        await sendError(reply, quotaRejectFor(request.url, message, sec))
+        await sendError(reply, quotaRejectFor(request.url, message, sec, request.id))
         return
       }
     }

@@ -4,6 +4,7 @@
   "error": {
     "message": "agy exited with code 1: upstream request failed while generating (request id 8f3ac2)",
     "type": "api_error",
-    "code": "PROCESS_EXIT"
+    "code": "PROCESS_EXIT",
+    "param": null
   }
 }

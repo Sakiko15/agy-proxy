@@ -332,11 +332,13 @@ describe('AN8: error matrix legs', () => {
     const { built } = makeServer({ apiKey: 'sekrit' })
     const res = await post(built, BASE)
     expect(res.statusCode).toBe(401)
-    const an = res.json() as { type?: string; error?: { type?: string } }
-    // Anthropic error shape: {type:'error', error:{type,message}}.
+    const an = res.json() as { type?: string; request_id?: string; error?: { type?: string } }
+    // Anthropic error shape: {type:'error', error:{type,message}} + the
+    // gateway's top-level request_id echo.
     expect(an.type).toBe('error')
     expect(an.error?.type).toBe('authentication_error')
     expect(typeof an.error === 'object' && an.error !== null && 'message' in an.error).toBe(true)
+    expect(an.request_id).toMatch(/^[0-9a-f-]{36}$/)
     await built.app.close()
   })
 
@@ -367,10 +369,11 @@ describe('AN8: error matrix legs', () => {
     const { built } = makeServer()
     const res = await post(built, { model: 'gemini-3.7-flash', messages: [{ role: 'user', content: 'hi' }] })
     expect(res.statusCode).toBe(400)
-    const an = res.json() as { type?: string; error?: { type?: string } }
+    const an = res.json() as { type?: string; request_id?: string; error?: { type?: string } }
     expect(an.type).toBe('error')
     expect(an.error?.type).toBe('invalid_request_error')
     expect(an.error && 'message' in an.error).toBe(true)
+    expect(an.request_id).toMatch(/^[0-9a-f-]{36}$/)
     await built.app.close()
   })
 

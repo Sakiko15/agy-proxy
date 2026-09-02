@@ -25,6 +25,7 @@ import {
   openAiError,
   anthropicError,
   isAnthropicPath,
+  stampRequestId,
   type OpenAiErrorBody,
 } from './errors.ts'
 import {
@@ -38,6 +39,7 @@ import {
 import type { EngineCall } from '../host/engine.ts'
 import { SseWriter } from './sse.ts'
 import { InFlightTracker } from './shutdown.ts'
+import { OutputBudget, StopHoldback } from './stream-guards.ts'
 import {
   assembleMessage,
   collectChunks as collectAnthropicChunks,
@@ -164,7 +166,9 @@ export function buildServer(deps: ServerDeps): BuiltServer {
 
   app.setErrorHandler((err: unknown, request, reply) => {
     if (err instanceof GatewayHttpError) {
-      void reply.code(err.statusCode).headers(err.headers ?? {}).send(err.body)
+      // Anthropic bodies carry the top-level request_id echo (official API
+      // shape); OpenAI bodies are returned untouched.
+      void reply.code(err.statusCode).headers(err.headers ?? {}).send(stampRequestId(err.body, request.id))
       return
     }
     // TypeBox/Fastify validation and malformed-JSON bodies.
@@ -182,7 +186,7 @@ export function buildServer(deps: ServerDeps): BuiltServer {
       if (request.url.startsWith('/admin')) {
         void reply.code(415).send({ ok: false, error: message })
       } else if (isAnthropicPath(request.url)) {
-        void reply.code(415).send(anthropicError('invalid_request_error', message))
+        void reply.code(415).send(anthropicError('invalid_request_error', message, request.id))
       } else {
         void reply.code(415).send(openAiError(message, 'invalid_request_error', 'unsupported_media_type'))
       }
@@ -191,7 +195,7 @@ export function buildServer(deps: ServerDeps): BuiltServer {
     if (validation !== undefined || status === 400 || status === 413) {
       const message = err instanceof Error ? err.message : String(err)
       if (isAnthropicPath(request.url)) {
-        void reply.code(status ?? 400).send(anthropicError('invalid_request_error', message))
+        void reply.code(status ?? 400).send(anthropicError('invalid_request_error', message, request.id))
       } else {
         void reply
           .code(status ?? 400)
@@ -202,7 +206,7 @@ export function buildServer(deps: ServerDeps): BuiltServer {
     const detail = redactLine(err instanceof Error ? err.message : String(err))
     request.log.error({ err: detail }, 'internal error')
     if (isAnthropicPath(request.url)) {
-      void reply.code(500).send(anthropicError('api_error', 'Internal server error: ' + detail))
+      void reply.code(500).send(anthropicError('api_error', 'Internal server error: ' + detail, request.id))
     } else {
       void reply.code(500).send(openAiError('Internal server error: ' + detail, 'api_error', 'internal_error'))
     }
@@ -245,7 +249,7 @@ export function buildServer(deps: ServerDeps): BuiltServer {
       }
     }
     if (isAnthropicPath(request.url)) {
-      void reply.code(404).send(anthropicError('not_found_error', 'Not found.'))
+      void reply.code(404).send(anthropicError('not_found_error', 'Not found.', request.id))
     } else {
       void reply.code(404).send(httpError(404, 'Not found.', 'invalid_request_error', 'not_found').body)
     }
@@ -462,22 +466,77 @@ async function streamAnthropicMessages(args: {
   })
   const id = newMessageId()
   const state = { messageStarted: false, blockIndex: 0, openType: null as 'text' | 'thinking' | 'tool_use' | null }
+  // message_start precedes any engine usage; the heuristic estimate keeps
+  // cost-tracking clients from recording a zero-prompt turn.
+  const inputEstimate = estimateInputTokens(request.body)
   let usage: TokenUsage | undefined
   let finishKind: string = 'stop'
+  // T2: streaming guards — hold back text that could still be a stop
+  // prefix, and abort the engine once the estimated output reaches
+  // max_tokens. Reasoning is never cut; it still counts toward the budget.
+  const holdback = meta.stop.length > 0 ? new StopHoldback(meta.stop) : null
+  const budget = meta.maxTokens !== undefined ? new OutputBudget(meta.maxTokens) : null
+  let stopSequence: string | undefined
+  let budgetCut = false
+  const emit = async (chunk: StreamChunk): Promise<void> => {
+    for (const ev of anthropicStreamEvents({ id, model: call.model, chunk, state, usage, inputTokens: inputEstimate, stopSequence })) {
+      await sse.event(ev.event, ev.data)
+    }
+  }
   try {
     sse.open()
-    for await (const ch of deps.engine.stream({ ...call, signal: abort.signal })) {
-      if (ch.type === 'usage') {
-        usage = ch.usage
+    for await (const raw of deps.engine.stream({ ...call, signal: abort.signal })) {
+      if (raw.type === 'usage') {
+        usage = raw.usage
         continue
       }
-      if (ch.type === 'finish') finishKind = ch.reason.kind
-      for (const ev of anthropicStreamEvents({ id, model: call.model, chunk: ch, state, usage })) {
-        await sse.event(ev.event, ev.data)
+      // Budget accounting always reads the raw generated text — held-back
+      // tails were generated too, even if the client never sees them.
+      if (budget !== null && !budgetCut) {
+        if (raw.type === 'text-delta' || raw.type === 'reasoning-delta') budgetCut = budget.charge(raw.text)
+        else if (raw.type === 'block-end' && raw.block.type === 'tool-call') budgetCut = budget.charge(raw.block.arguments)
       }
-      if (ch.type === 'finish' && (ch.reason.kind === 'error' || ch.reason.kind === 'aborted')) {
-        finishKind = ch.reason.kind
-        return
+
+      if (raw.type === 'finish') {
+        finishKind = raw.reason.kind
+        // Flush the holdback before the terminal events so no generated
+        // text is lost behind the buffer.
+        if (holdback !== null) {
+          const tail = holdback.close()
+          if (tail.text !== '') await emit({ type: 'text-delta', index: 0, text: tail.text })
+          if (tail.matched !== null && raw.reason.kind !== 'tool-calls' && raw.reason.kind !== 'error' && raw.reason.kind !== 'aborted') {
+            // A stop hit overrides the terminal reason — except when tool
+            // calls already streamed this span (the client must keep its
+            // tool loop running).
+            stopSequence = tail.matched
+          }
+        }
+        if (raw.reason.kind === 'error' || raw.reason.kind === 'aborted') {
+          finishKind = raw.reason.kind
+          await emit(raw)
+          return
+        }
+        await emit(budgetCut || stopSequence !== undefined ? { type: 'finish', reason: { kind: budgetCut ? 'max-tokens' : 'stop' } } : raw)
+        continue
+      }
+
+      if (raw.type === 'text-delta' && holdback !== null) {
+        await emit({ ...raw, text: holdback.push(raw.text) })
+      } else {
+        await emit(raw)
+      }
+
+      if (budgetCut) {
+        // Cap reached by estimate: stop agy now instead of letting it run
+        // on, then end the SSE sequence at the budget.
+        abort.abort()
+        if (holdback !== null) {
+          const tail = holdback.close()
+          if (tail.text !== '') await emit({ type: 'text-delta', index: 0, text: tail.text })
+        }
+        finishKind = 'max-tokens'
+        await emit({ type: 'finish', reason: { kind: 'max-tokens' } })
+        break
       }
     }
     request.log.info(
@@ -530,32 +589,62 @@ async function streamOpenAiChat(args: {
   const state = { firstSent: false, toolIndex: 0, sawToolThisSpan: false }
   let usage: TokenUsage | undefined
   let finishKind: string = 'stop'
+  // T2: streaming guards — same contract as the Anthropic leg (see below).
+  const holdback = meta.stop.length > 0 ? new StopHoldback(meta.stop) : null
+  const budget = meta.maxTokens !== undefined ? new OutputBudget(meta.maxTokens) : null
+  let stopSequence: string | undefined
+  let budgetCut = false
+  const emit = async (chunk: StreamChunk): Promise<void> => {
+    for (const frame of openAiStreamFrames({ id, created, model: call.model, chunk, state, includeUsage: meta.includeUsage, usage })) {
+      await sse.data(frame)
+    }
+  }
   try {
     sse.open()
-    for await (const ch of deps.engine.stream({ ...call, signal: abort.signal })) {
-      if (ch.type === 'usage') {
-        usage = ch.usage
+    for await (const raw of deps.engine.stream({ ...call, signal: abort.signal })) {
+      if (raw.type === 'usage') {
+        usage = raw.usage
         continue
       }
-      if (ch.type === 'finish') finishKind = ch.reason.kind === 'max-tokens' ? 'max-tokens' : ch.reason.kind
-      if (ch.type === 'finish' && (ch.reason.kind === 'error' || ch.reason.kind === 'aborted')) {
-        const failure = engineFailureToHttp(ch.reason.failure.message, ch.reason.failure.code)
-        const body = failure.body as OpenAiErrorBody
-        await sse.data(openAiError(body.error.message, body.error.type, body.error.code))
-        await sse.data('[DONE]')
-        finishKind = ch.reason.kind
-        return
+      if (budget !== null && !budgetCut) {
+        if (raw.type === 'text-delta' || raw.type === 'reasoning-delta') budgetCut = budget.charge(raw.text)
+        else if (raw.type === 'block-end' && raw.block.type === 'tool-call') budgetCut = budget.charge(raw.block.arguments)
       }
-      for (const frame of openAiStreamFrames({
-        id,
-        created,
-        model: call.model,
-        chunk: ch,
-        state,
-        includeUsage: meta.includeUsage,
-        usage,
-      })) {
-        await sse.data(frame)
+
+      if (raw.type === 'finish') {
+        finishKind = raw.reason.kind === 'max-tokens' ? 'max-tokens' : raw.reason.kind
+        if (raw.reason.kind === 'error' || raw.reason.kind === 'aborted') {
+          const failure = engineFailureToHttp(raw.reason.failure.message, raw.reason.failure.code)
+          const body = failure.body as OpenAiErrorBody
+          await sse.data(openAiError(body.error.message, body.error.type, body.error.code))
+          await sse.data('[DONE]')
+          finishKind = raw.reason.kind
+          return
+        }
+        if (holdback !== null) {
+          const tail = holdback.close()
+          if (tail.text !== '') await emit({ type: 'text-delta', index: 0, text: tail.text })
+          if (tail.matched !== null && raw.reason.kind !== 'tool-calls') stopSequence = tail.matched
+        }
+        await emit(budgetCut || stopSequence !== undefined ? { type: 'finish', reason: { kind: budgetCut ? 'max-tokens' : 'stop' } } : raw)
+        continue
+      }
+
+      if (raw.type === 'text-delta' && holdback !== null) {
+        await emit({ ...raw, text: holdback.push(raw.text) })
+      } else {
+        await emit(raw)
+      }
+
+      if (budgetCut) {
+        abort.abort()
+        if (holdback !== null) {
+          const tail = holdback.close()
+          if (tail.text !== '') await emit({ type: 'text-delta', index: 0, text: tail.text })
+        }
+        finishKind = 'max-tokens'
+        await emit({ type: 'finish', reason: { kind: 'max-tokens' } })
+        break
       }
     }
     request.log.info(
