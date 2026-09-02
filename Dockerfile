@@ -5,13 +5,18 @@
 
 # ---- stage 0: build the gateway bundle (self-contained: no prebuilt dist/) ----
 FROM node:24-slim AS build
+# better-sqlite3 has no prebuilt for every node24/glibc target — when the
+# prebuild download misses, node-gyp needs the full native toolchain.
+RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY tsconfig.json tsdown.config.ts ./
 COPY src/ ./src/
-# tsdown only (host bundle); the WebUI builds in the web stage below
-RUN npx tsdown
+# tsdown only (host bundle); the WebUI builds in the web stage below.
+# Prune dev deps so the runtime stage reuses this node_modules verbatim.
+RUN npx tsdown && npm prune --omit=dev
 
 # ---- stage 1: build the WebUI (web/dist for the static hosting in dist/) ----
 FROM node:24-slim AS web
@@ -39,8 +44,9 @@ ENV PATH="/root/.local/bin:${PATH}" \
     AGY_CLI_DISABLE_AUTO_UPDATE=true
 
 WORKDIR /app
-COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev || npm install --omit=dev
+COPY package.json ./
+# prod node_modules come verbatim from the build stage (dev deps pruned there)
+COPY --from=build /app/node_modules ./node_modules
 
 COPY --from=build dist/ ./dist/
 COPY --from=web /web/dist/ ./web/dist/
