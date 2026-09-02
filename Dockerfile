@@ -3,6 +3,16 @@
 # children spawned per request). The official agy binary is installed at build
 # time and version-locked; auto-update is disabled at runtime.
 
+# ---- stage 0: build the gateway bundle (self-contained: no prebuilt dist/) ----
+FROM node:24-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY tsconfig.json tsdown.config.ts ./
+COPY src/ ./src/
+# tsdown only (host bundle); the WebUI builds in the web stage below
+RUN npx tsdown
+
 # ---- stage 1: build the WebUI (web/dist for the static hosting in dist/) ----
 FROM node:24-slim AS web
 WORKDIR /web
@@ -32,7 +42,7 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev || npm install --omit=dev
 
-COPY dist/ ./dist/
+COPY --from=build dist/ ./dist/
 COPY --from=web /web/dist/ ./web/dist/
 
 # All mutable state lives under /data (pool, sessions, accounts, media, sqlite).

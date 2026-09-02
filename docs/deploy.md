@@ -6,17 +6,17 @@
 
 ## 1. 部署路径
 
-**A. 从 checkout 构建（推荐先行）**
+**A. 从 checkout 构建（自包含，无本机 Node 也能做）**
 
 ```bash
-git clone <repo> agy-proxy && cd agy-proxy
-npm ci && npm run build        # tsdown + web 构建链
-docker compose up -d --build   # 使用 compose 中的 `build: .`（需先取消注释）
+git clone https://github.com/Sakiko15/agy-proxy.git agy-proxy && cd agy-proxy
+docker build -t agy-proxy:local .   # Dockerfile stage 0 在容器内编译网关 bundle
+AGY_PROXY_IMAGE=agy-proxy:local docker compose up -d
 ```
 
-**B. 拉取预构建镜像（主 registry = Docker Hub；发布指令后可用）**
+**B. 拉取预构建镜像（主 registry = Docker Hub，已发布）**
 
-镜像路径由 compose 的 `AGY_PROXY_IMAGE` 环境插值给定（如 `docker.io/<your-dockerhub-user>/agy-proxy:0.1.0`，与 `AGY_PROXY_API_KEY` 同放 `.env`）。**在用户下达发布指令之前，该镜像不存在于任何 registry** —— 镜像未推前用路径 A。私有仓库需先配认证（1Panel「容器 → 仓库」或 `docker login`）。ghcr.io 仅作备选（CN VPS 可达性通常差于 Docker Hub）。
+compose 的 `image` 行已内置默认 `docker.io/sakiko15/agy-proxy:0.2.0`（仍可用 `.env` 的 `AGY_PROXY_IMAGE` 覆盖）。镜像由 GitHub Actions 的 `docker-release` workflow（手动 dispatch，版本入参）构建推送，tag 为 `<version>` + `latest`（linux/amd64）。若 Docker Hub 仓库设为私有，需先配认证（1Panel「容器 → 仓库」或 `docker login`）。ghcr.io 仅作备选（CN VPS 可达性通常差于 Docker Hub）。
 
 **C. 1Panel 面板编排 + 远程拉取镜像（本文实际部署形态）** —— 见 §1.1。
 
@@ -26,8 +26,8 @@ agy CLI 版本由 Dockerfile `ARG AGY_CLI_VERSION=1.1.22` 锁定（m1.md 真机�
 
 已核实的面板事实（[1Panel 编排官方文档](https://1panel.cn/docs/v1/user_manual/containers/compose/)）：创建编排支持「编辑 / 路径选择 / 编排模版」三种来源；**编辑与启停操作仅适用于 1Panel 创建的编排**；编排文件落在 `{安装目录}/1panel/docker/compose/<名称>/`（项目名即编排名）。
 
-1. **镜像就位**（发布指令后）：Docker Hub 推送 `docker.io/<user>/agy-proxy:<git tag>`；若仓库设为私有，先在 1Panel「容器 → 仓库」添加仓库并填凭据（Docker Hub 账号 / token），否则拉取 401。
-2. **面板创建编排**：1Panel → 容器 → 编排 → 创建编排 → 来源「编辑」→ 文件夹名称填 `agy-proxy` → 粘贴仓库的 `docker-compose.yml` → 把 `image` 行改成本人 Docker Hub 路径（或在同一编排目录放 `.env`：`AGY_PROXY_IMAGE=docker.io/<user>/agy-proxy:0.1.0` 与 `AGY_PROXY_API_KEY`）→ 确认创建。
+1. **镜像就位**：GitHub 仓库 Actions 页 → `docker-release` → Run workflow（版本入参与 `package.json` 一致，当前 `0.2.0`）→ 等待构建推送完成；若 Docker Hub 仓库设为私有，先在 1Panel「容器 → 仓库」添加仓库并填凭据（Docker Hub 账号 / token），否则拉取 401。
+2. **面板创建编排**：1Panel → 容器 → 编排 → 创建编排 → 来源「编辑」→ 文件夹名称填 `agy-proxy` → 粘贴仓库的 `docker-compose.yml` → 确认创建（`image` 默认 `docker.io/sakiko15/agy-proxy:0.2.0`，无需 .env；要覆盖镜像或设 `AGY_PROXY_API_KEY` 时才放 `.env`）。
 3. **首启密码**：编排详情 → 容器 → 日志（或 SSH 后 `docker logs agy-proxy | grep -i password`）——随机管理密码只打印一次；常驻部署建议直接设 `AGY_PROXY_ADMIN_PASSWORD`（env）。
 4. **镜像加速**（CN VPS）：拉 Docker Hub 慢/失败时，1Panel「容器 → 配置 → 镜像加速」或 `/etc/docker/daemon.json` 配 registry-mirrors。
 5. 编排卷名带项目前缀：备份命令（本文 §5）中 `-v agy-data:/data` 对应改为实际卷名 `<编排名>_agy-data`（`docker volume ls | grep agy-data` 确认）。

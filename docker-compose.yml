@@ -1,55 +1,19 @@
-# docker-compose for agy-proxy on a VPS behind a reverse proxy.
-# Runbook: docs/deploy.md (compose up, first-boot password, nginx/Caddy SSE
-# configuration, docker kill drills, volume backups). For a 1Panel deployment
-# (容器 → 编排 → 创建编排, source "编辑"), paste this file as-is and see the
-# 路径 C section there.
-#
-# The image reference is interpolated from the environment: set AGY_PROXY_IMAGE
-# in the same directory's .env (1Panel 编排: same folder as the pasted yaml),
-# or edit the image line to the real Docker Hub path — e.g.
-#   docker.io/<your-dockerhub-user>/agy-proxy:0.1.0
-# The image is pushed to Docker Hub only on the user's explicit release
-# command (charter red line); until then, build from a checkout (`build: .`).
-# A PRIVATE Docker Hub repo needs registry auth first: 1Panel 容器 → 仓库 add
-# the credentials (or `docker login`), otherwise the pull fails with
-# authentication required.
+# agy-proxy compose — image defaults to the published Docker Hub tag (override
+# via AGY_PROXY_IMAGE in .env); runbook: docs/deploy.md
 services:
   gateway:
-    image: ${AGY_PROXY_IMAGE:?set AGY_PROXY_IMAGE in .env, e.g. docker.io/<your-dockerhub-user>/agy-proxy:0.1.0}
-    # build: .            # uncomment to build locally instead of pulling
-    # args:
-    #   AGY_CLI_VERSION: "1.1.22"   # default in Dockerfile; override consciously
+    image: ${AGY_PROXY_IMAGE:-docker.io/sakiko15/agy-proxy:0.2.0}
     container_name: agy-proxy
     restart: unless-stopped
     init: false # tini is the in-container PID 1 (Docker's --init must not wrap it)
-    stop_grace_period: 30s  # in-flight agy children get the full teardown window
+    stop_grace_period: 30s # in-flight agy children get the full teardown window
     ports:
-      # Bind to loopback only — access the WebUI/API through an SSH tunnel until
-      # a TLS reverse proxy is fronted (docs/deploy.md 路径 C 安全边界). With the
-      # 1Panel OpenResty path, keep this binding and proxy by container name.
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8080:8080" # loopback only; front with a TLS reverse proxy (docs/deploy.md)
     volumes:
-      # Credentials are device-bound — everything mutable lives on this volume
-      # (pool.json, per-account isolated HOMEs, sessions, media, SQLite).
-      # Under 1Panel 编排 the volume lands as <编排名>_agy-data.
       - agy-data:/data
     environment:
       AGY_PROXY_HOST: "0.0.0.0"
       AGY_PROXY_PORT: "8080"
-      # The daily token-budget day boundary rolls over at the container's
-      # LOCAL midnight, which is UTC in the base image. Operators billing by
-      # UTC+8 should uncomment (docs/deploy.md "Day boundary" section):
-      # TZ: "Asia/Shanghai"
-      # Narrow the admin surface to the proxy/loopback networks you actually
-      # use (comma-separated CIDRs; re-read per request). Without a reverse
-      # proxy (SSH-tunnel-only posture), keep the docker bridge + loopback:
-      # AGY_PROXY_ADMIN_ALLOW_CIDR: "172.16.0.0/12,127.0.0.1/32"
-      # Bootstrap root key for /v1/* (environment-only by design — a plaintext
-      # key never rests on disk):
-      # AGY_PROXY_API_KEY: ${AGY_PROXY_API_KEY:?set in .env or delete to start keyless}
-    # networks:
-    #   - 1panel-network   # uncomment when 1Panel OpenResty fronts this — then
-    #                      # proxy to http://agy-proxy:8080 by container name
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 15s
@@ -59,8 +23,3 @@ services:
 
 volumes:
   agy-data:
-
-# networks:
-#   1panel-network:
-#     external: true   # 1Panel OpenResty 反代时取消本节与上面的 networks 注释；
-#                      # 网络名以 `docker network ls` 实际为准（面板默认 1panel-network）

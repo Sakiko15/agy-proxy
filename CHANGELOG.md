@@ -2,14 +2,23 @@
 
 All notable changes to agy-proxy are documented here. Format based on Keep a Changelog; versions follow semver.
 
-## [Unreleased] (性能与稳定性 · 批次 4 — 流式内存管线)
+## 0.2.0 - 2026-09-02
+
+First registry release: protocol parity (stop/max_tokens enforcement, tool_result
+preservation, error-shape alignment) plus the four optimization batches (engine
+anti-hang, shutdown & SSE lifecycle, hot-path CPU/IO, streaming memory pipeline)
+and the M2-M5 hardening milestones below. Gates: check/build/458 tests +
+web:check/web:test, perf 8/8 legs ×2, soak 23/23. Docker publish now runs through
+the docker-release GitHub Actions workflow (self-contained image build).
+
+### 性能与稳定性 · 批次 4 — 流式内存管线
 
 Streaming memory-pipeline reductions in the engine hot path and the protocol
 adapters. Zero wire changes — every event stream, golden and token estimate is
 byte-identical (pins: golden suites, mapper, engine-retry). Full gate green
 (check/build, 458 tests/47 files).
 
-### Changed
+#### Changed
 - **Parsed events no longer carry the raw line object** (`src/common/types.ts`,
   `src/host/parser.ts`, A-M3): every `init`/`step`/`result` event kept the full
   parsed JSON in `raw` for no reader (the CANCELED empty-run case is detected on
@@ -45,14 +54,14 @@ byte-identical (pins: golden suites, mapper, engine-retry). Full gate green
   (test/anthropic-adapter.test.ts + test/openai-chat.test.ts pin the blanking,
   the staged bytes and the estimate).
 
-## [Unreleased] (性能与稳定性 · 批次 3 — 热路径 CPU/IO)
+### 性能与稳定性 · 批次 3 — 热路径 CPU/IO
 
 Hot-path cost reductions in the per-request server layer and account pool. Zero wire
 changes — estimateTokens stays byte-for-byte equivalent (differential fuzz), all other
 items are internal cost only. Full gate green (check/build, 456 tests/47 files,
 perf 8/8 legs).
 
-### Changed
+#### Changed
 - **estimateTokens lookup-table rewrite** (`src/server/tokens.ts`, B-H2): the per-token
   estimate walked every char through two regexes — measured 370ms for a 10MB prompt,
   all on the event loop before the first streamed byte (and `count_tokens` had no
@@ -94,13 +103,13 @@ perf 8/8 legs).
   (test/config-cache.test.ts pins cache hit, invalidate seam, writer seam and
   missing/corrupt tolerance). No-restart semantics unchanged; env layer untouched.
 
-## [Unreleased] (性能与稳定性 · 批次 2 — 停机与 SSE 连接生命周期)
+### 性能与稳定性 · 批次 2 — 停机与 SSE 连接生命周期
 
 Shutdown and SSE-connection lifecycle fixes. One deliberate behavior change (B-M1,
 argued below); otherwise zero wire changes. Full gate green (check/build, 444
 tests/45 files at batch end, shutdown-SSE suite 11/11); soak rerun after batch 3.
 
-### Fixed
+#### Fixed
 - **SIGTERM with a live `/admin/events` client no longer hangs shutdown**
   (`src/server/shutdown.ts` + `src/index.ts`, B-H1): `app.close()` ran before
   `bus.closeAll()`, but Fastify 5 never reaps hijacked SSE sockets — a connected
@@ -129,13 +138,13 @@ tests/45 files at batch end, shutdown-SSE suite 11/11); soak rerun after batch 3
 - `SseWriter.isClosed()` exported (B-L3), replacing the two `sse['closed']` private
   bracket accesses in src/server/app.ts.
 
-## [Unreleased] (性能与稳定性 · 批次 1 — 引擎防挂死)
+### 性能与稳定性 · 批次 1 — 引擎防挂死
 
 Anti-hang hardening across the agy process lifecycle (src/host). Zero wire changes —
 every protocol surface (golden SSE sequences, error bodies, stop/max_tokens semantics)
 is byte-identical; the full test suite (437/437, 44 files) and all 8 perf legs pass.
 
-### Added
+#### Added
 - **Kill escalation ladder** (`src/host/runner.ts`, A-H1): on POSIX, a process-group
   `SIGTERM` that the agy tree ignores now escalates after `killGraceMs` (new
   `RunOptions` field, default 5000ms) to a group `SIGKILL`, then a direct
@@ -154,7 +163,7 @@ is byte-identical; the full test suite (437/437, 44 files) and all 8 perf legs p
   hang → single retry → clean recovery with the TIMEOUT code confined to the ledger
   failure text, never the client stream.
 
-### Changed
+#### Changed
 - **Abort-before-spawn checks** (`src/host/engine.ts`, A-M2/A-L5): aborting a queued or
   mid-flight call is now honored at every waiting point — the per-account queue task
   head, right after semaphore acquire (immediate release + `ABORTED` settle), after the
@@ -187,13 +196,13 @@ is byte-identical; the full test suite (437/437, 44 files) and all 8 perf legs p
   product code untouched. Leg result back in line with the recorded baseline
   (P95 950ms over 30/30 rows vs 957ms recorded).
 
-## [Unreleased] (协议格式补齐)
+### 协议格式补齐
 
 Protocol-surface audit (OpenAI Chat Completions + Anthropic Messages) against the current
 official specs: seven quick wins, four behavioral fixes, docs synced. Architecture
 unchanged — agy still runs its own tool loop; the gateway remains a mirror.
 
-### Added
+#### Added
 - **Streaming `stop_sequences` enforced on both legs** (src/server/stream-guards.ts, new
   `StopHoldback`): the SSE layer withholds any text tail that could still be the prefix
   of one of the stop sequences and cuts at the first full hit — across delta boundaries,
@@ -224,7 +233,7 @@ unchanged — agy still runs its own tool loop; the gateway remains a mirror.
   zero-prompt turns; real engine usage still lands in the final `message_delta`.
   Three anthropic streaming goldens re-pinned (an2/an3/an5).
 
-### Fixed
+#### Fixed
 - `response_format {"type":"text"}` — a spec-legal value — was rejected 400; now a
   no-op. Only genuinely unknown types are rejected.
 - `stream_options.include_usage` intermediate chunks now carry `"usage": null` (OpenAI
@@ -245,16 +254,16 @@ unchanged — agy still runs its own tool loop; the gateway remains a mirror.
 - Whitespace-only `model` strings (`' '`) no longer silently fall back to the default
   model on the Anthropic leg — both legs answer 400 `model must be a non-empty string`.
 
-### Docs
+#### Docs
 - charter §4.2/§4.3/§4.4 + README "Request surface notes" synced: streaming
   stop/max_tokens semantics, `[user context] ` merge rule, `prompt_tokens` = uncached
   input (client conversion hint: add `cached_tokens`), `message_start` estimate,
   `reasoning_content` non-standard / no `content_filter`/`refusal`/`pause_turn`,
   `n>1` + document/citations/search_result → 400, corrected json_object wording.
 
-## [Unreleased] (M5 加固发布)
+### M5 加固发布
 
-### Added
+#### Added
 - **Engine-level single retry** (src/host/engine.ts): `RETRYABLE_CODES`/`RETRY_POLICY` existed since the ADR-11 port with zero consumers. Now: retryable failure classes (TIMEOUT / PROCESS_EXIT / no-result INVALID_OUTPUT) get exactly one dispatch-level retry with the jittered policy delay, one recording per LOGICAL run so the span streams seamlessly across the attempt boundary and a failure frame can never reach the client before retries are exhausted. No-replay guards: any recorded step event (`hasClientMappedEvents()`, recording.ts's third documented modification) plus every finish-capable result shape (ok, error-with-response, and the #902 CANCELED empty success) block the retry. Spawn failures joined the loop (the old spawnGate throw leaked the recording unsettled) with explicit 'failed to spawn agy: …' / 'terminated (signal …)' messages; `deps.bin()` re-read per attempt. `onRun` gains `{attempt, final, failureMessage?}`.
 - **Busy-aware account spread** (src/host/pool.ts + engine.ts): selection was not busy-aware — three same-family arrivals before any settle stacked onto one account's queue (measured ratio 0.9× where two-and-a-half was required). `selectAccount(family, busy?)` skips tracked accounts and recurses to unfiltered selection when the whole pool is busy; the engine tracks selected accounts until the dispatch finally block. *(M5 drill correction: the tracking first shipped as a per-stream() local Set — a no-op across concurrent requests, so spread never actually happened and the 2.7× perf reading was timing luck; the soak/perf leg-6 account diagnostics exposed the stacking. Tracking now lives at engine level (shared Set + refcount), pinned by a concurrent-arrival unit test asserting three distinct accountIds.)*
 - **Per-key model whitelist enforcement** (engine + key-store + errors): `EngineDeps.getScopes(keyId)` → the engine judges the model ACTUALLY SERVED (deliberately after fallback-model resolution) pre-spawn; violations answer `Err.MODEL_NOT_ALLOWED` → 403 permission_error in both protocol tables. Root key / absent callback / cleared whitelist bypass (empty = unrestricted, not deny-all). `KeyStore.update` patches scopes; `parseKeyScopes` splits on newline/comma/semicolon.
@@ -265,7 +274,7 @@ unchanged — agy still runs its own tool loop; the gateway remains a mirror.
 - **`AGY_PROXY_DEBUG_METRICS_MS`** (config `debugMetricsMs`): the gateway emits one NDJSON `{"debug":"metrics", rss, handles, uptime}` line per tick for the harness (raw stdout, not pino). Registered in README.
 - **fake-agy**: `FAKE_AGY_MODE_FILE` (mode re-read per process start — the mechanism for flipping failure modes between retry attempts), `kill-early`/`kill-mid` self-SIGKILL rescue/no-replay drills (win32 documents exit 1/no-signal, POSIX signal SIGKILL — both PROCESS_EXIT), `flood` mode (20k events, no awaits).
 
-### Fixed
+#### Fixed
 - **API-key display prefix derived from the plaintext's first 8 chars = the constant marker** (M5 security-audit drill finding; latent since M3): every plaintext starts with `sk-agy-` (7 chars), so the stored/echoed 8-char "distinguishing" prefix was `sk-agy-` + 1 char — the marker string rested in the `api_keys.prefix` DB column (red line: the marker never rests in the DB) and identified nothing. Now `generateApiKey()` slices the 8 chars AFTER the marker (`KEY_MARK` shared with db.ts), the v2 migration data-fix strips the marker from legacy rows (idempotent, varying tail kept), and tests pin prefix shape + `not.toContain('sk-agy-')` on the create-response echo. Plaintext handling unchanged (shown exactly once, never logged — re-verified by a live audit probe: 18 unauthenticated-route posture checks + key lifecycle + full server-log grep = 0 hits).
 - **Usage ledger flush never aborts the process**: a failed transaction escaped the throwaway `void`-flush chain as an unhandled rejection (disk full = process kill, violating the DoD). Bounded requeue (`MAX_PENDING_ROWS=5000`, oldest dropped beyond it), failure warning throttled to one per 60 s, and a fully guarded `close()`.
 - **Settings overrides writer strands the .tmp on failure**: now unlinked best-effort and rethrown — a failed write leaves exactly the pre-call state.
@@ -274,33 +283,33 @@ unchanged — agy still runs its own tool loop; the gateway remains a mirror.
 - **Client-boundary token scrub**: terminal failure text crossed to clients unscrubbed; new narrow `scrubTokenMaterial()` (ya29.*/Bearer/anchored `4/` codes; URLs and prose untouched — redactLine() would destroy the validation_url feature passthrough) wired at the single funnel `EventMapper.emitFailure`.
 - **Dockerfile `AGY_CLI_VERSION` pinned to 1.1.22** (m1.md record), closing the charter L148 floating-tag violation; compose + .dockerignore added. The compose `image:` reference is env-interpolated (`AGY_PROXY_IMAGE`) and `docs/deploy.md` 路径 C covers a 1Panel 编排 deployment pulling from Docker Hub (primary registry, image pushed only on the explicit release command); no-reverse-proxy posture documented as loopback bind + SSH tunnel.
 
-### Deliberate deviations (M5)
+#### Deliberate deviations (M5)
 - **`hasClientMappedEvents()` counts step events only**, not result envelopes: the mapper emits chunks from a result only for finish-capable shapes, and the retry gate excludes those independently — a passive error envelope (`!ok`, empty response) maps to zero chunks, so the plan's "任一 step/result 事件" shorthand is implemented to its stated intent (客户端可见输出) rather than its letter.
 - **Retry re-selection keeps the settled failure on an empty-pool miss** instead of raising secondhand POOL_EXHAUSTED: the first attempt's outcome is the client-visible truth; pool emptiness mid-retry is only reachable via operator action, not retryable failures.
 - charter "中途重放 M5 复议" (§6) **decided: maintain the M3 decision** — the new engine-level retry is orthogonal (nothing-on-the-wire failures only) and does not reintroduce transparent replay; documented in charter §6.
 
-## [Unreleased] (M4 管理 WebUI)
+### M4 管理 WebUI
 
-### Added
+#### Added
 - **WebUI (`web/`, React 19 + Vite 8 + Tailwind v4 + TanStack Router/Query + react-i18next)**: six pages (charter §9) riding the admin JSON + SSE surface — login; dashboard (today's stats + live run feed + recent errors); accounts (dual 5h/weekly quota bars with reset countdowns, live cooldown countdowns + reasons, health badges incl. `VALIDATION_REQUIRED` + `validation_url` surfacing, paste-URL login with same-origin QR, enable/disable/proxy/clear-cooldown/refresh); API keys (create-once plaintext dialog gated by an "I saved it" checkbox, quota edits, disable/delete); usage log (filters + 50-row pages + status chips + client-side CSV export of the filtered rows); settings (effective vs in-file values, env-locked lock hints, `permissionMode=skip` behind a consequence dialog + typed SKIP confirmation per charter §10, with an app-wide warning banner in the shell). zh-CN default with EN switch (persisted, navigator detection), light/dark/system theme (pre-paint, no FOUC), 375px-responsive layouts. i18n discipline is mechanically enforced: zh/en key-set identity is tested, and all CJK lives in `.ts` resource files (acceptance greps only `*.tsx`).
 - **Admin event bus + `GET /admin/events`** (src/server/events.ts): the server had no push surface. Monotonic seq `id:`-stamped SSE events (`snapshot`/`run`/`pool`), a 200-event ring for `Last-Event-ID` reconnect replay with snapshot XOR replay semantics (never both — no gap merging, no duplicate rows), trailing-edge 250ms-debounced pool snapshots via the new pool `onChange` hook, and `run` events carrying exactly the usage-ledger fields from the same `onRun` hook. SseWriter gained optional `id` framing; hijacked streams register explicit end callbacks because `app.close()` does not close hijacked connections.
 - **Settings write path** (src/server/settings.ts): `GET/PUT /admin/settings` — a 9-key allowlist (defaultModel, defaultEffort, timeoutMs, maxConcurrent, maxQueueDepth, permissionMode, enabled, autoFallbackModel, quotaPollIntervalMs) written atomically (tmp+rename) to `runtime-overrides.json`, clamps mirroring resolveConfig's env rules line-for-line, hand-edited keys preserved, `apiKey`/`adminPassword` and boot-critical keys excluded. Env-owned keys are reported per-key (`envLocked`) rather than rejected: the file stores the requested value so it becomes effective the day the variable is removed.
 - **Static WebUI hosting** (src/server/static.ts, @fastify/static ^8 — charter §8 amendment): `wildcard:false` per-file routes can never shadow the /v1, /admin, /healthz literals; the SPA fallback rides in front of the single not-found handler for dot-free GET non-API paths; every cache-control decision is owned (`cacheControl:false` — send()'s default `public, max-age=0` would have overridden setHeaders), hashed assets immutable 1y, index `no-cache`. No built frontend → JSON-only no-op with one info log; a broken `AGY_PROXY_WEB_DIST` can never take the server down.
 - **CI/CD**: root `build` chains `tsdown && npm --prefix web run build` (development.md §3 semantics); CI installs web deps, runs the web vitest suites and a `web/src` console.log fence (G4 parity); Dockerfile gained a web build stage finally feeding the `COPY web/dist` line it always had.
 
-### Fixed
+#### Fixed
 - **Unsupported content-type → 415** (closes the m3 drill finding): `FST_ERR_CTP_*` fell into the 500 branch; now a first-class 415 with per-surface bodies (admin `{ok:false}`, dual-protocol OpenAI/Anthropic) and the offending content-type named in the message (Fastify's own CTP message does not).
 - CI push trigger corrected `main` → `master` — the default branch had never run push CI (pre-existing mismatch).
 
-### Deliberate deviations (M4)
+#### Deliberate deviations (M4)
 - **No error-text column in the usage page**: ledger schema v1 has none; the page shows status codes (chip per code) and the raw text stays in gateway logs. `errorText` is a schema-v2/M5 candidate. This deviates from charter §9 page-5 wording and is recorded here instead of faking a field. *(Landed in M5: schema v2 `error_text` + usage-page detail row + CSV column.)*
 - **TanStack Virtual not introduced** (charter §9 principle): the log table is server-paginated ≤500 rows where virtualization costs a11y and bundle for no gain; charter §8 WebUI row annotated. Revisit if M5 adds an unbounded live log.
 - **Per-key model whitelist (scopes)**: enforcement deliberately deferred to M5 (user decision); the keys UI shows a read-only "planned M5" badge instead of a dead edit form. *(Landed in M5: engine pre-spawn enforcement via `getScopes` + keys-page scopes editor.)*
 - Dashboard "success rate" derives from two from-midnight ledger queries (all vs `status=OK`) because the day summary carries no status split.
 
-## [Unreleased] (M3 池与记账)
+### M3 池与记账
 
-### Added
+#### Added
 - **SQLite storage** (src/server/db.ts, commit a05a56d): `openDb()` — WAL + `synchronous=FULL` + `busy_timeout=5000` + `foreign_keys=ON`, `user_version`-gated idempotent schema v1 (`api_keys`, `usage` with `request_id UNIQUE`, `admin_sessions`, `admin_settings`), `checkpointAndClose()` (`wal_checkpoint(TRUNCATE)` + close). Charter §6 崩溃恢复 row: WAL+FULL survives SIGKILL with at most the last 1s ledger buffer lost (≤ ±1 request, MA5 tolerance).
 - **Key management** (src/server/key-store.ts, commit 9d9b56d): `KeyStore` — plaintext format `sk-agy-` + 24B base64url, returned **exactly once** at creation; the DB stores a sha256 hex hash (UNIQUE) plus an 8-char prefix for display (LiteLLM pattern; high-entropy keys need no slow hash). `verify()` verdicts ok/unknown/disabled; day-token budgets and RPM limits per key; `touch()` best-effort last-used refresh.
 - **Usage ledger** (src/server/usage-ledger.ts, commit 85781fa): `UsageLedger` — record() is an O(1) in-memory push (never blocks the stream); 1s unref'd flush timer, 500-row opportunistic flush, transaction-batched `INSERT OR IGNORE` for **request-id idempotent replay**; `tokensUsedToday(keyId)` sums since local midnight (day-budget enforcement); `summarizeToday()`/`query()` (limit ≤ 500); `close()` = flush → checkpoint → close, post-close record() is a one-warn no-op.
@@ -317,19 +326,19 @@ unchanged — agy still runs its own tool loop; the gateway remains a mirror.
 - **fake-agy**: `rate-limit` mode (stderr `429 RESOURCE_EXHAUSTED … Resets in 21m25s` + ERROR envelope, exit 1), `validation` mode (403 VALIDATION_REQUIRED + Google challenge URL), `FAKE_AGY_FAIL_HOME` (fails only the account whose isolated HOME matches — enables switch drills).
 - **Tests**: 292 total (was 249, +43): db/key-store/usage-ledger unit suites, auth-keys MA4/MA5 dual-protocol matrix (root key unchanged, disabled 403, RPM 429, day-budget 429, cross-key isolation), admin-api 12-case suite (guards/CSRF/CIDR/keys/auth-flow/QR), pool-gateway drills (DoD ③ 429-switch + exhaustion 429, DoD ④ 403 validation_url + quarantine).
 
-### Changed
+#### Changed
 - `GatewayHttpError` carries optional `headers`; the app error handler forwards them (Retry-After now actually reaches clients).
 - `tsdown.config.ts`: `better-sqlite3` / `@node-rs/argon2` externalized (native modules never inlined).
 - `installShutdown` accepts `teardown?` — runs after `app.close()`, before exit; errors still exit 1.
 
-### Deliberate semantics (M3)
+#### Deliberate semantics (M3)
 - The root env key has no day budget and no RPM limit by design (bootstrap key).
 - A crash loses at most the last ~1s of ledger buffer (bounded by MA5 tolerance); WAL+FULL recovers everything else.
 - Key plaintext exists only in the POST /admin/keys response body; the string `sk-agy-` never appears in logs (G4-checked) or in the DB.
 
-## [Unreleased] (M2 双协议完整)
+### M2 双协议完整
 
-### Added
+#### Added
 - **Streaming SSE on both protocols**: `POST /v1/chat/completions` and `POST /v1/messages` with `stream: true` (`reply.hijack` + raw writes). OpenAI leg: first frame `delta:{role,content:""}`, `delta.reasoning_content` for thinking (industry-convention field, documented as non-official), tool_calls on block-end, `finish_reason` frame, usage-only trailing frame with `stream_options.include_usage`, `[DONE]` sentinel. Anthropic leg: `message_start` → `content_block_start/delta/stop` (thinking/text/tool_use with `input_json_delta`) → `message_delta` (stop_reason + `usage.output_tokens_details.thinking_tokens`) → `message_stop`. Terminal errors surface as in-stream error payloads per protocol.
 - **`SseWriter`** (src/server/sse.ts): backpressure-aware raw writes, heartbeat comments (`: ping` OpenAI style / `ping` event Anthropic style) gated on `cfg.sseHeartbeatMs` (default 60s, `AGY_PROXY_SSE_HEARTBEAT_MS` env, 0 = off; heartbeats only fire when no real event has been written for the interval), and immediate engine abort on client disconnect (charter gap-g closure).
 - **Anthropic Messages endpoint** (POST /v1/messages): system string/array equivalence, all content-block kinds (text/image data:/base64/thinking/redacted_thinking/tool_use/tool_result), `max_tokens` required (400 otherwise), `thinking` budget tiers (≤4096→low / ≤16384→medium / >16384→high), `stop_sequences` gateway-side cut with `stop_sequence` echo + `stop_reason:'stop_sequence'`, `output_config.format`/`response_format` json_schema equivalence with the OpenAI leg, `x-api-key` accepted alongside Bearer. Anthropic usage mapping: disjoint input/output, `cache_read_input_tokens`, gateway extension `output_tokens_details.thinking_tokens`. No `signature_delta` is ever emitted (agy provides no signatures; inbound signatures are not validated — AN4 tamper leg N/A, documented in charter §4.3).
@@ -340,7 +349,7 @@ unchanged — agy still runs its own tool loop; the gateway remains a mirror.
 - **Model pre-validation** (OA8): with a DISCOVERED catalog, unknown model ids → 404 `model_not_found` with the available list; the fallback catalog stays advisory (dual behavior documented in README).
 - **Golden cases**: `test/golden/` directory-driven runner generalized to all three surfaces (openai/anthropic/models) with field-walk diffs, raw-text sentinels (`__ID__`/`__AGYTC__`/`__UUID__`, created→0 on chat only, MODEL_CREATED literal on listings), `_status`/`_provenance` keys, per-case `case.json` (apiKey/fakeAgyExitCode/discoveredModels). 26 cases: oa1–oa10 (OpenAI), an1–an10 (Anthropic), ma1–ma3 (models), each with PROVENANCE.md citing acceptance §2 sources.
 
-### Changed
+#### Changed
 - `AGY_NOT_INSTALLED` → 503 is now routed through the same error table as every other engine code (no behavior change; table documented in errors.ts).
 - Auth hook renders per-protocol 401 bodies: `{error:{...}}` on OpenAI paths, `{type:'error',error:{...}}` on Anthropic paths.
 - fake-agy gained `FAKE_AGY_EXIT_CODE` (replay exit semantics) and `slow` mode (delayed events for heartbeat tests).
@@ -348,6 +357,22 @@ unchanged — agy still runs its own tool loop; the gateway remains a mirror.
 
 ### Removed
 - M1 restrictions lifted: `stream:true` and `tools` no longer 400 on OpenAI; images no longer 400 on either protocol (data:/base64).
+
+### 发布与部署
+
+- **docker-release workflow** (`.github/workflows/docker-release.yml`): manual
+  `workflow_dispatch` (version input) builds the image on ubuntu-latest via
+  buildx and pushes `docker.io/sakiko15/agy-proxy:<version>` + `:latest`
+  (linux/amd64, GHA layer cache; Docker Hub credentials via the
+  `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` secrets).
+- **Self-contained image build** (`Dockerfile`): a new `build` stage compiles
+  the gateway bundle (tsdown) inside the image, so `docker build .` no longer
+  requires a prebuilt `dist/` on the build host — Node 24 + `npm run build`
+  locally are no longer prerequisites.
+- **compose default image** (`docker-compose.yml`): `image` now defaults to
+  `docker.io/sakiko15/agy-proxy:0.2.0` (still overridable via `AGY_PROXY_IMAGE`
+  in `.env`), and the file is trimmed to the 23-line core config — the tutorial
+  guidance lives in docs/deploy.md.
 
 ## [0.1.0] - 2026-08-30 (M1 引擎移植 + M1 收尾)
 

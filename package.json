@@ -1,6 +1,6 @@
 {
   "name": "agy-proxy",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Self-hosted LLM gateway: Google Antigravity (official agy CLI) upstream, OpenAI Chat Completions + Anthropic Messages compatible endpoints, per-key quotas, management WebUI.",
   "type": "module",
   "license": "MIT",
