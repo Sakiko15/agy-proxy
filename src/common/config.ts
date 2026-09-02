@@ -6,7 +6,7 @@
 // The overrides file backs admin-UI hot changes and survives restarts; env is
 // read per call so a changed process environment is honored without reload.
 import { defaultConfig, type GatewayConfig, type PermissionMode } from './types.ts'
-import { readFileSync, existsSync } from 'node:fs'
+import { readFileSync, existsSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -25,18 +25,55 @@ export function overridesPath(): string {
   return join(stateDir(), 'runtime-overrides.json')
 }
 
-function readJson(file: string): Record<string, unknown> {
-  try {
-    if (!existsSync(file)) return {}
-    const v = JSON.parse(readFileSync(file, 'utf8'))
-    return v && typeof v === 'object' ? (v as Record<string, unknown>) : {}
-  } catch {
-    return {}
-  }
+/**
+ * B-M3: memoized overrides read keyed on path + mtimeMs + size. The host's
+ * getConfig thunk resolves the config on every request (semaphore sizing,
+ * model scoping, limits — several times per request), and each of those calls
+ * used to pay a full existsSync + readFileSync + JSON.parse on the overrides
+ * file. The cache trades that for a single statSync when the file is
+ * unchanged. Semantics preserved:
+ *  - env stays read-per-call (separate layer, untouched);
+ *  - a changed file (any stat delta) is re-read immediately — admin UI hot
+ *    changes and hand edits keep taking effect without a restart;
+ *  - missing files are NOT cached (no negative cache) so a hand-created
+ *    overrides file is picked up on the next read;
+ *  - corrupt files are not cached either — tolerance keeps returning {} and
+ *    a repaired file is picked up at once.
+ * The one hole — a rewrite that lands inside the same mtime tick AND at the
+ * same byte size — is covered on the writer side: writeOverridesPatch()
+ * calls invalidateOverridesCache() after its rename.
+ */
+let overridesCache: { file: string; mtimeMs: number; size: number; data: OverridesFile } | null = null
+
+export function invalidateOverridesCache(): void {
+  overridesCache = null
 }
 
-export function readOverrides(file = overridesPath()): OverridesFile {
-  return readJson(file)
+export function readOverrides(file: string = overridesPath()): OverridesFile {
+  let st: { mtimeMs: number; size: number } | null = null
+  try {
+    const s = statSync(file)
+    st = { mtimeMs: s.mtimeMs, size: s.size }
+  } catch {
+    overridesCache = null // ENOENT etc. — also drop any stale entry
+  }
+  const cached = overridesCache
+  if (st !== null && cached !== null && cached.file === file && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+    // Shallow copy: callers get a fresh top-level object per call, as before
+    // (values are scalars — the overrides format is flat).
+    return { ...cached.data }
+  }
+  let data: OverridesFile = {}
+  try {
+    if (existsSync(file)) {
+      const v = JSON.parse(readFileSync(file, 'utf8'))
+      if (v && typeof v === 'object') data = v as Record<string, unknown>
+    }
+  } catch {
+    return {} // corrupt/unreadable — tolerated, never cached
+  }
+  if (st !== null) overridesCache = { file, mtimeMs: st.mtimeMs, size: st.size, data }
+  return data
 }
 
 function asString(v: unknown): string | undefined {
@@ -68,11 +105,10 @@ function asMode(v: unknown): PermissionMode | undefined {
 /**
  * Layered config read. NOTE (perf): the default `overrides` parameter does a
  * SYNCHRONOUS disk read (readOverrides()) on every call, and the host's
- * getConfig thunk (index.ts) calls this uncached — so every request pays a
- * small stat+read on the overrides file. Accepted: the file is tiny, it is
- * what makes runtime-overrides.json take effect without a restart, and
- * spawn/argon2/etc. dwarf it on request latency; revisit only if profiling
- * ever disagrees.
+ * getConfig thunk (index.ts) calls this uncached — so every request used to
+ * pay a small stat+read on the overrides file. B-M3 replaces that with the
+ * mtime+size memo in readOverrides(): the no-restart semantics are untouched,
+ * the per-request cost is one statSync on a hit.
  */
 export function resolveConfig(
   env: NodeJS.ProcessEnv = process.env,

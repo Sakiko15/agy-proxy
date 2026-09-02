@@ -546,7 +546,12 @@ export class AccountPoolManager {
 
     if (!this.data.activeAccountIds) this.data.activeAccountIds = {}
     this.data.activeAccountIds[family] = nextAccount.id
-    this.persist()
+    // A-H2: the cursor advance is the per-request hot path — every request
+    // that skips a busy/drained account used to rewrite the whole pool.json
+    // synchronously (pretty-JSON, quota models included). It rides the same
+    // debounce as recordSuccess/recordFailure; a crash between advance and
+    // flush only re-picks the first healthy candidate.
+    this.persistSoon()
     return nextAccount
   }
 

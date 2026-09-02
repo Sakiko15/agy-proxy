@@ -59,6 +59,16 @@ export class RunRecording {
    */
   requestAbort: (() => void) | null = null
 
+  /**
+   * A-M4 lifecycle hint (engine-owned): true while a future span may still
+   * resume this recording from a mirror-tool cursor — i.e. the last span the
+   * client watched cut on a completed tool step. The engine forgets settled
+   * recordings whose flag is false, instead of holding them until the
+   * registry's fixed capacity evicts them (which, under >capacity concurrent
+   * runs, evicts an in-progress recording and 404s its continuation).
+   */
+  keepForContinuation = false
+
   constructor(runId: string = randomUUID()) {
     this.runId = runId
   }
@@ -249,6 +259,17 @@ const MAX_RETAINED_RUNS = 8
 /** Bounded registry keeping the most recent runs for continuation spans. */
 export class RunRegistry {
   private readonly runs = new Map<string, RunRecording>()
+  private readonly capacity: number
+
+  /**
+   * `capacity` (A-M4): how many recordings to retain. Callers size it from
+   * the real concurrency ceiling (maxConcurrent + headroom); the historical
+   * fixed 8 could evict an in-progress run's recording when more runs than
+   * the cap were live, breaking that run's mirror-tool continuation.
+   */
+  constructor(capacity: number = MAX_RETAINED_RUNS) {
+    this.capacity = Math.max(1, Math.floor(capacity))
+  }
 
   create(): RunRecording {
     const rec = new RunRecording()
@@ -258,7 +279,7 @@ export class RunRegistry {
 
   remember(rec: RunRecording): void {
     this.runs.set(rec.runId, rec)
-    while (this.runs.size > MAX_RETAINED_RUNS) {
+    while (this.runs.size > this.capacity) {
       const oldest = this.runs.keys().next().value
       if (oldest === undefined) break
       this.runs.delete(oldest)

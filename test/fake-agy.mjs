@@ -24,6 +24,11 @@
 //   auth          — stderr sign-in notice + auth URL
 //   hang          — emits nothing, keeps running until killed (watchdog /
 //                   process-tree kill verification)
+//   hang-sigterm  — like hang, but SIGTERM is IGNORED (process.on handler):
+//                   on POSIX only a SIGKILL can end it (the runner's kill
+//                   escalation ladder must fire); on win32 taskkill /F is
+//                   already fatal, so the same drill passes on both platforms
+//                   without a skip
 //   slow          — init, then FAKE_AGY_SILENCE_MS of pure silence, then a
 //                   short text + result (SSE heartbeat verification)
 //   kill-early    — SIGKILLs itself BEFORE any output (the engine-level
@@ -107,6 +112,16 @@ const conv = argv.includes('--conversation')
 if (mode === 'hang') {
   // Never prints, never exits: exercised by the watchdog and abort-kill
   // tests (process-tree kill must end this process).
+  setInterval(() => {}, 1000)
+  await new Promise(() => {})
+}
+
+if (mode === 'hang-sigterm') {
+  // A-H1 escalation drill: a hung tree that IGNORES SIGTERM. On POSIX only a
+  // group/child SIGKILL can end it (the runner's escalation ladder must
+  // land); on win32 taskkill /F kills it outright (TerminateProcess ignores
+  // handlers), so the same test passes everywhere without a skip.
+  process.on('SIGTERM', () => {})
   setInterval(() => {}, 1000)
   await new Promise(() => {})
 }

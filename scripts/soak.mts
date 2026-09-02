@@ -16,6 +16,7 @@ import { spawn, execSync, type ChildProcess } from 'node:child_process'
 import { mkdirSync, mkdtempSync, writeFileSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { writeFakeBin } from './fake-bin.mts'
 
 const REPO = resolve(import.meta.dirname, '..')
 const MINUTES = Math.max(1, Number(process.env.SOAK_MINUTES ?? 60))
@@ -55,7 +56,7 @@ function judge(phase: string, check: string, ok: boolean, detail: string): void 
 
 function sanitizePath(binDir: string): string {
   // resolveAgyBin prefers a real agy.exe on PATH — keep only what the fake
-  // shim needs: System32 + the node dir (the .cmd shim runs `@node`).
+  // binary needs: System32 + the node dir (the launcher re-execs node).
   return process.platform === 'win32'
     ? `C:\\Windows\\System32;${join(NODE, '..')};${binDir}`
     : `/usr/bin:/bin:${join(NODE, '..')}:${binDir}`
@@ -69,8 +70,7 @@ function bootServer(name: string, opts: { port: number; dataDir: string; rateLim
   const modeFile = join(dir, 'fake-mode')
   const argsFile = join(dir, 'args.jsonl')
   writeFileSync(modeFile, 'ok\n')
-  if (process.platform === 'win32') writeFileSync(join(binDir, 'agy.cmd'), `@node "${FAKE}" %*\r\n`)
-  else writeFileSync(join(binDir, 'agy'), `#!/bin/sh\nexec "${NODE}" "${FAKE}" "$@"\n`, { mode: 0o755 })
+  const fakeBin = writeFakeBin(binDir, NODE, FAKE)
 
   const child = spawn(NODE, [join(REPO, 'dist', 'index.js')], {
     env: {
@@ -78,7 +78,9 @@ function bootServer(name: string, opts: { port: number; dataDir: string; rateLim
       AGY_PROXY_DATA_DIR: opts.dataDir,
       AGY_PROXY_PORT: String(opts.port ?? 0),
       AGY_PROXY_HOST: '127.0.0.1',
-      AGY_PROXY_BIN: join(binDir, process.platform === 'win32' ? 'agy.cmd' : 'agy'),
+      AGY_PROXY_BIN: fakeBin,
+      AGY_FAKE_NODE: NODE,
+      AGY_FAKE_SCRIPT: FAKE,
       AGY_PROXY_MODE: 'plan',
       AGY_PROXY_WEB_DIST: 'none',
       AGY_PROXY_DEBUG_METRICS_MS: '500',

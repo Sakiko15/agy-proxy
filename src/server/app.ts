@@ -158,6 +158,13 @@ export function buildServer(deps: ServerDeps): BuiltServer {
     loggerInstance: deps.log,
     bodyLimit: 32 * 1024 * 1024,
     genReqId: () => randomUUID(),
+    // B-L1: Fastify 5 leaves requestTimeout at 0, disabling Node's default
+    // 300s request-receive timeout — a slow-body dribbler could hold a socket
+    // forever. This only covers receiving the request (headers+body before
+    // the handler); hijacked streaming responses are unaffected. The
+    // connectionTimeout stays unset deliberately: it would kill silent
+    // thinking pauses on established streams.
+    requestTimeout: 300_000,
     ...(trusted.size > 0 ? { trustProxy: (addr: string) => trusted.has(addr) } : {}),
   })
 
@@ -559,7 +566,7 @@ async function streamAnthropicMessages(args: {
       message = 'Internal server error: ' + redactLine(err.message)
     }
     request.log.error({ finishKind: 'error' }, 'stream failed')
-    if (!sse['closed']) {
+    if (!sse.isClosed()) {
       await sse.event('error', { type: 'error', error: { type, message } })
     }
   } finally {
@@ -671,7 +678,7 @@ async function streamOpenAiChat(args: {
       message = 'Internal server error: ' + redactLine(err.message)
     }
     request.log.error({ code, finishKind: 'error' }, 'stream failed')
-    if (!sse['closed']) {
+    if (!sse.isClosed()) {
       await sse.data(openAiError(message, type, code))
       await sse.data('[DONE]')
     }

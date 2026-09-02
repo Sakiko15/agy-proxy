@@ -91,6 +91,9 @@ export class UsageLedger {
   private readonly log?: (msg: string) => void
   private readonly now: () => number
   private readonly insertStmt: BetterSqlite3.Statement
+  /** B-M2: tokensUsedToday rides every authenticated request (daily budget
+   *  check) — prepare-once instead of per-call sqlite_stmt churn. */
+  private readonly tokensTodayStmt: BetterSqlite3.Statement
   /** Warn once about post-close record() calls (straggler run callbacks). */
   private warnedClosed = false
   /** Timestamp of the last flush-failure warning (throttle state). */
@@ -120,6 +123,9 @@ export class UsageLedger {
          @promptTokens, @completionTokens, @reasoningTokens, @cacheReadTokens,
          @totalTokens, @status, @durationMs, @errorText, @createdAt)
     `)
+    this.tokensTodayStmt = db.prepare(
+      'SELECT COALESCE(SUM(total_tokens), 0) AS s FROM usage WHERE key_id = ? AND created_at >= ?',
+    )
     this.armTimer()
   }
 
@@ -189,9 +195,7 @@ export class UsageLedger {
   /** SUM(total_tokens) for one key since LOCAL midnight (MA5 daily budget). */
   tokensUsedToday(keyId: string): number {
     const midnight = startOfToday(this.now)
-    const row = this.db
-      .prepare('SELECT COALESCE(SUM(total_tokens), 0) AS s FROM usage WHERE key_id = ? AND created_at >= ?')
-      .get(keyId, midnight) as { s: number }
+    const row = this.tokensTodayStmt.get(keyId, midnight) as { s: number }
     return row.s
   }
 

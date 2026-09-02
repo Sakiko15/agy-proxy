@@ -81,6 +81,29 @@ describe('mapMessagesRequest', () => {
     await mapThrows({ ...BASE, max_tokens: 'many' }, /positive integer/)
   })
 
+  it('B-M5: staging blanks the body image payload but keeps the bytes + estimate', async () => {
+    // 1x1 PNG, base64 — big enough to survive a 'malformed' rejection.
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+    const body = {
+      ...BASE,
+      messages: [
+        { role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: png } }] },
+      ],
+    }
+    const before = estimateInputTokens(body)
+    const { meta } = await map(body)
+    // The bytes landed in staging exactly once…
+    const staged = meta.imageBytes.get('img-1')
+    expect(staged?.length).toBeGreaterThan(0)
+    // …and the body no longer carries the payload (it used to ride the
+    // fastify body + stream closures until the response ended).
+    const msg = (body.messages as Array<{ content: Array<{ source?: { data?: string } }> }>)[0]
+    expect(msg?.content[0]?.source?.data).toBe('')
+    // The body's only later reader (estimateInputTokens) counts images flat —
+    // value unchanged by the blanking.
+    expect(estimateInputTokens(body)).toBe(before)
+  })
+
   it('rejects a whitespace-only model instead of falling back silently', async () => {
     await mapThrows({ ...BASE, model: ' ' }, /non-empty/)
     // Non-string models keep their own error; unset falls back to default.

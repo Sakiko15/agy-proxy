@@ -14,6 +14,7 @@ import { AgyEngine, computeRetryDelayMs, RETRY_POLICY, type EngineCall, type Eng
 import { ModelCatalog } from '../src/host/models.ts'
 import { SessionStore } from '../src/host/sessions.ts'
 import { RunRegistry } from '../src/host/recording.ts'
+import { createBinCache } from '../src/host/runner.ts'
 import { AccountPoolManager } from '../src/host/pool.ts'
 import type { StreamChunk } from '../src/host/stream-types.ts'
 import { defaultConfig, Err, type GatewayConfig } from '../src/common/types.ts'
@@ -204,11 +205,17 @@ describe('engine-level single retry', () => {
   it('a spawn failure inside the loop is retried like any PROCESS_EXIT (deps.bin re-read)', async () => {
     const h = mk()
     let binTarget = '/nonexistent/agy-binary-respawn'
+    // A-M1: the wiring-level cache must let go on failure — if the engine
+    // forgets to invalidate, the retry re-reads the stale memo and the
+    // rescue dies with it. The cache (not a naked closure) is what
+    // production wires, so the test drives exactly that path.
+    const binCache = createBinCache(() => binTarget)
     const engine = new AgyEngine({
       getConfig: () => ({ ...defaultConfig(), permissionMode: 'plan', timeoutMs: 5_000 }),
       catalog: new ModelCatalog(async () => { throw new Error('x') }, defaultConfig().fallbackModels, 300_000),
       store: new SessionStore(join(h.dir, 'sessions-respawn.json')),
-      bin: () => binTarget,
+      bin: () => binCache.resolve(),
+      invalidateBin: binCache.invalidate,
       binArgs: [fakeScript],
       acquire: () => Promise.resolve(() => {}),
       runs: new RunRegistry(),

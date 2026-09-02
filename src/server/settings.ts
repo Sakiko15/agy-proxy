@@ -15,6 +15,7 @@
 import { mkdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import {
+  invalidateOverridesCache,
   overridesPath,
   readOverrides,
   resolveConfig,
@@ -188,6 +189,10 @@ export function writeOverridesPatch(patch: OverridesFile, file: string = overrid
   try {
     writeFileSync(tmp, JSON.stringify(merged, null, 2) + '\n')
     renameSync(tmp, file)
+    // B-M3: the rename can land inside the readOverrides cache's mtime tick
+    // (and a same-size rewrite is legal) — drop the memo so the next config
+    // read sees this write immediately instead of relying on stat churn.
+    invalidateOverridesCache()
   } catch (err) {
     // A failed write/rename must not strand the .tmp residue next to the real
     // overrides file (M5 hardening); drop it best-effort and rethrow — the

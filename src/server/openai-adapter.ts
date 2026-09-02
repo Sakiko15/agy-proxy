@@ -147,12 +147,10 @@ function decodeDataImageUrl(url: string, imageBytes: Map<string, Uint8Array>): E
     throw bad(`unsupported image media type '${mime}' — supported: image/png, image/jpeg, image/webp, image/gif`)
   }
   if (!meta.includes('base64')) throw bad('image_url data: URL must be base64-encoded')
-  let bytes: Uint8Array
-  try {
-    bytes = new Uint8Array(Buffer.from(payload, 'base64'))
-  } catch {
-    throw bad('image_url base64 payload is malformed')
-  }
+  // B-M5: Buffer IS a Uint8Array — no second full copy of the staged image.
+  // Buffer.from cannot throw on a validated string (invalid base64 chars are
+  // skipped); an empty decode is the only malformed case left.
+  const bytes = Buffer.from(payload, 'base64')
   if (bytes.length === 0) throw bad('image_url base64 payload is empty')
   const name = 'img-' + String(imageBytes.size + 1)
   imageBytes.set(name, bytes)
@@ -189,6 +187,32 @@ async function contentToTextAndImages(
     return { text: parts.join(''), images }
   }
   throw bad('user content must be a string or an array of content parts')
+}
+
+/**
+ * B-M5: after mapping, the staged bytes live in meta.imageBytes — but the
+ * request body kept holding every data:-URL payload (multi-MB each) until the
+ * response finished (fastify's body reference + the streaming closures keep
+ * it reachable). Blank the payloads here (the map already consumed them);
+ * the OpenAI leg has no body-reading token estimate, and nothing else reads
+ * the images after mapping.
+ */
+function releaseBodyImageData(b: Record<string, unknown>): void {
+  if (!Array.isArray(b.messages)) return
+  for (const m of b.messages) {
+    if (m === null || typeof m !== 'object') continue
+    const content = (m as { content?: unknown }).content
+    if (!Array.isArray(content)) continue
+    for (const part of content) {
+      if (part === null || typeof part !== 'object') continue
+      const p = part as { type?: unknown; image_url?: unknown }
+      if (p.type !== 'image_url') continue
+      const iu = p.image_url
+      if (iu !== null && typeof iu === 'object') {
+        ;(iu as { url?: unknown }).url = ''
+      }
+    }
+  }
 }
 
 /** Map one OpenAI request body onto an EngineCall (throws 400s). */
@@ -270,6 +294,10 @@ export async function mapChatRequest(
     if (role === 'function') throw bad('the legacy function role is not supported — use tools in M2')
     throw bad('unsupported message role: ' + String(role))
   }
+
+  // B-M5: drop the base64 payloads from the request body now that the staged
+  // bytes are in meta.imageBytes (see releaseBodyImageData).
+  releaseBodyImageData(b)
 
   // Client tool definitions are ACCEPTED BUT IGNORED (M2 decision, charter
   // §4.2): agy runs its own tool loop and the gateway mirrors that activity

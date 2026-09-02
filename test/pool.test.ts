@@ -309,3 +309,29 @@ describe('pool: AccountPoolManager', () => {
     expect(existsSync(freshLog)).toBe(true)
   })
 })
+
+describe('pool: selectAccount persist policy (A-H2)', () => {
+  it('cursor advance is debounced to flush(), not a per-call sync write', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-pool-ah2-'))
+    const pool = new AccountPoolManager(dir)
+    const accA = pool.createAccountSlot('Account A')
+    const accB = pool.createAccountSlot('Account B')
+    // Settle the topology writes; baseline the on-disk state.
+    pool.flush()
+    const before = readFileSync(join(dir, 'pool.json'), 'utf8')
+
+    // Busy filter forces a cursor advance (A is in flight) — the hot
+    // scheduling path that used to rewrite the whole pool.json synchronously
+    // on every request.
+    const next = pool.selectAccount('google', new Set([accA.id]))
+    expect(next?.id).toBe(accB.id)
+    // The advance stays in memory: pool.json is not rewritten synchronously.
+    expect(readFileSync(join(dir, 'pool.json'), 'utf8')).toBe(before)
+    // flush() (shutdown path) lands it.
+    pool.flush()
+    const persisted = JSON.parse(readFileSync(join(dir, 'pool.json'), 'utf8')) as {
+      activeAccountIds?: Record<string, string>
+    }
+    expect(persisted.activeAccountIds?.google).toBe(accB.id)
+  })
+})

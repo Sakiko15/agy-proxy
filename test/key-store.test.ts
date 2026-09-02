@@ -111,3 +111,34 @@ describe('KeyStore lifecycle', () => {
     checkpointAndClose(db)
   })
 })
+
+describe('KeyStore touch debounce (B-M2)', () => {
+  it('the first touch writes immediately; repeats inside the window only buffer', () => {
+    const { store } = mkStore()
+    const a = store.create({ name: 'deb' })
+    store.touch(a.id)
+    const first = store.get(a.id)?.lastUsedAt ?? null
+    expect(first).not.toBeNull()
+
+    // A repeat inside the 60s window must NOT fire the autocommit UPDATE.
+    store.touch(a.id) // a few ms later — same window
+    expect(store.get(a.id)?.lastUsedAt).toBe(first)
+
+    // The skipped refresh still lands at flushTouch (teardown contract) with
+    // the latest observed timestamp.
+    store.flushTouch()
+    expect(store.get(a.id)?.lastUsedAt).not.toBe(first)
+  })
+
+  it('remove() drops the touch bookkeeping so a later flush writes nothing stale', () => {
+    const { store, db } = mkStore()
+    const a = store.create({ name: 'gone' })
+    store.touch(a.id) // writes + starts the window
+    store.touch(a.id) // debounced → pending
+    expect(store.remove(a.id)).toBe(true)
+    store.flushTouch() // must be a silent no-op, not resurrect the row
+    const rows = (db.prepare('SELECT COUNT(*) AS n FROM api_keys').get() as { n: number }).n
+    expect(rows).toBe(0)
+    checkpointAndClose(db)
+  })
+})

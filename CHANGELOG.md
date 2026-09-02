@@ -2,6 +2,191 @@
 
 All notable changes to agy-proxy are documented here. Format based on Keep a Changelog; versions follow semver.
 
+## [Unreleased] (性能与稳定性 · 批次 4 — 流式内存管线)
+
+Streaming memory-pipeline reductions in the engine hot path and the protocol
+adapters. Zero wire changes — every event stream, golden and token estimate is
+byte-identical (pins: golden suites, mapper, engine-retry). Full gate green
+(check/build, 458 tests/47 files).
+
+### Changed
+- **Parsed events no longer carry the raw line object** (`src/common/types.ts`,
+  `src/host/parser.ts`, A-M3): every `init`/`step`/`result` event kept the full
+  parsed JSON in `raw` for no reader (the CANCELED empty-run case is detected on
+  the normalized surface — ok + empty response). Removing it drops the retained
+  JSON of up to 20k events × 8 runs per recording; the type-level removal is the
+  pin.
+- **Raw-chunk parser feed + bounded stdout excerpt** (`src/host/runner.ts` +
+  `src/host/engine.ts`, A-M5): the engine now hands agy's utf8-decoded stdout
+  chunks straight to the parser via the new `RunOptions.onChunk` seam — the old
+  `onLine` path split every chunk into lines, re-appended `\n`, and let the
+  parser split them apart again. With a chunk consumer the runner's stdout copy
+  is bounded to the head 4KB + tail 64KB the engine actually reads (auth-banner
+  sniffing); without one, `agy models` discovery and the `--version` probe still
+  capture the full stream. The `onLine` seam is unchanged for the other callers.
+- **recentLines diagnostics ring compacts in batches** (`src/host/parser.ts`,
+  A-L2): trimming to the 2000-line cap moved the whole array on every line;
+  a 512-line batch trim keeps the same chronological, truncated tail at
+  amortized O(1) per line.
+- **ChunkQueue drains by head index** (`src/host/engine.ts`, A-L1): the per-span
+  chunk queue used to `shift()` every chunk (O(n) on 20k-event runs); a
+  consumed-prefix cursor advances O(1) and compacts once per wake cycle.
+  Delivery order is unchanged.
+- **Image staging keeps one copy and releases the request body payloads**
+  (`src/server/anthropic-adapter.ts` + `src/server/openai-adapter.ts`, B-M5):
+  `Buffer.from(x,'base64')` is used directly (Buffer IS a Uint8Array — the
+  `new Uint8Array(...)` wrapper copied every staged image a second time), the
+  never-throwing base64 try/catch is gone (Node skips invalid base64 chars; the
+  empty decode check remains), and after mapping the adapters blank the
+  `data`/`image_url.url` payloads in the request body — previously the base64
+  strings rode fastify's body reference and the streaming closures until the
+  response ended. The body's only later reader, `estimateInputTokens`, counts
+  image blocks flat (1000), so the token estimate is unchanged
+  (test/anthropic-adapter.test.ts + test/openai-chat.test.ts pin the blanking,
+  the staged bytes and the estimate).
+
+## [Unreleased] (性能与稳定性 · 批次 3 — 热路径 CPU/IO)
+
+Hot-path cost reductions in the per-request server layer and account pool. Zero wire
+changes — estimateTokens stays byte-for-byte equivalent (differential fuzz), all other
+items are internal cost only. Full gate green (check/build, 456 tests/47 files,
+perf 8/8 legs).
+
+### Changed
+- **estimateTokens lookup-table rewrite** (`src/server/tokens.ts`, B-H2): the per-token
+  estimate walked every char through two regexes — measured 370ms for a 10MB prompt,
+  all on the event loop before the first streamed byte (and `count_tokens` had no
+  semaphore in front of it). A 64KB `Uint8Array` now classifies all 65536 BMP code
+  points once at module load (CJK / whitespace / other, U+3000 keeps its
+  CJK-before-space priority); the scan is a `charCodeAt` loop with surrogate-pair
+  handling that replicates the original `for..of` iteration semantics. Differential
+  tests (test/tokens.test.ts) pin exact equality against the original implementation
+  as an in-test oracle: hand-picked corpus (lone surrogates, astral emoji, U+F900,
+  full-width space, BOM), 18 boundary buckets and ~950 seeded fuzz rounds including
+  mid-pair splices. ~10-60× faster on large inputs, values identical.
+- **Account selection no longer syncs pool.json on every cursor advance**
+  (`src/host/pool.ts`, A-H2): `selectAccount` under a busy burst used to run a full
+  pretty-JSON `writeFileSync` per request (the file grows with per-account quota
+  models). Cursor advancement now stays in memory behind the existing debounced
+  `persistSoon`; crash loss is harmless (the cursor re-picks the first candidate).
+- **`resolveAgyBin` memoized** (`src/index.ts` wiring + `src/host/runner.ts`
+  `createBinCache`, A-M1): the per-spawn binary probe scanned every PATH dir
+  synchronously (blocking, proportional to PATH length). The cache memoizes it and
+  the engine invalidates after any failed attempt, so the retry-rescans-after-spawn-
+  failure seam is preserved (test/engine-retry.test.ts drives the real cache now).
+- **KeyStore prepare-once + `last_used_at` write debounce** (`src/server/key-store.ts`,
+  B-M2): verify/get rode every request and churned sqlite statements per call; the
+  `last_used_at` refresh was a full autocommit UPDATE (WAL fsync at
+  `synchronous=FULL`) per authenticated request. All statements are prepared in the
+  constructor and touches are debounced to one write per key per 60s window, with
+  skipped refreshes buffered (latest wins) and landed by `flushTouch()` at teardown
+  (wired in src/index.ts ahead of `ledger.close()`). `last_used_at` is admin-UI
+  display data — zero wire impact.
+- **UsageLedger `tokensUsedToday` prepared once** (`src/server/usage-ledger.ts`): it
+  rides every authenticated request (daily budget check) — same prepare-once pattern.
+- **runtime-overrides.json read memoized on mtime+size** (`src/common/config.ts`, B-M3):
+  the host's config thunk resolved the layered config several times per request, each
+  paying a full existsSync + readFileSync + JSON.parse. `readOverrides` now stats the
+  file once and re-reads only on stat change; no negative caching (a hand-created
+  file is still picked up), corrupt files are never cached, and
+  `writeOverridesPatch` calls the new exported `invalidateOverridesCache()` after its
+  rename so an admin write lands immediately even within the same mtime tick
+  (test/config-cache.test.ts pins cache hit, invalidate seam, writer seam and
+  missing/corrupt tolerance). No-restart semantics unchanged; env layer untouched.
+
+## [Unreleased] (性能与稳定性 · 批次 2 — 停机与 SSE 连接生命周期)
+
+Shutdown and SSE-connection lifecycle fixes. One deliberate behavior change (B-M1,
+argued below); otherwise zero wire changes. Full gate green (check/build, 444
+tests/45 files at batch end, shutdown-SSE suite 11/11); soak rerun after batch 3.
+
+### Fixed
+- **SIGTERM with a live `/admin/events` client no longer hangs shutdown**
+  (`src/server/shutdown.ts` + `src/index.ts`, B-H1): `app.close()` ran before
+  `bus.closeAll()`, but Fastify 5 never reaps hijacked SSE sockets — a connected
+  admin dashboard held the sequence open until docker's SIGKILL skipped the ledger
+  flush + WAL checkpoint. Shutdown now runs `preClose` (ends the admin streams)
+  before `app.close()`, and at grace expiry additionally calls
+  `server.closeAllConnections()`. The sequence is refactored into an awaitable
+  `runShutdownSequence` / `createShutdown` pair for tests (test/shutdown-sse.test.ts:
+  real listener + live SSE client completes in-widow, closeAllConnections fires,
+  teardown still lands).
+- **A second SIGTERM now force-exits** (`process.on` + re-entry latch, B-L2): the
+  second signal logs and `exit(1)`s instead of being swallowed by `process.once`.
+- **Stalled SSE clients no longer hold a gateway slot for ~15 minutes**
+  (`src/server/sse.ts`, B-M1): a zero-window/half-open client parked in the drain
+  wait tripped no timeout (Fastify clears request timers after hijack; heartbeats
+  wrote straight past the wait). `writeRaw` parks now arm a one-shot unref'd stall
+  watchdog at `max(3×heartbeatMs, 180s)` that destroys the socket; the existing raw
+  'close' settle then unlocks the waiter and the disconnect abort cascades the
+  semaphore slot free. Behavior change, argued: the only affected clients are those
+  that cannot read <180KB in 180s — indistinguishable from a dead connection; the
+  previous behavior was 3 stalled clients = whole-gateway 429.
+- **Fastify `requestTimeout: 300_000` restored** (`src/server/app.ts`, B-L1): Fastify 5
+  disables Node's default request-receive timeout; a slow-body dribbler could hold a
+  socket forever. Receiving only — long hijacked streams unaffected;
+  `connectionTimeout` is deliberately NOT set (it would kill quiet thinking pauses).
+- `SseWriter.isClosed()` exported (B-L3), replacing the two `sse['closed']` private
+  bracket accesses in src/server/app.ts.
+
+## [Unreleased] (性能与稳定性 · 批次 1 — 引擎防挂死)
+
+Anti-hang hardening across the agy process lifecycle (src/host). Zero wire changes —
+every protocol surface (golden SSE sequences, error bodies, stop/max_tokens semantics)
+is byte-identical; the full test suite (437/437, 44 files) and all 8 perf legs pass.
+
+### Added
+- **Kill escalation ladder** (`src/host/runner.ts`, A-H1): on POSIX, a process-group
+  `SIGTERM` that the agy tree ignores now escalates after `killGraceMs` (new
+  `RunOptions` field, default 5000ms) to a group `SIGKILL`, then a direct
+  `child.kill('SIGKILL')` after a second grace window — previously an unkillable
+  (stuck-uninterruptible or SIGTERM-ignoring) tree left `proc.outcome` pending
+  forever, deadlocking the account queue slot, the busy mark and the gateway
+  semaphore (3 hung trees = whole-gateway BUSY). Escalation timers are cleared in
+  `finish()`; the win32 path is unchanged (`taskkill /T /F` is already fatal).
+- **fake-agy `hang-sigterm` mode** (test/fake-agy.mjs): the stub installs an empty
+  `SIGTERM` handler and only dies on SIGKILL (win32: `taskkill /F` still terminates
+  it), so the ladder is exercised cross-platform with no `.skip`.
+- **`test/engine-kill-ladder.test.ts`** (5 tests): runner-level ladder timing and
+  platform-correct signal assertions; onLine consumer-bug containment; semaphore-gate
+  abort (pre-spawn: zero spawns, `inFlight` back to 0); account-queue abort (no
+  spawn for the queued-then-aborted stream, a later stream still runs); engine-level
+  hang → single retry → clean recovery with the TIMEOUT code confined to the ledger
+  failure text, never the client stream.
+
+### Changed
+- **Abort-before-spawn checks** (`src/host/engine.ts`, A-M2/A-L5): aborting a queued or
+  mid-flight call is now honored at every waiting point — the per-account queue task
+  head, right after semaphore acquire (immediate release + `ABORTED` settle), after the
+  spawn-interval sleep and after rate-limit waits. Shared `sleepUnref(ms, signal?)`
+  (always unref'd) replaces bare sleeps. Previously a saturated gateway would still
+  spawn a full agy run for an already-disconnected client, burning quota and queue
+  capacity.
+- **`onLine`/`onChunk` consumer guard** (`src/host/runner.ts`, A-L6): a throwing parser
+  or consumer callback no longer propagates as an uncaught exception through the
+  gateway process — the error is captured into the stderr tail for failure
+  classification and the process outcome settles normally.
+- **RunRegistry lifecycle** (`src/host/recording.ts` + `src/index.ts`, A-M4): runs that
+  can no longer be resumed by a mirror callback (settled with no tool-call cut) are now
+  `forget()`-ed at settle instead of being evicted silently; registry capacity is
+  configurable and sized `max(8, maxConcurrent + 2)` at wiring. Continuation-flag
+  semantics (`keepForContinuation`) pinned by tests.
+- **perf/soak fake binary** (`scripts/fake-bin.mts`, harness-only): the win32 fake
+  `agy.cmd` shim became unspawnable through no fault of the harness — the gateway
+  refuses cmd shims (S-H4: request-controlled argv) and Node's CVE-2024-27980
+  mitigation throws EINVAL on shell-less .cmd spawns. The harness now compiles a
+  10-line C# launcher (ships with every Windows install via the .NET Framework
+  compiler) into a real `agy.exe` that re-execs `node fake-agy.mjs` with lossless
+  MSVCRT argv quoting, inherited stdio pipes and exit-code passthrough; POSIX keeps a
+  sh wrapper. The production S-H4 refusal is untouched.
+- **perf leg 4 harness fix** (scripts/perf.mts, harness-only): the ledger-landing leg
+  still matched rows by the client `x-request-id`, but ledger request ids have been
+  server-generated since the replay-hardening change (a client-supplied id is
+  observability metadata only, never a DB key). The leg now pairs positionally (30
+  strictly sequential calls → 30 newest rows) and polls until all rows have flushed;
+  product code untouched. Leg result back in line with the recorded baseline
+  (P95 950ms over 30/30 rows vs 957ms recorded).
+
 ## [Unreleased] (协议格式补齐)
 
 Protocol-surface audit (OpenAI Chat Completions + Anthropic Messages) against the current

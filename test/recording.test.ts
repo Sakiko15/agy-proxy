@@ -1,8 +1,9 @@
 // RunRecording unit tests (S-M6): the per-run event cap — step events stop
 // being stored past MAX_EVENTS_PER_RUN while result envelopes and the
 // usage/binding bookkeeping keep landing, and stored indices stay stable.
+// Also: RunRegistry capacity + the A-M4 keep/forget lifecycle.
 import { describe, it, expect } from 'vitest'
-import { MAX_EVENTS_PER_RUN, RunRecording } from '../src/host/recording.ts'
+import { MAX_EVENTS_PER_RUN, RunRecording, RunRegistry } from '../src/host/recording.ts'
 import type { AgyEvent, RawUsage } from '../src/common/types.ts'
 
 const step = (i: number, usage?: RawUsage): AgyEvent => ({
@@ -11,7 +12,6 @@ const step = (i: number, usage?: RawUsage): AgyEvent => ({
   stepKind: 'text',
   text: 't' + i,
   ...(usage !== undefined ? { usage } : {}),
-  raw: {},
 })
 
 describe('RunRecording event cap (S-M6)', () => {
@@ -23,7 +23,7 @@ describe('RunRecording event cap (S-M6)', () => {
     // Stored indices stay stable (continuation callIds stay valid).
     expect(rec.eventAt(0)?.kind).toBe('step')
     // A result event after the cap is still stored and books the binding.
-    rec.append({ kind: 'result', conversationId: 'conv-1', ok: true, response: 'done', usage: { total_tokens: 5 }, raw: {} })
+    rec.append({ kind: 'result', conversationId: 'conv-1', ok: true, response: 'done', usage: { total_tokens: 5 } })
     expect(rec.eventAt(rec.length - 1)?.kind).toBe('result')
     expect(rec.conversationId).toBe('conv-1')
     expect(rec.getResultEvent()).toEqual({ ok: true, response: 'done' })
@@ -48,5 +48,47 @@ describe('RunRecording event cap (S-M6)', () => {
     rec.append(step(1))
     expect(rec.length).toBe(1)
     expect(rec.droppedEvents).toBe(0)
+  })
+})
+
+describe('RunRegistry capacity + keep/forget lifecycle (A-M4)', () => {
+  it('honors the configured capacity for concurrent in-progress runs', () => {
+    const reg = new RunRegistry(4)
+    const recs: RunRecording[] = []
+    for (let i = 0; i < 5; i++) {
+      const rec = reg.create()
+      rec.append(step(i))
+      recs.push(rec)
+    }
+    // Capacity 4: the 5th live run evicts the OLDEST one, exactly like the
+    // historical fixed cap — the point of A-M4 is that callers size the cap
+    // from the real concurrency ceiling so live runs are never evicted.
+    expect(reg.get(recs[0]?.runId ?? '')).toBeUndefined()
+    for (const rec of recs.slice(1)) expect(reg.get(rec.runId)).toBeDefined()
+  })
+
+  it('keeps the historical default capacity of 8', () => {
+    const reg = new RunRegistry()
+    const recs: RunRecording[] = []
+    for (let i = 0; i < 9; i++) recs.push(reg.create())
+    expect(reg.get(recs[0]?.runId ?? '')).toBeUndefined()
+    expect(reg.get(recs[1]?.runId ?? '')).toBeDefined()
+    expect(reg.get(recs[8]?.runId ?? '')).toBeDefined()
+  })
+
+  it('forget() frees capacity and is idempotent', () => {
+    const reg = new RunRegistry(2)
+    const a = reg.create()
+    const b = reg.create()
+    reg.forget(a.runId)
+    reg.forget(a.runId)
+    const c = reg.create()
+    expect(reg.get(a.runId)).toBeUndefined()
+    expect(reg.get(b.runId)).toBeDefined()
+    expect(reg.get(c.runId)).toBeDefined()
+  })
+
+  it('keepForContinuation defaults to false (engine-owned lifecycle flag)', () => {
+    expect(new RunRecording('r-flag').keepForContinuation).toBe(false)
   })
 })

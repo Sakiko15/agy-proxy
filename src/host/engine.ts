@@ -78,6 +78,32 @@ export function defaultRetryDelay(ms: number): Promise<void> {
   })
 }
 
+/**
+ * Abort-aware, unref-ed sleep (A-M2/A-L5): resolves on timeout or as soon as
+ * `signal` aborts, never holding the event loop open at shutdown. Callers
+ * must re-check `signal.aborted` (and run liveness flags) after the wait.
+ */
+function sleepUnref(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const onAbort = () => {
+      if (timer !== null) {
+        clearTimeout(timer)
+        timer = null
+      }
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }
+    let timer: NodeJS.Timeout | null = setTimeout(() => {
+      timer = null
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, Math.max(0, ms))
+    timer.unref()
+    if (signal?.aborted === true) onAbort()
+    else signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
 export interface EngineMessageImage {
   name?: string
   mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
@@ -126,6 +152,11 @@ export interface EngineDeps {
   store: SessionStore
   pool?: AccountPoolManager
   bin: () => string | null
+  /** A-M1: drops the wiring-level bin cache so a retry (or the next run)
+   *  re-scans PATH. The engine fires it after any failed attempt — a spawn
+   *  failure may stem from a stale/missing binary, and the per-attempt
+   *  re-read seam only recovers if the cache lets go. */
+  invalidateBin?: () => void
   /**
    * Fixed argv prefix inserted before the call's own arguments (after them
    * nothing is appended by the engine). Test harnesses point `bin` at the
@@ -192,6 +223,10 @@ export interface EngineDeps {
 
 class ChunkQueue {
   private chunks: StreamChunk[] = []
+  /** A-L1: consumed-prefix cursor — shift() moved the whole array per chunk
+   *  on 20k-event runs; the head index advances O(1) and the consumed prefix
+   *  is compacted once per wake cycle instead. */
+  private head = 0
   private wake: (() => void) | null = null
   private closed = false
 
@@ -209,9 +244,14 @@ class ChunkQueue {
 
   async *drain(): AsyncIterable<StreamChunk> {
     for (;;) {
-      while (this.chunks.length > 0) {
-        const ch = this.chunks.shift()
+      while (this.head < this.chunks.length) {
+        const ch = this.chunks[this.head]
+        this.head++
         if (ch !== undefined) yield ch
+      }
+      if (this.head > 0) {
+        this.chunks.splice(0, this.head)
+        this.head = 0
       }
       if (this.closed) return
       await new Promise<void>((resolve) => {
@@ -224,6 +264,13 @@ class ChunkQueue {
 function brief(s: string): string {
   const flat = s.trim().replace(/\s+/g, ' ')
   return flat.length > 300 ? flat.slice(0, 300) + '...' : flat
+}
+
+/** Whether one finished span cut on a completed tool step (A-M4): true = the
+ *  client holds a mirror tool call and a continuation span may still resume
+ *  the recording, so it must stay registered. */
+interface SpanEnd {
+  cutOnTool: boolean
 }
 
 /** Gateway provider id; assistant turns marked with it rode OUR agy history. */
@@ -409,7 +456,11 @@ export class AgyEngine {
         }
         return
       }
-      yield* this.driveSpan(rec, continuation.eventIndex + 1, true)
+      const spanEnd = yield* this.driveSpan(rec, continuation.eventIndex + 1, true)
+      // A-M4 lifecycle: a span that did NOT cut on a tool step ends the
+      // client's interest in this recording — drop it once the run settled.
+      rec.keepForContinuation = spanEnd.cutOnTool
+      if (!rec.keepForContinuation && rec.isSettled) this.deps.runs.forget(rec.runId)
       return
     }
     // Mid-turn steer preemption: the session sends a new prompt while a run
@@ -470,8 +521,13 @@ export class AgyEngine {
       if (this.requestTimestamps.length >= cfg.rateLimitPerMinute) {
         const delayMs = this.requestTimestamps[0]! + 60_000 - now
         if (delayMs > 0) {
-          await new Promise((r) => setTimeout(r, delayMs))
+          await sleepUnref(delayMs, call.signal)
         }
+      }
+      if (call.signal?.aborted ?? false) {
+        // Nothing is held yet (no busy mark, no semaphore slot, no window
+        // entry): fail the aborted call before it consumes further work.
+        throw new EngineError('request aborted before dispatch', 'ABORTED')
       }
       this.requestTimestamps.push(Date.now())
     }
@@ -671,6 +727,17 @@ export class AgyEngine {
         schemaCleanup = () => rm(dir, { recursive: true, force: true })
       }
       release = await this.deps.acquire()
+      if (call.signal?.aborted ?? false) {
+        // A-M2: aborted while parked in the semaphore queue. The catch below
+        // only untracks the busy mark — the semaphore slot (and any schema
+        // temp dir) is ours to hand back here, post-acquire. No spawn, no
+        // onRun: nothing was consumed.
+        release()
+        release = () => undefined
+        if (schemaCleanup) void schemaCleanup().catch(() => undefined)
+        schemaCleanup = null
+        throw new EngineError('request aborted while waiting for a concurrency slot', 'ABORTED')
+      }
     } catch (err) {
       // H1: the dispatch IIFE's finally only runs once it starts — a throw
       // before it (queue-full BUSY, staging/schema fs errors, the debounce)
@@ -751,8 +818,11 @@ export class AgyEngine {
 
     const runOnce = async (index: number, attemptAcc: typeof account): Promise<AttemptResult> => {
       const task = async (): Promise<AttemptResult> => {
-        // Superseded while queued (steer/abort) — don't spawn.
-        if (rec.isSettled || steerAborted) {
+        // Superseded while queued (steer/abort) — don't spawn. Also covers a
+        // client that disconnected while its request sat in the per-account
+        // queue (A-M2): the abort listener installed by the runner only fires
+        // post-spawn, so the pre-spawn waits must check the signal themselves.
+        if (rec.isSettled || steerAborted || (call.signal?.aborted ?? false)) {
           return spawnFailedAbort(attemptAcc)
         }
         // Per-account burst spacing throttle with randomized jitter (prevents high-frequency flood to Google endpoints)
@@ -762,7 +832,10 @@ export class AgyEngine {
           const jitter = Math.floor(Math.random() * 300) // 0~299ms organic jitter
           const targetInterval = this.minSpawnIntervalMs + jitter
           if (elapsed < targetInterval) {
-            await new Promise((r) => setTimeout(r, targetInterval - elapsed))
+            await sleepUnref(targetInterval - elapsed, call.signal)
+            if (rec.isSettled || steerAborted || (call.signal?.aborted ?? false)) {
+              return spawnFailedAbort(attemptAcc)
+            }
           }
           this.lastAccountSpawnTime.set(attemptAcc.id, Date.now())
         }
@@ -781,8 +854,13 @@ export class AgyEngine {
             timeoutMs: cfg.timeoutMs,
             signal: call.signal,
             env: envFor(attemptAcc),
-            onLine: (line) => {
-              for (const ev of parser.feed(line + '\n')) {
+            // A-M5: raw stdout chunks go straight into the parser — the old
+            // onLine seam re-split every chunk into lines and re-appended
+            // '\n' only for the parser to split them apart again, and the
+            // runner kept a 4MB stdout copy behind it. onChunk hands the
+            // utf8-decoded chunk over untouched; feed() owns line buffering.
+            onChunk: (chunk) => {
+              for (const ev of parser.feed(chunk)) {
                 if (ev.kind === 'init' && ev.conversationId) streamCid = ev.conversationId
                 if (ev.kind === 'result' && ev.conversationId !== '') streamCid = ev.conversationId
                 rec.append(ev)
@@ -934,6 +1012,10 @@ export class AgyEngine {
             return
           }
           last = await runOnce(attempt, attemptAccount)
+          // A-M1: any failed attempt may stem from a stale or missing
+          // binary — drop the wiring cache so the retry's per-attempt
+          // re-read actually rescans (a no-op when no cache is wired).
+          if (last.failure !== null) this.deps.invalidateBin?.()
           // Retry gate (M5): only outcome-level failures with nothing on the
           // wire. A result-shaped failure never emits span chunks (the mapper
           // returns passively on !ok with an empty response); the #902
@@ -975,6 +1057,12 @@ export class AgyEngine {
         }
         releaseOnce()
         rec.settle(last.failure)
+        // A-M4 lifecycle: a settled recording is only kept while a future
+        // span may still resume it from a mirror-tool cursor (its last
+        // completed span cut on a tool step). Otherwise nothing will ever
+        // look it up again — drop it now instead of waiting for the
+        // capacity eviction to hit an in-progress run.
+        if (!rec.keepForContinuation) this.deps.runs.forget(rec.runId)
         if (last.failure === null) {
           if (last.account) this.deps.pool?.recordSuccess(last.account.id, family)
           if (sessionAccountKey !== '') {
@@ -1022,7 +1110,14 @@ export class AgyEngine {
     // completed tool step cuts it (or the result finishes it). The dispatch
     // loop above keeps the recording unsettled until the final attempt, so
     // this span simply never sees a failure frame until retries are done.
-    yield* this.driveSpan(rec, 0, true)
+    const spanEnd = yield* this.driveSpan(rec, 0, true)
+    // A-M4 lifecycle: mirror of the continuation-path rule. A span that did
+    // not cut on a tool step ends the client's interest in this recording;
+    // if the run already settled (the common case — the result beat the span
+    // consumer to it), forget immediately. A tool-cut span flips the
+    // keep flag so the settle-time check above retains it for continuation.
+    rec.keepForContinuation = spanEnd.cutOnTool
+    if (!rec.keepForContinuation && rec.isSettled) this.deps.runs.forget(rec.runId)
   }
 
   /**
@@ -1036,8 +1131,9 @@ export class AgyEngine {
     rec: RunRecording,
     from: number,
     cutOnTool: boolean,
-  ): AsyncIterable<StreamChunk> {
+  ): AsyncGenerator<StreamChunk, SpanEnd> {
     const queue = new ChunkQueue()
+    let cutOnToolEnd = false
     void (async () => {
       const mapper = new EventMapper({
         runId: rec.runId,
@@ -1048,7 +1144,10 @@ export class AgyEngine {
       let i = from
       try {
         for await (const ev of rec.eventsFrom(from)) {
-          for (const ch of mapper.map(ev, i)) queue.push(ch)
+          for (const ch of mapper.map(ev, i)) {
+            if (ch.type === 'finish' && ch.reason.kind === 'tool-calls') cutOnToolEnd = true
+            queue.push(ch)
+          }
           i++
           if (mapper.isFinished) break
         }
@@ -1066,6 +1165,7 @@ export class AgyEngine {
       queue.close()
     })()
     yield* queue.drain()
+    return { cutOnTool: cutOnToolEnd }
   }
 }
 

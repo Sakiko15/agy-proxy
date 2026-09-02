@@ -198,16 +198,16 @@ export interface AgyToolInfo {
 }
 
 /** Normalized AgyEvent union consumed by the StreamChunk mapper (see parser).
- *  Shape aligns with upstream dsh-agy-link: each parsed variant carries the
- *  raw line object so the engine can inspect fields the normalized surface
- *  does not project (e.g. result.status=CANCELED for empty-run detection). */
+ *  A-M3: variants no longer carry the raw parsed line object — nothing read
+ *  `ev.raw` (the CANCELED empty-run case is detected on the normalized
+ *  surface: ok + empty response), and keeping it pinned the full parsed JSON
+ *  of every event (20k events × retained runs) in memory for no reader. */
 export type AgyEvent = InitEvent | StepEvent | ResultEvent | GarbageEvent
 
 export interface InitEvent {
   kind: 'init'
   conversationId?: string
   model?: string
-  raw: unknown
 }
 
 export interface StepEvent {
@@ -222,7 +222,6 @@ export interface StepEvent {
   state?: string
   /** Per-step usage (agy ≥1.1.15 reports usage on agent_response steps). */
   usage?: RawUsage
-  raw: unknown
 }
 
 export interface ResultEvent {
@@ -232,7 +231,6 @@ export interface ResultEvent {
   response: string
   error?: string
   usage: RawUsage
-  raw: unknown
 }
 
 export interface GarbageEvent {

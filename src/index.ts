@@ -7,7 +7,7 @@
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { resolveConfig, dataDir, stateDir } from './common/config.ts'
-import { resolveAgyBin, probeProcess, startAgyProcess, MIN_AGY_VERSION } from './host/runner.ts'
+import { resolveAgyBin, probeProcess, startAgyProcess, MIN_AGY_VERSION, createBinCache } from './host/runner.ts'
 import { AgyEngine } from './host/engine.ts'
 import { ModelCatalog } from './host/models.ts'
 import { SessionStore } from './host/sessions.ts'
@@ -160,7 +160,12 @@ async function main(): Promise<void> {
     getConfig().modelsCacheTtlMs,
   )
   const store = new SessionStore(join(stateDir(), 'sessions.json'))
-  const runs = new RunRegistry()
+  // A-M1: the per-spawn bin resolution used to rescan every PATH dir
+  // synchronously on each request; the cache memoizes it and the engine's
+  // invalidateBin drops it after any failed attempt (retry finds a
+  // (re)installed binary — same seam semantics, one scan per healthy run).
+  const binCache = createBinCache(() => resolveAgyBin(getConfig().agyBin))
+  const runs = new RunRegistry(Math.max(8, getConfig().maxConcurrent + 2))
   const sem = new GatewaySemaphore(
     () => getConfig().maxConcurrent,
     () => getConfig().maxQueueDepth,
@@ -170,7 +175,8 @@ async function main(): Promise<void> {
     catalog,
     store,
     pool,
-    bin: () => resolveAgyBin(getConfig().agyBin),
+    bin: () => binCache.resolve(),
+    invalidateBin: binCache.invalidate,
     acquire: () => sem.acquire(),
     runs,
     // Per-key model whitelist (M5): resolved per call from the keys table.
@@ -289,19 +295,29 @@ async function main(): Promise<void> {
   // greps for the `"debug":"metrics"` marker). Off by default.
   const metricsTimer = startDebugMetrics(getConfig().debugMetricsMs)
 
-  installShutdown(built, {
-    log,
-    teardown: async () => {
-      clearTimeout(bootRefresh)
-      clearInterval(poller)
-      metricsTimer.stop()
-      mediaSweeper.stop()
-      bus.closeAll() // ends hijacked /admin/events streams — app.close() does not
-      pool.flush() // write out a pending debounced hot-path persist (S-M8)
-      await poolAuth.cancel().catch(() => undefined)
-      await ledger.close().catch(() => undefined) // flush → WAL checkpoint → close
+  installShutdown(
+    { app: built.app, inFlight: built.inFlight, server: built.app.server },
+    {
+      log,
+      // B-H1: end the hijacked /admin/events streams BEFORE app.close() — a
+      // live admin SSE client parks its connection past Fastify's close and
+      // used to hang the whole sequence until docker's SIGKILL skipped the
+      // ledger flush + WAL checkpoint. Idempotent (the teardown call below is
+      // a no-op when preClose already ran).
+      preClose: () => bus.closeAll(),
+      teardown: async () => {
+        clearTimeout(bootRefresh)
+        clearInterval(poller)
+        metricsTimer.stop()
+        mediaSweeper.stop()
+        bus.closeAll() // ends hijacked /admin/events streams — app.close() does not
+        pool.flush() // write out a pending debounced hot-path persist (S-M8)
+        keys.flushTouch() // land debounced last_used_at refreshes (B-M2)
+        await poolAuth.cancel().catch(() => undefined)
+        await ledger.close().catch(() => undefined) // flush → WAL checkpoint → close
+      },
     },
-  })
+  )
 }
 
 // Entry detection: direct `node dist/index.js` / `tsx src/index.ts` runs the

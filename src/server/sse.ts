@@ -3,7 +3,13 @@
 // buffers in between — parser line → mapper chunk → SSE frame, no aggregate.
 // New code, not a port. Two obligations beyond frame formatting:
 // - backpressure: `raw.write` returning false pauses the producer via
-//   `once('drain')`, honoring Node stream semantics on slow clients;
+//   `once('drain')`, honoring Node stream semantics on slow clients — with a
+//   stall watchdog (batch 2, B-M1) as the last resort: a client that cannot
+//   read a single byte for the stall window (zero-window or half-open) gets
+//   its socket destroyed, releasing the parked producer and, through the
+//   disconnect cascade, its gateway semaphore slot. Left alone, such a
+//   client held its slot until TCP gave up (~15min); three of them meant a
+//   whole-gateway 429.
 // - heartbeat (charter §6): when nothing real has been sent for
 //   cfg.sseHeartbeatMs, emit the caller's keepalive frame so reverse proxies
 //   and Cloudflare keep the connection alive. The timer is torn down on
@@ -12,9 +18,17 @@
 import type { FastifyReply } from 'fastify'
 import type { ServerResponse } from 'node:http'
 
+/** Stall window for a parked (backpressured) frame write: three heartbeats,
+ *  but never below 180s — long enough that any live reader (frame granularity
+ *  is one delta, KB-scale) cannot be distinguished from a dead connection. */
+export function stallWindowMs(heartbeatMs: number): number {
+  return heartbeatMs > 0 ? Math.max(3 * heartbeatMs, 180_000) : 180_000
+}
+
 export class SseWriter {
   private readonly raw: ServerResponse
   private readonly heartbeatMs: number
+  private readonly stallMs: number
   private readonly makeKeepalive: () => string
   private lastSendAt = 0
   private heartbeatTimer: NodeJS.Timeout | null = null
@@ -22,9 +36,10 @@ export class SseWriter {
   /** Resolves when the client stream ends or close() finishes. */
   readonly done: Promise<void>
 
-  constructor(reply: FastifyReply, opts: { heartbeatMs: number; keepalive: () => string }) {
+  constructor(reply: FastifyReply, opts: { heartbeatMs: number; keepalive: () => string; stallMs?: number }) {
     this.raw = reply.raw
     this.heartbeatMs = opts.heartbeatMs
+    this.stallMs = opts.stallMs ?? stallWindowMs(opts.heartbeatMs)
     this.makeKeepalive = opts.keepalive
     reply.hijack()
     let releaseDone: () => void = () => undefined
@@ -81,9 +96,23 @@ export class SseWriter {
     // A client that disconnects mid-backpressure never emits 'drain' — the
     // waiter must also settle on close/error or the producer loop hangs
     // forever (M5'). once() + explicit removal keep a single resolution and
-    // leave no stray listeners behind.
+    // leave no stray listeners behind. The one-shot stall timer is the last
+    // resort (B-M1): a zero-window/half-open client produces neither drain
+    // nor close/error — the parked write used to hold its semaphore slot
+    // until TCP gave up (~15min), and three of those clients meant a
+    // whole-gateway 429. Destroying the socket fires the raw 'close' settle
+    // below and the disconnect cascade reclaims everything.
     await new Promise<void>((resolve) => {
+      let stallTimer: NodeJS.Timeout | null = setTimeout(() => {
+        stallTimer = null
+        this.raw.destroy()
+      }, this.stallMs)
+      stallTimer.unref()
       const settle = (): void => {
+        if (stallTimer !== null) {
+          clearTimeout(stallTimer)
+          stallTimer = null
+        }
         this.raw.off('drain', settle)
         this.raw.off('close', settle)
         this.raw.off('error', settle)
@@ -109,6 +138,12 @@ export class SseWriter {
     this.lastSendAt = Date.now()
     const idLine = typeof id === 'number' ? 'id: ' + id + '\n' : ''
     await this.writeRaw('event: ' + name + '\n' + idLine + 'data: ' + JSON.stringify(payload) + '\n\n')
+  }
+
+  /** True once close() ran (or the stream is already ended) — the public read
+   *  the stream handlers use instead of the private field (B-L3). */
+  isClosed(): boolean {
+    return this.closed
   }
 
   /** End the stream: [DONE] is the caller's job; this closes our side cleanly. */

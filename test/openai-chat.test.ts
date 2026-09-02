@@ -122,6 +122,21 @@ describe('mapChatRequest', () => {
     expect(meta.warnings).toEqual([])
   })
 
+  it('B-M5: staging blanks the body image_url payload but keeps the bytes', async () => {
+    const dataUrl = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+    const body = {
+      ...BASE,
+      messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: dataUrl } }] }],
+    }
+    const { meta } = await map(body)
+    const staged = meta.imageBytes.get('img-1')
+    expect(staged?.length).toBeGreaterThan(0)
+    // The data: payload used to ride the fastify body + stream closures until
+    // the response ended; after mapping only the blank string remains.
+    const msg = (body.messages as Array<{ content: Array<{ image_url?: { url?: string } }> }>)[0]
+    expect(msg?.content[0]?.image_url?.url).toBe('')
+  })
+
   it('rejects a whitespace-only model instead of falling back silently', async () => {
     mapThrows({ ...BASE, model: ' ' }, /non-empty/)
     mapThrows({ ...BASE, model: '  ' }, /non-empty/)

@@ -135,6 +135,31 @@ export function compareVersions(a: string, b: string): number {
   return 0
 }
 
+/**
+ * A-M1: resolveAgyBin scans every PATH dir + the per-platform default
+ * locations (accessSync per candidate, plus an nvm readdir) — far too much
+ * synchronous work to redo per spawn on the request path. The cache memoizes
+ * the resolved binary until `invalidate()`, which the engine calls after any
+ * failed attempt so the retry (or the next run) re-scans — preserving the
+ * exact seam semantics the dispatch loop relies on: a retry may find a
+ * (re)installed binary even when attempt 0 failed to spawn.
+ */
+export function createBinCache(resolve: () => string | null): {
+  resolve: () => string | null
+  invalidate: () => void
+} {
+  let cached: string | null | undefined
+  return {
+    resolve: () => {
+      if (cached === undefined) cached = resolve()
+      return cached
+    },
+    invalidate: () => {
+      cached = undefined
+    },
+  }
+}
+
 export function parseVersion(out: string): string | null {
   const m = out.match(/(\d+\.\d+\.\d+)/)
   return m?.[1] ?? null
@@ -158,8 +183,25 @@ export interface RunOptions {
   signal?: AbortSignal
   env?: NodeJS.ProcessEnv
   onLine?: (line: string) => void
+  /**
+   * A-M5: raw stdout chunks straight from the utf8-decoded pipe. When a chunk
+   * consumer is wired the runner skips its own line splitting AND its
+   * full-stream capture: the consumer (the engine) feeds the chunk straight
+   * into the NDJSON parser instead of re-splitting line-by-line, and the
+   * outcome's `stdout` keeps only a head-4KB + tail-64KB excerpt (the engine
+   * sniffs the first 4KB for auth banners; nothing reads more). WITHOUT a
+   * chunk consumer the full stdout is still captured — `agy models`
+   * discovery and the --version probe parse the complete stream.
+   */
+  onChunk?: (chunk: string) => void
   /** stdin stays writable (auth code injection). */
   keepStdin?: boolean
+  /**
+   * POSIX-only: how long a SIGTERM'd process group gets to exit before the
+   * kill ladder escalates to SIGKILL (A-H1). Windows ignores it — taskkill /F
+   * is already fatal. Defaults to GRACE_MS.
+   */
+  killGraceMs?: number
 }
 
 export interface RunningProcess {
@@ -170,7 +212,9 @@ export interface RunningProcess {
 
 const GRACE_MS = 5000
 
-function killTree(child: ChildProcess): void {
+/** One kill blow against the process tree. `force` escalates SIGTERM→SIGKILL
+ *  on POSIX; on Windows both blow via taskkill /F (already fatal). */
+function sendKill(child: ChildProcess, force: boolean): void {
   if (child.pid === undefined) return
   if (IS_WIN) {
     // No Unix process groups on Windows: kill the whole tree via taskkill.
@@ -186,10 +230,10 @@ function killTree(child: ChildProcess): void {
     return
   }
   try {
-    process.kill(-child.pid, 'SIGTERM')
+    process.kill(-child.pid, force ? 'SIGKILL' : 'SIGTERM')
   } catch {
     try {
-      child.kill('SIGTERM')
+      child.kill(force ? 'SIGKILL' : 'SIGTERM')
     } catch {
       // already gone
     }
@@ -240,28 +284,97 @@ export function startAgyProcess(opts: RunOptions): RunningProcess {
     }
   }
 
+  // A-H1 kill ladder. The first blow is SIGTERM (graceful: agy children may
+  // flush); if the tree is still alive after killGraceMs it escalates to a
+  // group SIGKILL, then a direct child SIGKILL after a second grace. A
+  // SIGTERM-immune hung tree used to survive every kill attempt — the
+  // watchdog fires once and `await proc.outcome` (and with it the semaphore
+  // slot, the busy mark and the per-account queue task) hung forever.
+  // Windows is unaffected: taskkill /F has no graceful stage to escalate.
+  const graceMs = Math.max(0, opts.killGraceMs ?? GRACE_MS)
+  let escalated = false
+  let escalationTimer: NodeJS.Timeout | null = null
+  let finalKillTimer: NodeJS.Timeout | null = null
+  const killTree = (force: boolean): void => {
+    sendKill(child, force)
+    if (force || escalated || settled || graceMs === 0) return
+    escalated = true
+    escalationTimer = setTimeout(() => {
+      escalationTimer = null
+      if (!settled) sendKill(child, true)
+    }, graceMs)
+    escalationTimer.unref()
+    finalKillTimer = setTimeout(() => {
+      finalKillTimer = null
+      if (!settled) {
+        try { child.kill('SIGKILL') } catch { /* already gone */ }
+      }
+    }, graceMs * 2)
+    finalKillTimer.unref()
+  }
+  const disarmEscalation = (): void => {
+    if (escalationTimer !== null) clearTimeout(escalationTimer)
+    escalationTimer = null
+    if (finalKillTimer !== null) clearTimeout(finalKillTimer)
+    finalKillTimer = null
+  }
+
   let watchdog: NodeJS.Timeout | null = null
   const refreshWatchdog = () => {
     if (!opts.timeoutMs || opts.timeoutMs <= 0 || settled) return
     if (watchdog) clearTimeout(watchdog)
     watchdog = setTimeout(() => {
       timedOut = true
-      killTree(child)
+      killTree(false)
     }, opts.timeoutMs)
   }
   refreshWatchdog()
 
   const onAbort = () => {
     aborted = true
-    killTree(child)
+    killTree(false)
   }
   opts.signal?.addEventListener('abort', onAbort, { once: true })
 
   if (child.stdout) child.stdout.setEncoding('utf8')
   if (child.stderr) child.stderr.setEncoding('utf8')
+  // A-L6: a throwing line consumer (parser bug, mirrored-tool crash) must not
+  // take the gateway down from inside a stdout 'data' handler. Park the error
+  // in the stderr tail, where failure classification already looks.
+  const safeOnLine = (line: string): void => {
+    try {
+      opts.onLine?.(line)
+    } catch (err) {
+      stderr = (stderr + '[onLine] ' + String(err)).slice(-4096)
+    }
+  }
+  const safeOnChunk = (chunk: string): void => {
+    try {
+      opts.onChunk?.(chunk)
+    } catch (err) {
+      stderr = (stderr + '[onChunk] ' + String(err)).slice(-4096)
+    }
+  }
+  // A-M5: with a chunk consumer the run's stdout copy is bounded to the head
+  // 4KB + tail 64KB the engine actually reads; without one, models discovery
+  // and --version need the whole stream, so capture stays unbounded (with the
+  // old 4MB→2MB trim as the runaway guard).
+  const hasChunkConsumer = opts.onChunk !== undefined
+  const HEAD_KEEP = 4096
+  const TAIL_KEEP = 65_536
+  let stdoutHead = ''
+  let stdoutTail = ''
+  let stdoutTotal = 0
   let pending = ''
   child.stdout?.on('data', (chunk: string) => {
     refreshWatchdog()
+    if (hasChunkConsumer) {
+      stdoutTotal += chunk.length
+      if (stdoutHead.length < HEAD_KEEP) stdoutHead = (stdoutHead + chunk).slice(0, HEAD_KEEP)
+      stdoutTail = (stdoutTail + chunk).slice(-TAIL_KEEP)
+      safeOnChunk(chunk)
+      return
+    }
     stdout += chunk
     if (stdout.length > 4_000_000) stdout = stdout.slice(-2_000_000)
     pending += chunk
@@ -269,7 +382,7 @@ export function startAgyProcess(opts: RunOptions): RunningProcess {
     while ((nl = pending.indexOf('\n')) >= 0) {
       const line = pending.slice(0, nl).replace(/\r$/, '')
       pending = pending.slice(nl + 1)
-      opts.onLine?.(line)
+      safeOnLine(line)
     }
   })
   child.stderr?.on('data', (chunk: string) => {
@@ -282,9 +395,10 @@ export function startAgyProcess(opts: RunOptions): RunningProcess {
       if (settled) return
       settled = true
       if (watchdog) clearTimeout(watchdog)
+      disarmEscalation()
       opts.signal?.removeEventListener('abort', onAbort)
       if (pending !== '') {
-        opts.onLine?.(pending)
+        safeOnLine(pending)
         pending = ''
       }
       resolve({
@@ -292,7 +406,10 @@ export function startAgyProcess(opts: RunOptions): RunningProcess {
         signal,
         timedOut,
         aborted,
-        stdout,
+        // A-M5: chunk-consuming runs report only the head+tail excerpt (the
+        // tail is skipped when the whole stream fit in the head window —
+        // otherwise short streams would be duplicated).
+        stdout: hasChunkConsumer ? (stdoutTotal <= HEAD_KEEP ? stdoutHead : stdoutHead + stdoutTail) : stdout,
         stderrTail: stderr,
         durationMs: Date.now() - started,
       })
@@ -311,7 +428,7 @@ export function startAgyProcess(opts: RunOptions): RunningProcess {
       if (reason === 'timeout') timedOut = true
       else aborted = true
       if (watchdog) clearTimeout(watchdog)
-      killTree(child)
+      killTree(false)
     },
   }
 }
@@ -346,7 +463,3 @@ export async function probeProcess(
   if (!version) return { ok: false, error: `unparsable version output: ${out.stdout.slice(0, 200)}` }
   return { ok: true, version }
 }
-
-// GRACE_MS is reserved for a future SIGKILL escalation after the SIGTERM
-// process-group kill (kept from upstream to ease the future diff).
-void GRACE_MS

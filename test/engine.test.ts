@@ -7,7 +7,7 @@
 // EngineError; dsh-llm listModels/resolveModel/prepareCall cases dropped —
 // the service layer uses ModelCatalog directly; sessionCwd cases dropped —
 // the engine has no host-provided session workspace seam).
-import { describe, it, expect, afterAll } from 'vitest'
+import { describe, it, expect, afterAll, vi } from 'vitest'
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -86,13 +86,16 @@ type MirrorArgs = { run: string; step: number; tool: string; input?: unknown }
 /**
  * Drive one full agy turn the way the gateway loop would: collect a span,
  * and whenever it finishes with tool-calls, append the mirrored tool-result
- * message and call stream() again.
+ * message and call stream() again. `onHop` runs right after each hop's span
+ * was collected — the only window in which the recording is guaranteed to
+ * still be registered (A-M4 forgets it once the terminal span drained).
  */
 async function runTurn(
   engine: AgyEngine,
   base: EngineMessage[],
   extra: Partial<EngineCall> = {},
   maxHops = 12,
+  onHop?: (chunks: StreamChunk[], hop: number) => void,
 ): Promise<{ chunks: StreamChunk[]; toolCalls: Array<{ id: string; args: MirrorArgs }>; messages: EngineMessage[] }> {
   const messages = [...base]
   const all: StreamChunk[] = []
@@ -101,6 +104,7 @@ async function runTurn(
     // Pass a copy: the engine's outcome handler captures the array it was
     // given, and the watermark it records must reflect this hop's view.
     const chunks = await collect(engine.stream(call([...messages], extra)))
+    onHop?.(chunks, hop)
     all.push(...chunks)
     const finish = chunks[chunks.length - 1] as { type: string; reason: { kind: string } } | undefined
     if (finish === undefined || finish.type !== 'finish') throw new Error('span ended without a finish chunk')
@@ -127,7 +131,19 @@ describe('engine: ok run, mirroring, binding', () => {
     const { engine, store, argsFile, runs } = makeEngine()
     process.env.FAKE_AGY_MODE = 'ok'
     process.env.FAKE_AGY_ARGS_FILE = argsFile
-    const { chunks, toolCalls } = await runTurn(engine, [msg('user', 'hello there')], { sessionKey: 'sess-1' })
+    // A-M4: the registry only guarantees a recording while a continuation may
+    // still resume it — capture the tool data at the tool-cut hop.
+    let toolAtCut: { name?: string } | null | undefined
+    let replayAtCut: string | undefined
+    const { chunks, toolCalls } = await runTurn(engine, [msg('user', 'hello there')], { sessionKey: 'sess-1' }, 12, (hopChunks) => {
+      const cut = hopChunks.find(
+        (c) => c.type === 'block-end' && (c as { block: { type: string } }).block.type === 'tool-call',
+      ) as unknown as { block: { id: string; arguments: string } } | undefined
+      if (cut === undefined) return
+      const parsed = JSON.parse(cut.block.arguments) as { run: string; step: number }
+      toolAtCut = runs.get(parsed.run)?.toolEventAt(parsed.step)
+      replayAtCut = executeMirrorTool({ runs }, { run: parsed.run, step: parsed.step })
+    })
     const types = chunks.map((c) => c.type)
     const finish = chunks[chunks.length - 1] as { type: string; reason: { kind: string } }
     expect(finish.type).toBe('finish')
@@ -143,11 +159,13 @@ describe('engine: ok run, mirroring, binding', () => {
     expect(toolCalls.length).toBe(1)
     const first = toolCalls[0] as { args: { run: string; step: number } }
     expect(first.args.run.length > 0).toBe(true)
-    const t = runs.get(first.args.run)?.toolEventAt(first.args.step)
-    expect(t?.name).toBe('read_file')
+    expect(toolAtCut?.name).toBe('read_file')
     // the mirror replays the recorded output for that callId
-    const replayed = executeMirrorTool({ runs }, toolCalls[0]?.args)
-    expect(replayed).toBe('file contents here')
+    expect(replayAtCut).toBe('file contents here')
+    // A-M4: the terminal span freed the recording — nothing can resume it.
+    // The forget lands when the dispatch IIFE settles the run (after the
+    // process's exit event), so wait for it rather than racing it.
+    await vi.waitFor(() => expect(runs.get(first.args.run)).toBeUndefined(), { timeout: 5_000, interval: 10 })
     const argv = JSON.parse(readFileSync(argsFile, 'utf8').trim().split('\n').at(-1) ?? '[]') as string[]
     expect(argv).toContain('--output-format')
     expect(argv[argv.indexOf('--output-format') + 1]).toBe('stream-json')
@@ -195,7 +213,23 @@ describe('engine: real-shape runs and error mapping', () => {
   it('agy 1.1.15 stream mirrors tools as native cards across spans', async () => {
     const { engine, runs } = makeEngine()
     process.env.FAKE_AGY_MODE = 'real'
-    const { chunks, toolCalls } = await runTurn(engine, [msg('user', 'count the files')])
+    // A-M4: capture the per-tool data at each tool-cut hop (the terminal span
+    // frees the recording afterwards).
+    const namesAtCut: Array<string | undefined> = []
+    const replays: Array<string | Error> = []
+    const { chunks, toolCalls } = await runTurn(engine, [msg('user', 'count the files')], {}, 12, (hopChunks) => {
+      const cut = hopChunks.find(
+        (c) => c.type === 'block-end' && (c as { block: { type: string } }).block.type === 'tool-call',
+      ) as unknown as { block: { id: string; arguments: string } } | undefined
+      if (cut === undefined) return
+      const parsed = JSON.parse(cut.block.arguments) as { run: string; step: number }
+      namesAtCut.push(runs.get(parsed.run)?.toolEventAt(parsed.step)?.name)
+      try {
+        replays.push(executeMirrorTool({ runs }, { run: parsed.run, step: parsed.step }))
+      } catch (e) {
+        replays.push(e as Error)
+      }
+    })
     const finish = chunks[chunks.length - 1] as { type: string; reason: { kind: string } }
     expect(finish.reason.kind).toBe('stop')
     const reasoning = chunks.filter((c) => c.type === 'reasoning-delta').map((c) => (c as unknown as { text: string }).text).join('')
@@ -205,12 +239,17 @@ describe('engine: real-shape runs and error mapping', () => {
     expect(text).not.toContain('note1.txt')
     expect(text).toContain('There are 2 files, 6 words total.')
     // both tool steps became mirrored native calls, in order
-    const names = toolCalls.map((t) => runs.get(t.args.run)?.toolEventAt(t.args.step)?.name)
-    expect(names).toEqual(['run_command', 'find_by_name'])
+    expect(toolCalls.length).toBe(2)
+    expect(namesAtCut).toEqual(['run_command', 'find_by_name'])
     // the mirror replays run_command's recorded output and surfaces the errored tool
-    const out = executeMirrorTool({ runs }, toolCalls[0]?.args)
-    expect(out).toBe('note1.txt\nnote2.txt\n')
-    expect(() => executeMirrorTool({ runs }, toolCalls[1]?.args)).toThrow(/Find command timed out/)
+    expect(replays[0]).toBe('note1.txt\nnote2.txt\n')
+    expect((replays[1] as Error).message).toContain('Find command timed out')
+    // A-M4: the terminal span freed the shared recording (forget fires when
+    // the dispatch IIFE settles — after the process's exit event).
+    await vi.waitFor(
+      () => expect(runs.get((toolCalls[0] as { args: { run: string } }).args.run)).toBeUndefined(),
+      { timeout: 5_000, interval: 10 },
+    )
   })
 
   it('agy 1.1.15 result ERROR with response still finishes stop', async () => {

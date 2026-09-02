@@ -132,16 +132,42 @@ function decodeImageSource(source: unknown, imageBytes: Map<string, Uint8Array>)
     throw bad('image source media_type must be image/png, image/jpeg, image/webp, or image/gif')
   }
   if (typeof s.data !== 'string' || s.data === '') throw bad('image source data must be a base64 string')
-  let bytes: Uint8Array
-  try {
-    bytes = new Uint8Array(Buffer.from(s.data, 'base64'))
-  } catch {
-    throw bad('image source base64 payload is malformed')
-  }
+  // B-M5: Buffer IS a Uint8Array — the old new Uint8Array(Buffer.from(...))
+  // made a second full copy of every staged image. Buffer.from cannot throw
+  // on a validated string (invalid base64 chars are skipped), so the only
+  // malformed case left to check is an empty decode below.
+  const bytes = Buffer.from(s.data, 'base64')
   if (bytes.length === 0) throw bad('image source base64 payload is empty')
   const name = 'img-' + String(imageBytes.size + 1)
   imageBytes.set(name, bytes)
   return { name, mediaType, bytes: bytes.length }
+}
+
+/**
+ * B-M5: after mapping, the staged bytes live in meta.imageBytes — but the
+ * request body kept holding every base64 string (multi-MB each) until the
+ * response finished, because fastify's body reference + the streaming
+ * closures keep it reachable. Blank the payloads here (the map already
+ * consumed them); the ONLY later reader of the body is estimateInputTokens,
+ * which counts image blocks flat (1000) and never looks at the data — so the
+ * token estimate is unchanged.
+ */
+function releaseBodyImageData(b: Record<string, unknown>): void {
+  if (!Array.isArray(b.messages)) return
+  for (const m of b.messages) {
+    if (m === null || typeof m !== 'object') continue
+    const content = (m as { content?: unknown }).content
+    if (!Array.isArray(content)) continue
+    for (const block of content) {
+      if (block === null || typeof block !== 'object') continue
+      const bl = block as { type?: unknown; source?: unknown }
+      if (bl.type !== 'image') continue
+      const src = bl.source
+      if (src !== null && typeof src === 'object' && (src as { type?: unknown }).type === 'base64') {
+        ;(src as { data?: unknown }).data = ''
+      }
+    }
+  }
 }
 
 type MappedBlocks = { text: string; images: EngineMessageImage[] }
@@ -314,6 +340,7 @@ export async function mapMessagesRequest(
   }
 
   const effort = mapThinking(b.thinking)
+  releaseBodyImageData(b)
 
   let stop: string[] = []
   if (b.stop_sequences !== undefined && b.stop_sequences !== null) {

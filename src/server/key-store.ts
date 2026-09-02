@@ -5,7 +5,7 @@
 // return value — and never in a table column, a log line, or a response
 // beyond that moment (acceptance M3 DoD: sha256 落库验证).
 import { createHash, randomBytes } from 'node:crypto'
-import type { Database } from 'better-sqlite3'
+import type BetterSqlite3 from 'better-sqlite3'
 
 export interface ApiKeyRecord {
   id: string
@@ -60,11 +60,47 @@ export function generateApiKey(): { plaintext: string; prefix: string } {
   return { plaintext, prefix: plaintext.slice(KEY_MARK.length, KEY_MARK.length + 8) }
 }
 
+/** B-M2: last_used_at is admin-UI display data, but the refresh used to be
+ *  a full autocommit UPDATE (WAL fsync at synchronous=FULL) on every
+ *  authenticated request. Writes are debounced to one per key per window;
+ *  skipped refreshes land at flushTouch() (shutdown) so the final value is
+ *  still exact. */
+const TOUCH_DEBOUNCE_MS = 60_000
+
 export class KeyStore {
-  constructor(private readonly db: Database) {}
+  private readonly stmtCount: BetterSqlite3.Statement
+  private readonly stmtList: BetterSqlite3.Statement
+  private readonly stmtGet: BetterSqlite3.Statement
+  private readonly stmtByHash: BetterSqlite3.Statement
+  private readonly stmtInsert: BetterSqlite3.Statement
+  private readonly stmtUpdate: BetterSqlite3.Statement
+  private readonly stmtDelete: BetterSqlite3.Statement
+  private readonly stmtTouch: BetterSqlite3.Statement
+  /** B-M2: id → last written last_used_at; skipped refreshes buffer in
+   *  touchPending (latest wins) for flushTouch(). remove() cleans both. */
+  private readonly lastWritten = new Map<string, number>()
+  private readonly touchPending = new Map<string, number>()
+
+  constructor(private readonly db: BetterSqlite3.Database) {
+    // Prepare-once (same pattern as UsageLedger.insertStmt): verify/get ride
+    // every request — per-call prepare churned sqlite_stmt objects each time.
+    this.stmtCount = db.prepare('SELECT COUNT(*) AS n FROM api_keys')
+    this.stmtList = db.prepare('SELECT * FROM api_keys ORDER BY created_at')
+    this.stmtGet = db.prepare('SELECT * FROM api_keys WHERE id = ?')
+    this.stmtByHash = db.prepare('SELECT * FROM api_keys WHERE key_hash = ?')
+    this.stmtInsert = db.prepare(
+      `INSERT INTO api_keys (id, name, key_hash, prefix, created_at, daily_token_limit, rpm_limit)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    this.stmtUpdate = db.prepare(
+      'UPDATE api_keys SET name = ?, disabled_at = ?, daily_token_limit = ?, rpm_limit = ?, scopes = ? WHERE id = ?',
+    )
+    this.stmtDelete = db.prepare('DELETE FROM api_keys WHERE id = ?')
+    this.stmtTouch = db.prepare('UPDATE api_keys SET last_used_at = ? WHERE id = ?')
+  }
 
   count(): number {
-    return (this.db.prepare('SELECT COUNT(*) AS n FROM api_keys').get() as { n: number }).n
+    return (this.stmtCount.get() as { n: number }).n
   }
 
   create(input: { name?: string; dailyTokenLimit?: number; rpmLimit?: number } = {}): CreatedApiKey {
@@ -72,27 +108,22 @@ export class KeyStore {
     const id = 'key_' + randomBytes(4).toString('hex')
     const dailyTokenLimit = positiveIntOrZero(input.dailyTokenLimit)
     const rpmLimit = positiveIntOrZero(input.rpmLimit)
-    this.db
-      .prepare(
-        `INSERT INTO api_keys (id, name, key_hash, prefix, created_at, daily_token_limit, rpm_limit)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(id, input.name?.trim() || 'default', hashKey(plaintext), prefix, Date.now(), dailyTokenLimit, rpmLimit)
+    this.stmtInsert.run(id, input.name?.trim() || 'default', hashKey(plaintext), prefix, Date.now(), dailyTokenLimit, rpmLimit)
     return { ...(this.get(id) as ApiKeyRecord), plaintext }
   }
 
   list(): readonly ApiKeyRecord[] {
-    return (this.db.prepare('SELECT * FROM api_keys ORDER BY created_at').all() as RawKeyRow[]).map(fromRow)
+    return (this.stmtList.all() as RawKeyRow[]).map(fromRow)
   }
 
   get(id: string): ApiKeyRecord | undefined {
-    const row = this.db.prepare('SELECT * FROM api_keys WHERE id = ?').get(id) as RawKeyRow | undefined
+    const row = this.stmtGet.get(id) as RawKeyRow | undefined
     return row === undefined ? undefined : fromRow(row)
   }
 
   /** Hash-lookup the plaintext; a hit with disabled_at set reports 'disabled'. */
   verify(plaintext: string): KeyVerifyResult {
-    const row = this.db.prepare('SELECT * FROM api_keys WHERE key_hash = ?').get(hashKey(plaintext)) as RawKeyRow | undefined
+    const row = this.stmtByHash.get(hashKey(plaintext)) as RawKeyRow | undefined
     if (row === undefined) return { verdict: 'unknown' }
     const key = fromRow(row)
     return key.disabledAt !== null ? { verdict: 'disabled', key } : { verdict: 'ok', key }
@@ -107,31 +138,60 @@ export class KeyStore {
     const disabledAt = patch.disabled === undefined ? current.disabledAt : patch.disabled ? Date.now() : null
     // scopes: undefined = leave as is; '' or null clears the whitelist (NULL).
     const scopes = patch.scopes === undefined ? current.scopes : patch.scopes === null || patch.scopes === '' ? null : patch.scopes
-    this.db
-      .prepare(`UPDATE api_keys SET name = ?, disabled_at = ?, daily_token_limit = ?, rpm_limit = ?, scopes = ? WHERE id = ?`)
-      .run(
-        patch.name?.trim() || current.name,
-        disabledAt,
-        positiveIntOrZero(patch.dailyTokenLimit ?? current.dailyTokenLimit),
-        positiveIntOrZero(patch.rpmLimit ?? current.rpmLimit),
-        scopes,
-        id,
-      )
+    this.stmtUpdate.run(
+      patch.name?.trim() || current.name,
+      disabledAt,
+      positiveIntOrZero(patch.dailyTokenLimit ?? current.dailyTokenLimit),
+      positiveIntOrZero(patch.rpmLimit ?? current.rpmLimit),
+      scopes,
+      id,
+    )
     return this.get(id)
   }
 
   remove(id: string): boolean {
-    const info = this.db.prepare('DELETE FROM api_keys WHERE id = ?').run(id)
+    const info = this.stmtDelete.run(id)
+    this.lastWritten.delete(id)
+    this.touchPending.delete(id)
     return info.changes > 0
   }
 
-  /** Best-effort last_used refresh — never throws into the request path. */
+  /** Best-effort last_used refresh — never throws into the request path.
+   *  B-M2: at most one autocommit fsync per key per TOUCH_DEBOUNCE_MS; the
+   *  first-ever touch (and touches after a window) still writes immediately. */
   touch(id: string): void {
     try {
-      this.db.prepare('UPDATE api_keys SET last_used_at = ? WHERE id = ?').run(Date.now(), id)
+      const now = Date.now()
+      const last = this.lastWritten.get(id) ?? 0
+      if (now - last < TOUCH_DEBOUNCE_MS) {
+        this.touchPending.set(id, now) // latest value wins; flushTouch lands it
+        return
+      }
+      this.writeTouch(id, now)
     } catch {
       // a closed/unavailable DB must not break an authenticated request
     }
+  }
+
+  /** Teardown: land the debounced last_used_at refreshes before the DB
+   *  closes (index.ts calls it ahead of ledger.close()). Best-effort. */
+  flushTouch(): void {
+    if (this.touchPending.size === 0) return
+    try {
+      for (const [id, ts] of this.touchPending) {
+        this.stmtTouch.run(ts, id)
+        this.lastWritten.set(id, ts)
+      }
+      this.touchPending.clear()
+    } catch {
+      // best-effort by contract
+    }
+  }
+
+  private writeTouch(id: string, ts: number): void {
+    this.stmtTouch.run(ts, id)
+    this.lastWritten.set(id, ts)
+    this.touchPending.delete(id)
   }
 }
 

@@ -137,7 +137,6 @@ export function classifyEvent(obj: unknown, seq: number): AgyEvent | undefined {
       kind: 'init',
       ...(convId !== undefined ? { conversationId: convId } : {}),
       ...(typeof model === 'string' ? { model } : {}),
-      raw: o,
     };
   }
   if (evt === 'step_update' || evt === 'step' || evt === 'stepUpdate') {
@@ -167,7 +166,6 @@ export function classifyEvent(obj: unknown, seq: number): AgyEvent | undefined {
       ...(toolInfo !== undefined ? { tool: toolInfo } : {}),
       ...(typeof stateV === 'string' ? { state: stateV } : {}),
       ...(usageRaw && typeof usageRaw === 'object' ? { usage: parseUsage(usageRaw) } : {}),
-      raw: o,
     };
   }
   if (evt === 'result' || evt === 'done' || evt === 'final') {
@@ -185,7 +183,6 @@ export function classifyEvent(obj: unknown, seq: number): AgyEvent | undefined {
       response: typeof response === 'string' ? response : '',
       ...(typeof error === 'string' ? { error } : {}),
       usage: parseUsage(inner.usage),
-      raw: o,
     };
   }
 // Shape inference for schemas without an event discriminator.
@@ -227,6 +224,11 @@ export interface ParserStats {
 // truncated — they exist for the doctor report tail and counters only.
 const MAX_PENDING_CHARS = 1_048_576
 const MAX_STORED_LINE_CHARS = 4000
+// A-L2: compaction granularity for the recentLines ring. Trimming exactly to
+// maxRecent on every line moved the whole 2000-entry array per line; dropping
+// in batches keeps the same chronological, truncated diagnostics tail at
+// amortized O(1) per line (one 512-element move per 512 lines).
+const RECENT_BATCH = 512
 
 function truncateStored(line: string): string {
   return line.length > MAX_STORED_LINE_CHARS ? line.slice(0, MAX_STORED_LINE_CHARS) : line
@@ -277,7 +279,7 @@ export class StreamJsonParser {
     if (line.trim() === '') return undefined
     this.stats.lines++
     this.recentLines.push(truncateStored(line))
-    if (this.recentLines.length > this.maxRecent) this.recentLines.splice(0, this.recentLines.length - this.maxRecent)
+    if (this.recentLines.length > this.maxRecent + RECENT_BATCH) this.recentLines.splice(0, RECENT_BATCH)
     if (looksLikeAuthFailure(line)) this.stats.sawAuthFailure = true
     if (this.stats.authUrl === undefined) {
       const u = extractAuthUrl(line)

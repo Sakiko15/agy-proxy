@@ -9,10 +9,11 @@
 //   6. 3-account concurrency ≥ 2.5× on a fixed fake delay
 //   7. single-key RPM=5 → 6th call 429 + Retry-After
 import { spawn, type ChildProcess } from 'node:child_process'
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { startAgyProcess } from '../src/host/runner.ts'
+import { writeFakeBin } from './fake-bin.mts'
 
 const REPO = resolve(import.meta.dirname, '..')
 const NODE = process.execPath
@@ -48,14 +49,16 @@ function spawnGateway(p: number, dataDir: string, extra: Record<string, string>)
   const dir = mkdtempSync(join(tmpdir(), 'agy-perf-'))
   const binDir = join(dir, 'bin')
   mkdirSync(binDir, { recursive: true })
-  writeFileSync(join(binDir, 'agy.cmd'), `@node "${FAKE}" %*\r\n`)
+  const fakeBin = writeFakeBin(binDir, NODE, FAKE)
   const child = spawn(NODE, [join(REPO, 'dist', 'index.js')], {
     env: {
       ...process.env,
       AGY_PROXY_DATA_DIR: dataDir,
       AGY_PROXY_PORT: String(p),
       AGY_PROXY_HOST: '127.0.0.1',
-      AGY_PROXY_BIN: join(binDir, 'agy.cmd'),
+      AGY_PROXY_BIN: fakeBin,
+      AGY_FAKE_NODE: NODE,
+      AGY_FAKE_SCRIPT: FAKE,
       AGY_PROXY_MODE: 'plan',
       AGY_PROXY_WEB_DIST: 'none',
       AGY_PROXY_ADMIN_PASSWORD: 'perf-admin',
@@ -225,23 +228,34 @@ async function main(): Promise<void> {
   console.log(`  plain body P50=${String(pct(plainMs, 50))}ms P95=${String(pct(plainMs, 95))}ms (bare full-run P50=${String(Math.round(pct(barePlain, 50)))}ms)`)
   judge('2 non-stream overhead < 100ms', pct(plainMs, 50) - pct(barePlain, 50) < 100, `gateway P50=${String(Math.round(pct(plainMs, 50)))}ms bare P50=${String(Math.round(pct(barePlain, 50)))}ms (delta ${String(Math.round(pct(plainMs, 50) - pct(barePlain, 50)))}ms)`)
 
-  // 4: ledger landing (per-request completion → usage row createdAt)
-  const doneTimes = new Map<string, number>()
+  // 4: ledger landing (per-request completion → usage row createdAt).
+  // Ledger request ids are always server-generated (a client x-request-id is
+  // observability metadata only — keying the ledger on it would let any caller
+  // replay one id to void every later row), so pair positionally instead: the
+  // calls below are strictly sequential and each yields exactly one row, so
+  // the k-th chronological row belongs to the k-th call. createdAt is stamped
+  // at flush time, so the delta is the honest landing latency including the
+  // flush wait; poll until all 30 rows have landed before reading them.
+  const doneAt: number[] = []
   for (let i = 0; i < 30; i++) {
-    const id = 'perf-led-' + String(i)
-    await call(h, false, 200 + i, id)
-    doneTimes.set(id, Date.now())
+    await call(h, false, 200 + i, 'perf-led-' + String(i))
+    doneAt.push(Date.now())
     await sleep(PACING)
   }
   const cookie = await login(h)
-  const usage = await h.api('GET', '/admin/usage?limit=500', undefined, cookie)
-  const rows = (JSON.parse(usage.body) as { rows?: Array<{ requestId: string; createdAt: number }> }).rows ?? []
-  const latencies: number[] = []
-  for (const row of rows) {
-    const done = doneTimes.get(row.requestId)
-    if (done !== undefined) latencies.push(row.createdAt - done)
+  let legRows: Array<{ seq: number; createdAt: number }> = []
+  for (let waited = 0; waited < 8_000; waited += 200) {
+    const usage = await h.api('GET', '/admin/usage?limit=500', undefined, cookie)
+    const all = (JSON.parse(usage.body) as { rows?: Array<{ seq: number; createdAt: number }> }).rows ?? []
+    legRows = all.slice(0, doneAt.length).reverse() // seq DESC → call order
+    if (legRows.length >= doneAt.length) break
+    await sleep(200)
   }
-  judge('4 ledger landing P95 < 2s', pct(latencies, 95) >= 0 && pct(latencies, 95) < 2_000, `P95=${String(Math.round(pct(latencies, 95)))}ms over ${String(latencies.length)} rows`)
+  // settle happens server-side just before the client sees the final chunk,
+  // so a flush tick between the two can make the raw delta slightly negative —
+  // a row visible at client completion has already landed, so clamp to 0.
+  const latencies = legRows.map((row, k) => Math.max(0, row.createdAt - (doneAt[k] ?? row.createdAt)))
+  judge('4 ledger landing P95 < 2s', legRows.length === doneAt.length && pct(latencies, 95) >= 0 && pct(latencies, 95) < 2_000, `P95=${String(Math.round(pct(latencies, 95)))}ms over ${String(legRows.length)}/${String(doneAt.length)} rows`)
 
   // 6: 3-account concurrency ≥ 2.5× (serial legs paced; parallel lanes only
   // spread when the pool mode is round-robin — sequential drain sticks to one
