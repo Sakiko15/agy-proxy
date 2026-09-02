@@ -362,15 +362,17 @@ unchanged — agy still runs its own tool loop; the gateway remains a mirror.
 
 - **docker-release workflow** (`.github/workflows/docker-release.yml`): manual
   `workflow_dispatch` (version input) builds the image on ubuntu-latest via
-  buildx and pushes `docker.io/sakiko15/agy-proxy:<version>` + `:latest`
-  (linux/amd64, GHA layer cache; Docker Hub credentials via the
-  `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` secrets).
+  buildx and pushes `ghcr.io/sakiko15/agy-proxy:<version>` + `:latest`
+  (linux/amd64, GHA layer cache), authorized by the workflow's own
+  `GITHUB_TOKEN` (`packages: write`) — no registry secrets to configure. The
+  first push creates the package private; flip it to Public once in the
+  GitHub packages UI for anonymous pulls.
 - **Self-contained image build** (`Dockerfile`): a new `build` stage compiles
   the gateway bundle (tsdown) inside the image, so `docker build .` no longer
   requires a prebuilt `dist/` on the build host — Node 24 + `npm run build`
   locally are no longer prerequisites.
 - **compose default image** (`docker-compose.yml`): `image` now defaults to
-  `docker.io/sakiko15/agy-proxy:0.2.0` (still overridable via `AGY_PROXY_IMAGE`
+  `ghcr.io/sakiko15/agy-proxy:0.2.0` (still overridable via `AGY_PROXY_IMAGE`
   in `.env`), and the file is trimmed to the 23-line core config — the tutorial
   guidance lives in docs/deploy.md.
 

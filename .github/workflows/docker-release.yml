@@ -1,8 +1,10 @@
-# Docker image release: manual dispatch only (charter red line — images are
+# Container image release: manual dispatch only (charter red line — images are
 # pushed solely on the user's explicit release command, never automatically).
-# The build is self-contained (Dockerfile compiles the gateway bundle in a
-# build stage) — no prebuilt dist/ is committed or required.
-# Secrets needed: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN (Docker Hub access token).
+# Pushes to GHCR (ghcr.io), authorized by the workflow's own GITHUB_TOKEN —
+# no registry secrets to configure. The build is self-contained (the Dockerfile
+# compiles the gateway bundle in a build stage; no prebuilt dist/ needed).
+# The first push creates the package PRIVATE — flip it to Public once in
+# GitHub → Your packages → agy-proxy → Package settings for anonymous pulls.
 name: docker-release
 
 on:
@@ -15,6 +17,7 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 jobs:
   build-push:
@@ -24,16 +27,16 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
-          registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
           push: true
           tags: |
-            docker.io/sakiko15/agy-proxy:${{ inputs.version }}
-            docker.io/sakiko15/agy-proxy:latest
+            ghcr.io/sakiko15/agy-proxy:${{ inputs.version }}
+            ghcr.io/sakiko15/agy-proxy:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max

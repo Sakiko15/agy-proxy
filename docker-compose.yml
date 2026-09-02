@@ -2,7 +2,7 @@
 # via AGY_PROXY_IMAGE in .env); runbook: docs/deploy.md
 services:
   gateway:
-    image: ${AGY_PROXY_IMAGE:-docker.io/sakiko15/agy-proxy:0.2.0}
+    image: ${AGY_PROXY_IMAGE:-ghcr.io/sakiko15/agy-proxy:0.2.0}
     container_name: agy-proxy
     restart: unless-stopped
     init: false # tini is the in-container PID 1 (Docker's --init must not wrap it)
