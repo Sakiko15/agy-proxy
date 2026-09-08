@@ -244,6 +244,53 @@ describe('engine: ok run, mirroring, binding', () => {
     await vi.waitFor(() => expect(cap.get(runId)).toBeUndefined(), { timeout: 5_000, interval: 10 })
   })
 
+  it('early break during a continuation span keeps the recording (audit F4: OR-merge, not overwrite)', async () => {
+    // The overwrite bug class: the CONTINUATION span itself breaks early
+    // (budget cut during the replay) before delivering any tool-call block.
+    // The finally's local flag is false there, and a plain overwrite would
+    // clobber the keep decision the first span already recorded — forgetting
+    // a settled recording whose replay cursor is still live, so a retry of
+    // the same mirror continuation would 404. The OR-merge keeps it.
+    const { engine, argsFile, runs } = makeEngine()
+    process.env.FAKE_AGY_MODE = 'ok'
+    // Spawns append to the helper's own args record (continuations must not
+    // add lines — asserted below), so point the recorder at it directly.
+    process.env.FAKE_AGY_ARGS_FILE = argsFile
+    let runId: string | undefined
+    let toolCallId: string | undefined
+    for await (const ch of engine.stream(call([msg('user', 'hello there')]))) {
+      if (ch.type === 'block-end' && (ch as { block: { type: string } }).block.type === 'tool-call') {
+        const block = (ch as unknown as { block: { id: string; arguments: string } }).block
+        runId = (JSON.parse(block.arguments) as { run: string }).run
+        toolCallId = block.id
+        break
+      }
+    }
+    expect(runId).toBeDefined()
+    await vi.waitFor(() => expect(runs.get(runId!)?.isSettled).toBe(true), { timeout: 5_000, interval: 10 })
+    // Continuation replay: break on the first delivered chunk. Guard the
+    // premise — the replay leg starts past the tool step, so it must not
+    // re-deliver a tool-call block (that would legitimately set the local
+    // flag and mask the bug).
+    for await (const ch of engine.stream(
+      call([msg('user', 'hello there'), { role: 'tool', text: 'replayed', toolCallId: toolCallId! }]),
+    )) {
+      expect(!(ch.type === 'block-end' && (ch as { block: { type: string } }).block.type === 'tool-call')).toBe(true)
+      break
+    }
+    // The recording survives the mid-replay break — the same mirror
+    // continuation is still replayable.
+    expect(runs.get(runId!)).toBeDefined()
+    const spawnsBefore = readFileSync(argsFile, 'utf8').trim().split('\n').length
+    const replay = await collect(
+      engine.stream(call([msg('user', 'hello there'), { role: 'tool', text: 'replayed', toolCallId: toolCallId! }])),
+    )
+    const finish = replay[replay.length - 1] as { type: string; reason: { kind: string } }
+    expect(finish.type).toBe('finish')
+    expect(finish.reason.kind).toBe('stop')
+    expect(readFileSync(argsFile, 'utf8').trim().split('\n').length).toBe(spawnsBefore)
+  })
+
   it('detectContinuation keys off the trailing mirror tool-result only', () => {
     const toolResult = (callId: string): EngineMessage => ({ role: 'tool', text: '', toolCallId: callId })
     expect(detectContinuation([msg('user', 'q'), toolResult('agytc-run-1-7')])).toEqual({ runId: 'run-1', eventIndex: 7 })

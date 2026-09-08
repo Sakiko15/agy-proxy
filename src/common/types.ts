@@ -184,6 +184,10 @@ export const Err = {
   VALIDATION_REQUIRED: 'VALIDATION_REQUIRED',
   /** Per-key model whitelist violation (M5) → 403, both protocol tables. */
   MODEL_NOT_ALLOWED: 'MODEL_NOT_ALLOWED',
+  /** The server gave up on a parked/queued request: client disconnect while
+   *  waiting for a concurrency slot (B3/P4 semaphore) or a shutdown-drain
+   *  abort. → 503 api_error on both protocol tables. */
+  ABORTED: 'ABORTED',
 } as const
 
 // Raw usage object as emitted by agy stream-json (snake_case).

@@ -64,6 +64,16 @@ describe('scopes enforcement (engine pre-spawn check on the served model)', () =
     expect(anthropicStatusFor(Err.MODEL_NOT_ALLOWED, 'msg')).toEqual({ statusCode: 403, type: 'permission_error' })
   })
 
+  it('ABORTED (B3/P4 semaphore code) is a 503 api_error on both tables, not a 500 fallback', () => {
+    // Thrown only when the server gives up: a parked waiter whose client is
+    // already gone, or a shutdown-drain abort. 503, no Retry-After.
+    expect(errorStatus(Err.ABORTED)).toEqual({ statusCode: 503, type: 'api_error' })
+    expect(anthropicStatusFor(Err.ABORTED, 'request aborted while waiting for a concurrency slot')).toEqual({
+      statusCode: 503,
+      type: 'api_error',
+    })
+  })
+
   it('no callback = feature off; a served turn completes', async () => {
     const { engine } = makeEngine({})
     process.env.FAKE_AGY_MODE = 'ok'

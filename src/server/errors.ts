@@ -58,6 +58,11 @@ export function errorStatus(code: string): { statusCode: number; type: string } 
     case 'UNSUPPORTED_REASONING_EFFORT':
       return { statusCode: 400, type: 'invalid_request_error' }
     case 'AGY_NOT_INSTALLED':
+    // ABORTED: the server gave up on the request — a parked waiter whose
+    // client already disconnected (invisible to any client) or a shutdown-
+    // drain abort (the gateway is going away). 503 without Retry-After: no
+    // known retry moment exists to advertise.
+    case 'ABORTED':
       return { statusCode: 503, type: 'api_error' }
     case 'TIMEOUT':
     case 'PROCESS_EXIT':
@@ -133,6 +138,8 @@ export function anthropicStatusFor(code: string, message: string): { statusCode:
     case 'UNSUPPORTED_REASONING_EFFORT':
       return { statusCode: 400, type: 'invalid_request_error' }
     case 'AGY_NOT_INSTALLED':
+    // Same ABORTED row as errorStatus above — see the rationale there.
+    case 'ABORTED':
       return { statusCode: 503, type: 'api_error' }
     case 'TIMEOUT':
     case 'PROCESS_EXIT':

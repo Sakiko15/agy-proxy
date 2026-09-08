@@ -1235,11 +1235,17 @@ export class AgyEngine {
       // or disconnect breaks out of the for-await), the keepForContinuation
       // tails after the two `yield*` call sites never run. Mirror the keep
       // decision here: a delivered tool-call block must keep the recording
-      // for the coming mirror continuation; anything else forgets at settle
-      // exactly as the tails would.
+      // for the coming mirror continuation. OR-merge, never overwrite — this
+      // span may BE a continuation whose predecessor already set the keep
+      // flag at its tail, and an early break leaves the replay cursor alive,
+      // so a false local flag must not undo that decision. (The tails
+      // overwrite because a completed span carries the final word.) Only a
+      // merged-false settled recording is forgotten, exactly as the tails
+      // would forget it.
       if (!completed) {
-        rec.keepForContinuation = clientSawToolCall
-        if (!clientSawToolCall && rec.isSettled) this.deps.runs.forget(rec.runId)
+        const keep = clientSawToolCall || rec.keepForContinuation
+        rec.keepForContinuation = keep
+        if (!keep && rec.isSettled) this.deps.runs.forget(rec.runId)
       }
     }
     return { cutOnTool: cutOnToolEnd }
