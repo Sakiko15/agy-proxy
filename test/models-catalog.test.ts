@@ -124,6 +124,39 @@ describe('ModelCatalog', () => {
     await expect(catalog.refreshIfNeeded()).resolves.toBe('fresh')
   })
 
+  it('code-review #10: forceRefresh routes through the refreshing latch — never concurrent spawns', async () => {
+    // The poller tick, the boot refresh and a manual POST /admin/catalog/refresh
+    // used to be able to stack: forceRefresh bypassed the latch and spawned a
+    // second `agy models` beside refreshIfNeeded's in-flight cycle. Every entry
+    // now joins the latch, so max in-flight discover calls is 1 — overlapping
+    // callers serialize into sequential cycles.
+    let calls = 0
+    let inFlight = 0
+    let maxInFlight = 0
+    const gate = deferred()
+    const discover: DiscoverFn = vi.fn(async () => {
+      calls += 1
+      inFlight += 1
+      maxInFlight = Math.max(maxInFlight, inFlight)
+      await gate.promise
+      inFlight -= 1
+      return okCatalog(['m1'])
+    })
+    const catalog = new ModelCatalog(discover, FALLBACK, 300_000)
+    const first = catalog.refreshIfNeeded()
+    await vi.waitFor(() => expect(inFlight).toBe(1))
+    const f1 = catalog.forceRefresh() // rides the in-flight cycle...
+    const f2 = catalog.forceRefresh() // ...then honors its own force pass
+    gate.resolve(okCatalog(['m1']))
+    await Promise.all([first, f1, f2])
+    // Hard invariant: one discover call in flight at any time.
+    expect(maxInFlight).toBe(1)
+    // Convergence: the poller cycle + exactly one extra force pass (the second
+    // force caller's pass is the one the first force started after its ride).
+    expect(calls).toBe(2)
+    expect(catalog.get().source).toBe('discovered')
+  })
+
   it('defaultEffortFor picks high → medium → low unless config pins one', () => {
     const cfg = defaultConfig()
     const entry = { id: 'g', name: 'g', efforts: ['low', 'medium', 'high'] }

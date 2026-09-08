@@ -200,17 +200,37 @@ export function readMacKeychainToken(): StoredToken | null {
 
 export class QuotaService {
   private preferredEndpointIndex = 0
-  /** Audit M4: a full-pool refresh cycle is in progress — overlapping
-   *  refreshAllQuotas calls (poll tick vs boot refresh vs manual click) are
-   *  dropped rather than stacked onto the same accounts. */
-  private refreshAllInFlight = false
+  /** Audit M4, reworked by code-review #11: the in-flight full-pool cycle as a
+   *  promise. Poll ticks, the boot refresh and manual refresh-all clicks all
+   *  funnel here; overlapping callers ride the running cycle instead of being
+   *  silently dropped (the former boolean guard answered a manual click with
+   *  ok:true over a pool the cycle had not yet touched). */
+  private refreshAllCycle: Promise<void> | null = null
   /** Audit F12: last quota-refresh failure per account, in memory like
    *  catalog.lastError. Endpoint failures used to be swallowed entirely and
    *  cards kept presenting stale/default quota numbers as if they were live.
    *  Cleared on the next successful refresh for that account. */
   private lastErrors = new Map<string, { message: string; at: number }>()
+  /** Code-review #6: quota-error state changes must reach the admin SSE bus.
+   *  lastErrors rides the merged pool snapshot, but the bus only pushes off
+   *  pool.onChange — a fresh endpoint failure used to stay invisible until
+   *  some unrelated pool mutation happened to push. Same seam shape as
+   *  AccountPoolManager.onChange. */
+  private changeListeners = new Set<() => void>()
 
   constructor(private readonly pool: AccountPoolManager) {}
+
+  /** Mutation hook fired when quota-error state changes (note/clear). */
+  onChange(fn: () => void): () => void {
+    this.changeListeners.add(fn)
+    return () => {
+      this.changeListeners.delete(fn)
+    }
+  }
+
+  private notify(): void {
+    for (const fn of this.changeListeners) fn()
+  }
 
   /** Last recorded quota-refresh failure for an account, or undefined. */
   getQuotaError(accountId: string): { message: string; at: number } | undefined {
@@ -219,10 +239,11 @@ export class QuotaService {
 
   private noteQuotaError(accountId: string, message: string): void {
     this.lastErrors.set(accountId, { message, at: Date.now() })
+    this.notify()
   }
 
   private clearQuotaError(accountId: string): void {
-    this.lastErrors.delete(accountId)
+    if (this.lastErrors.delete(accountId)) this.notify()
   }
 
   private getTokenFilePath(account: ManagedAccount): string {
@@ -668,20 +689,33 @@ export class QuotaService {
    * Google is made for this check (risk-control neutral).
    */
   async refreshAllQuotas(force = false): Promise<void> {
-    // Audit M4: reentry guard. Poll ticks, the boot refresh and manual
-    // refresh-all clicks all funnel here; a hung cycle used to outlive the
-    // 15 min interval (undici's 300s header timeout) and stack concurrent
-    // cycles over the same accounts. Callers during a cycle get a no-op:
-    // with agyFetch bounded at 10s per endpoint a cycle self-completes well
-    // under a minute, so a dropped manual click is recoverable on retry.
-    // Per-account manual refreshes stay unguarded — token persistence is
-    // atomic now (M3), making the only possible overlap benign.
-    if (this.refreshAllInFlight) return
-    this.refreshAllInFlight = true
+    // Audit M4, reworked by code-review #11: overlapping callers RIDE the
+    // in-flight cycle instead of being silently dropped — a manual click
+    // during a cycle used to answer ok:true over a pool the cycle had not
+    // touched yet. A non-force caller is satisfied by the cycle it rode; a
+    // force caller still owes a force pass (the ridden cycle legitimately
+    // skipped healthy accounts), so it waits the cycle out and runs its own.
+    // With agyFetch bounded at 10s per endpoint a cycle self-completes well
+    // under a minute. Per-account manual refreshes stay unguarded — token
+    // persistence is atomic now (M3), making the only possible overlap benign.
+    const running = this.refreshAllCycle
+    if (running !== null) {
+      await running
+      if (!force) return
+      // Two force callers riding the same cycle would otherwise both fall
+      // through here and stack a second cycle — re-check after the wake-up.
+      const started = this.refreshAllCycle
+      if (started !== null) {
+        await started
+        return
+      }
+    }
+    const cycle = this.runRefreshAllCycle(force)
+    this.refreshAllCycle = cycle
     try {
-      await this.runRefreshAllCycle(force)
+      await cycle
     } finally {
-      this.refreshAllInFlight = false
+      if (this.refreshAllCycle === cycle) this.refreshAllCycle = null
     }
   }
 

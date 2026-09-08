@@ -156,6 +156,29 @@ describe('keys lifecycle over the admin API (DoD ⑤)', () => {
     const removed = await adminSend(built, 'DELETE', '/admin/keys/key_nope', cookie)
     expect(removed.statusCode).toBe(404)
   })
+
+  it('code-review #4: negative/fractional limits 400 instead of reaching positiveIntOrZero', async () => {
+    // -5 used to land in key-store's positiveIntOrZero, which maps negatives
+    // to 0 = an UNLIMITED key granted by a typo; 100.5 was floored silently.
+    const { built, keys } = makeAdminServer()
+    const { cookie } = await login(built)
+    for (const bad of [-5, 100.5]) {
+      expect((await adminSend(built, 'POST', '/admin/keys', cookie, { name: 'bad', dailyTokenLimit: bad })).statusCode).toBe(400)
+      expect((await adminSend(built, 'POST', '/admin/keys', cookie, { name: 'bad', rpmLimit: bad })).statusCode).toBe(400)
+      // The 400 fires before the store call — even an unknown id answers 400,
+      // not 404.
+      expect((await adminSend(built, 'PATCH', '/admin/keys/key_nope', cookie, { rpmLimit: bad })).statusCode).toBe(400)
+    }
+    expect(keys.count()).toBe(0)
+    // 0 stays legal (= unlimited by explicit choice); absent limits stay
+    // untouched by PATCH.
+    const zero = await adminSend(built, 'POST', '/admin/keys', cookie, { name: 'zero', dailyTokenLimit: 0, rpmLimit: 0 })
+    expect(zero.statusCode).toBe(201)
+    const created = zero.json() as { key: { id: string } }
+    const renamed = await adminSend(built, 'PATCH', `/admin/keys/${created.key.id}`, cookie, { name: 'renamed' })
+    expect(renamed.statusCode).toBe(200)
+    expect((renamed.json() as { key: { dailyTokenLimit: number } }).key.dailyTokenLimit).toBe(0)
+  })
 })
 
 describe('key secret reveal + rotate (schema v3 reversible storage)', () => {

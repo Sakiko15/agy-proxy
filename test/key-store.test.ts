@@ -2,7 +2,7 @@
 // unknown / disabled), lifecycle. Maps to acceptance M3 DoD ⑤ (key lifecycle,
 // plaintext-once, sha256 落库验证) and MA4's disabled→403 leg.
 import { describe, it, expect, afterEach } from 'vitest'
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomBytes } from 'node:crypto'
@@ -187,6 +187,39 @@ describe('KeyStore reversible storage (schema v3 secret_enc)', () => {
     // The sidecar file holds 64 hex chars + newline, readable as-is.
     const file = readFileSync(join(dir, 'keys-enc.key'), 'utf8').trim()
     expect(file).toMatch(/^[0-9a-f]{64}$/)
+  })
+
+  it('code-review #3: a missing sidecar is generated and lands on disk atomically', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-mk-'))
+    dirs.push(dir)
+    const key = loadOrCreateMasterKey(dir)
+    expect(key).toHaveLength(32)
+    const raw = readFileSync(join(dir, 'keys-enc.key'), 'utf8')
+    expect(raw.trim()).toMatch(/^[0-9a-f]{64}$/)
+    // tmp+rename: the staging file is gone after the rename.
+    expect(existsSync(join(dir, 'keys-enc.key.tmp'))).toBe(false)
+  })
+
+  it('code-review #3: a corrupt sidecar throws instead of regenerating (loud-fail contract)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-mk-'))
+    dirs.push(dir)
+    const file = join(dir, 'keys-enc.key')
+    writeFileSync(file, 'deadbeef-not-hex\n')
+    expect(() => loadOrCreateMasterKey(dir)).toThrow(/refusing to regenerate/)
+    // The corrupt file is left exactly as-is — a silent regeneration would
+    // orphan every AES ciphertext in the DB.
+    expect(readFileSync(file, 'utf8')).toBe('deadbeef-not-hex\n')
+  })
+
+  it('code-review #3: an unreadable (non-ENOENT) sidecar throws too — never regenerate over it', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-mk-'))
+    dirs.push(dir)
+    // A directory where the sidecar should be: readFileSync fails with
+    // EISDIR — not ENOENT — so generation must be refused, not bulldozed.
+    mkdirSync(join(dir, 'keys-enc.key'))
+    expect(() => loadOrCreateMasterKey(dir)).toThrow()
+    // The impostor entry is untouched.
+    expect(existsSync(join(dir, 'keys-enc.key'))).toBe(true)
   })
 
   it('a store without a master key keeps legacy semantics: secret_enc NULL, reveal null', () => {

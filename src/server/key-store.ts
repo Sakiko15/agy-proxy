@@ -8,7 +8,7 @@
 // plaintext never reaches a log line (acceptance M3 DoD: sqlite3 查库确认无
 // 明文 — ciphertext is not plaintext).
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type BetterSqlite3 from 'better-sqlite3'
 
@@ -78,21 +78,39 @@ const MASTER_KEY_FILE = 'keys-enc.key'
  */
 export function loadOrCreateMasterKey(dataDir: string): Buffer {
   const file = join(dataDir, MASTER_KEY_FILE)
+  let hex: string | null = null
   try {
-    const hex = readFileSync(file, 'utf8').trim()
-    if (/^[0-9a-f]{64}$/i.test(hex)) return Buffer.from(hex, 'hex')
-  } catch {
-    // ENOENT (or unreadable) → generate below
+    hex = readFileSync(file, 'utf8').trim()
+  } catch (err) {
+    // Code-review #3: only a genuinely absent sidecar may be generated. Any
+    // other read failure (EACCES, EISDIR…) throws — regenerating would orphan
+    // every AES ciphertext in the DB (reveal/rotate unreadable forever) while
+    // the boot still looked healthy.
+    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err
   }
-  const hex = randomBytes(32).toString('hex')
+  if (hex !== null) {
+    if (/^[0-9a-f]{64}$/i.test(hex)) return Buffer.from(hex, 'hex')
+    // Loud-fail contract (cf. admin-session.ts sidecar comment): a
+    // present-but-corrupt sidecar is never silently regenerated — that would
+    // orphan the stored ciphertext; the operator must restore the file/DB
+    // pair from backup instead.
+    throw new Error(
+      `master key sidecar ${file} exists but is not a 64-hex-digit key — refusing to regenerate (that would orphan all stored key ciphertext); restore the ${MASTER_KEY_FILE}/DB pair from backup`,
+    )
+  }
+  const fresh = randomBytes(32).toString('hex')
   mkdirSync(dataDir, { recursive: true })
-  writeFileSync(file, hex + '\n', { mode: 0o600 })
+  // tmp+rename atomic write (pool S-M8 / quota persistRefreshedToken idiom):
+  // a torn half-written sidecar must never look like a valid key.
+  const tmp = `${file}.tmp`
+  writeFileSync(tmp, fresh + '\n', { mode: 0o600 })
+  renameSync(tmp, file)
   try {
     chmodSync(file, 0o600)
   } catch {
     // win32: the mode flag above is already a hint; never fail startup here
   }
-  return Buffer.from(hex, 'hex')
+  return Buffer.from(fresh, 'hex')
 }
 
 /** iv.ciphertext.authTag — three base64 segments (base64 never contains '.'). */

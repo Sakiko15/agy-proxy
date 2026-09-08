@@ -116,6 +116,15 @@ function ipAllowed(ip: string, allowlist: string): boolean {
 
 // ---- route registration -----------------------------------------------------------
 
+/** Code-review #4: shape gate for an optional limit field. key-store's
+ *  positiveIntOrZero would silently map a negative value to 0 (= unlimited —
+ *  a silent privilege grant) and floor a fractional one; a present-but-bad
+ *  value must 400 instead of being dropped or coerced. 0 stays legal
+ *  (= unlimited by explicit choice). */
+function limitIsInvalid(v: unknown): boolean {
+  return v !== undefined && !(typeof v === 'number' && Number.isInteger(v) && v >= 0)
+}
+
 export function registerAdminApi(app: AdminInstance, deps: AdminDeps): void {
   const guarded = (opts: { mutating?: boolean; skipSession?: boolean } = {}) => ({
     preHandler: async (request: FastifyRequest<any>, reply: FastifyReply) => {
@@ -456,6 +465,10 @@ export function registerAdminApi(app: AdminInstance, deps: AdminDeps): void {
 
   app.post('/admin/keys', guarded({ mutating: true }), async (request, reply) => {
     const body = (request.body ?? {}) as { name?: unknown; dailyTokenLimit?: unknown; rpmLimit?: unknown }
+    if (limitIsInvalid(body.dailyTokenLimit) || limitIsInvalid(body.rpmLimit)) {
+      await reply.code(400).send({ ok: false, error: 'dailyTokenLimit/rpmLimit must be non-negative integers' })
+      return reply
+    }
     const created = deps.keys.create({
       ...(typeof body.name === 'string' && body.name !== '' ? { name: body.name } : {}),
       ...(typeof body.dailyTokenLimit === 'number' && Number.isFinite(body.dailyTokenLimit) ? { dailyTokenLimit: body.dailyTokenLimit } : {}),
@@ -469,6 +482,10 @@ export function registerAdminApi(app: AdminInstance, deps: AdminDeps): void {
   app.patch('/admin/keys/:id', guarded({ mutating: true }), async (request, reply) => {
     const { id } = request.params as { id: string }
     const body = (request.body ?? {}) as { name?: unknown; disabled?: unknown; dailyTokenLimit?: unknown; rpmLimit?: unknown; scopes?: unknown }
+    if (limitIsInvalid(body.dailyTokenLimit) || limitIsInvalid(body.rpmLimit)) {
+      await reply.code(400).send({ ok: false, error: 'dailyTokenLimit/rpmLimit must be non-negative integers' })
+      return reply
+    }
     const updated = deps.keys.update(id, {
       ...(typeof body.name === 'string' && body.name !== '' ? { name: body.name } : {}),
       ...(typeof body.disabled === 'boolean' ? { disabled: body.disabled } : {}),

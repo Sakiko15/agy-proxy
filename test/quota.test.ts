@@ -326,10 +326,11 @@ describe('quota: aggregation and refresh', () => {
     expect(pool.getAccount(acc.id)!.email).toBe('stable@gmail.com')
   })
 
-  it('refreshAllQuotas drops overlapping calls instead of stacking cycles (audit M4)', async () => {
-    // Poll tick / boot refresh / manual click all funnel into the same cycle;
-    // a second call while one is in flight must be a no-op, and the guard
-    // must clear afterwards (finally) so later calls still run.
+  it('refreshAllQuotas: overlapping callers ride the in-flight cycle, never stack (audit M4 + review #11)', async () => {
+    // Poll tick / boot refresh / manual click all funnel into the same cycle.
+    // A non-force caller rides the running cycle (formerly: silently dropped,
+    // answering ok:true over a pool the cycle had not touched), and the
+    // single-flight slot clears afterwards so later calls still run.
     const dir = mkdtempSync(join(tmpdir(), 'agy-quota-reentry-'))
     const pool = new AccountPoolManager(dir)
     pool.createAccountSlot('reentry')
@@ -344,9 +345,62 @@ describe('quota: aggregation and refresh', () => {
     const svc = new SlowService(pool)
     await Promise.all([svc.refreshAllQuotas(), svc.refreshAllQuotas()])
     expect(started).toBe(1)
-    // Guard cleared: a fresh call runs a new cycle.
+    // Cycle over: a fresh call runs a new one.
     await svc.refreshAllQuotas()
     expect(started).toBe(2)
+  })
+
+  it('refreshAllQuotas: force callers during a cycle converge on one extra pass (review #11)', async () => {
+    // The ridden cycle may legitimately have skipped healthy accounts, so a
+    // force caller cannot be satisfied by riding — it waits the cycle out and
+    // runs its own force pass. The invariant that matters: the two force
+    // callers below converge on ONE extra pass — never two concurrent cycles
+    // over the same accounts.
+    const dir = mkdtempSync(join(tmpdir(), 'agy-quota-force-conv-'))
+    const pool = new AccountPoolManager(dir)
+    pool.createAccountSlot('conv')
+    let started = 0
+    class SlowService extends QuotaService {
+      override async refreshAccountQuota(_account: ManagedAccount, _force = false) {
+        started++
+        await new Promise((r) => setTimeout(r, 60))
+        return null
+      }
+    }
+    const svc = new SlowService(pool)
+    const cycle = svc.refreshAllQuotas() // non-force cycle in flight
+    await new Promise((r) => setTimeout(r, 10))
+    await Promise.all([cycle, svc.refreshAllQuotas(true), svc.refreshAllQuotas(true)])
+    expect(started).toBe(2) // cycle 1 (non-force) + exactly one converged force pass
+  })
+
+  it('quota-error state changes notify onChange listeners (review #6)', () => {
+    // lastErrors rides the merged pool snapshot, but the admin SSE bus only
+    // pushes off pool.onChange — without its own seam a fresh endpoint failure
+    // stayed invisible until some unrelated pool mutation happened to push.
+    const dir = mkdtempSync(join(tmpdir(), 'agy-quota-onchange-'))
+    const pool = new AccountPoolManager(dir)
+    const acc = pool.createAccountSlot('onchange')
+    const svc = new QuotaService(pool)
+    let notes = 0
+    const stop = svc.onChange(() => notes++)
+    // note/clear are private — reach through like the persistRefreshedToken
+    // test above; the seam contract is what matters, not the visibility.
+    const note = (svc as unknown as { noteQuotaError: (id: string, m: string) => void }).noteQuotaError
+    const clear = (svc as unknown as { clearQuotaError: (id: string) => void }).clearQuotaError
+    note.call(svc, acc.id, 'boom')
+    expect(notes).toBe(1)
+    note.call(svc, acc.id, 'boom-2') // message/at changed → still a push
+    expect(notes).toBe(2)
+    clear.call(svc, acc.id)
+    expect(notes).toBe(3)
+    // Clearing an absent error is a no-op — no spurious push.
+    clear.call(svc, acc.id)
+    expect(notes).toBe(3)
+    // Unsubscribe detaches the listener.
+    stop()
+    note.call(svc, acc.id, 'again')
+    expect(notes).toBe(3)
   })
 
   it('endpoint failures surface per account and clear on the next success (audit F12)', async () => {

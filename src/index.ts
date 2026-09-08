@@ -219,6 +219,12 @@ async function main(): Promise<void> {
     getPool: () => poolWithQuotaErrors(quota, pool.getPoolData()),
   })
   pool.onChange(() => bus.schedulePoolChange())
+  // Code-review #6: quota-error state changes (note/clear) must push too —
+  // lastErrors rides the merged pool snapshot but used to change without any
+  // bus trigger, leaving stale failure banners until an unrelated pool
+  // mutation happened to push. The bus debounces, so note/clear bursts in
+  // one refresh cycle collapse into one push.
+  quota.onChange(() => bus.schedulePoolChange())
 
   // Code-review #2: in ready mode this re-resolution is the vanish guard; in
   // disabled mode the probe block above already resolved (or warned about)

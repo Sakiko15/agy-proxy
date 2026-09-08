@@ -213,7 +213,24 @@ export class ModelCatalog {
   }
 
   async forceRefresh(): Promise<Catalog> {
-    await this.refresh();
+    // Code-review #10: route through the same single-flight latch as
+    // refreshIfNeeded — a manual refresh (POST /admin/catalog/refresh) used
+    // to spawn a second `agy models` concurrently with the poller's cycle.
+    // Riders join the in-flight cycle; the .finally nulls the latch BEFORE
+    // awaiters resume, so the re-check below decides whether this caller
+    // still owes its own pass — two overlapping forceRefresh calls
+    // serialize into sequential cycles (each honored), never concurrent
+    // spawns.
+    if (this.refreshing !== null) await this.refreshing;
+    if (this.refreshing !== null) {
+      // Another rider resumed first and started the next cycle — ride it.
+      await this.refreshing;
+      return this.current;
+    }
+    this.refreshing = this.refresh().finally(() => {
+      this.refreshing = null;
+    });
+    await this.refreshing;
     return this.current;
   }
 

@@ -49,8 +49,10 @@ export function startCatalogPoller(deps: CatalogPollerDeps): { stop(): void } {
         schedule(CATALOG_POLL_INTERVAL_MS)
         return
       }
-      // refreshIfNeeded never throws and dedupes in-flight refreshes, so
-      // overlap with the boot call or a manual forceRefresh is safe.
+      // refreshIfNeeded never throws and dedupes in-flight refreshes through
+      // the `refreshing` latch — forceRefresh routes through that latch too
+      // (code-review #10), so overlap with the boot call or a manual refresh
+      // serializes instead of stacking concurrent `agy models` spawns.
       // B4/S7: branch on the reported outcome instead of sniffing
       // catalog.source — a failed re-validation of a discovered catalog
       // spreads the old 'discovered' source over the stale timestamp, so
