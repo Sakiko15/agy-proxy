@@ -55,6 +55,8 @@ export interface UsageRow extends UsageRecord {
 
 export interface UsageQuery {
   keyId?: string
+  /** Exact match on account_id (pool account attribution, charter §9 page 5). */
+  accountId?: string
   model?: string
   family?: string
   from?: number
@@ -216,6 +218,7 @@ export class UsageLedger {
     const where: string[] = []
     const params: Record<string, unknown> = {}
     if (q.keyId !== undefined) { where.push('key_id = @keyId'); params.keyId = q.keyId }
+    if (q.accountId !== undefined) { where.push('account_id = @accountId'); params.accountId = q.accountId }
     if (q.model !== undefined) { where.push('model = @model'); params.model = q.model }
     if (q.family !== undefined) { where.push('family = @family'); params.family = q.family }
     if (q.from !== undefined) { where.push('created_at >= @from'); params.from = q.from }

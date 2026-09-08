@@ -48,6 +48,23 @@ export function AccountsPage(): React.JSX.Element {
             <span className="mr-1 text-xs text-muted-foreground">
               {t('accounts.mode')}: {pool?.mode === 'round-robin' ? t('accounts.modeRoundRobin') : t('accounts.modeSequential')}
             </span>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={pool === null}
+              onClick={() => {
+                const next = pool?.mode === 'round-robin' ? 'sequential' : 'round-robin'
+                void api
+                  .poolMode(next)
+                  .then(() => {
+                    toast.success(t('accounts.modeChanged', { mode: t(next === 'round-robin' ? 'accounts.modeRoundRobin' : 'accounts.modeSequential') }))
+                    refresh()
+                  })
+                  .catch(failToast)
+              }}
+            >
+              {pool?.mode === 'round-robin' ? t('accounts.switchToSequential') : t('accounts.switchToRoundRobin')}
+            </Button>
             <Button variant="outline" size="sm" onClick={() => void api.refreshQuota().then(refresh).catch(failToast)}>
               <RefreshCw className="size-3.5" aria-hidden />
               {t('accounts.refreshAll')}

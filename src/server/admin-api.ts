@@ -9,8 +9,8 @@
 // All responses are plain JSON ({ok, error?}) — deliberately not
 // OpenAI/Anthropic-shaped, since isAnthropicPath never matches /admin.
 // Token material rules (charter §10): OAuth token files are never read here,
-// key plaintext rides the create response exactly once and is never logged,
-// and no route exposes key_hash or session tokens.
+// key plaintext rides ONLY the create / rotate / secret-reveal responses and
+// is never logged, and no route exposes key_hash or session tokens.
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import { RateLimiterMemory } from 'rate-limiter-flexible'
 import QRCode from 'qrcode'
@@ -22,7 +22,7 @@ import type { QuotaService } from '../host/quota.ts'
 import type { PoolAuthFlow } from '../host/pool-auth.ts'
 import type { ModelCatalog } from '../host/models.ts'
 import type { KeyStore } from './key-store.ts'
-import type { UsageLedger } from './usage-ledger.ts'
+import type { UsageLedger, UsageRow } from './usage-ledger.ts'
 import type { AdminSessionStore } from './admin-session.ts'
 import { parseCookieHeader, serializeClearCookie, serializeSetCookie } from './admin-session.ts'
 import { sanitizeSettings, settingsView, writeOverridesPatch } from './settings.ts'
@@ -234,9 +234,36 @@ export function registerAdminApi(app: AdminInstance, deps: AdminDeps): void {
         })),
       },
       poolAuth: deps.poolAuth.status(),
-      catalog: { source: catalog.source, count: catalog.models.length },
+      catalog: {
+        source: catalog.source,
+        count: catalog.models.length,
+        discoveredAt: catalog.discoveredAt,
+        // MA5: upstream stderr tail or a thrown message — same exposure class
+        // as the ledger's failureMessage audit column, session-gated here.
+        // Deliberately NOT scrubTokenMaterial: development.md §8 pins that
+        // funnel to EventMapper.emitFailure alone.
+        lastError: catalog.lastError ?? null,
+      },
       keys: { count: deps.keys.count() },
       usage: { today: deps.ledger.summarizeToday() },
+    })
+    return reply
+  })
+
+  // ---- catalog refresh (MA5): explicit manual re-discovery. forceRefresh
+  // never rejects (models.ts refresh() swallows everything into lastError),
+  // so the endpoint answers 200 with the resulting state and the operator
+  // reads failure out of the payload, not from an HTTP error. ----
+  app.post('/admin/catalog/refresh', guarded({ mutating: true }), async (_request, reply) => {
+    const catalog = await deps.catalog.forceRefresh()
+    await reply.code(200).send({
+      ok: true,
+      catalog: {
+        source: catalog.source,
+        count: catalog.models.length,
+        discoveredAt: catalog.discoveredAt,
+        lastError: catalog.lastError ?? null,
+      },
     })
     return reply
   })
@@ -441,6 +468,33 @@ export function registerAdminApi(app: AdminInstance, deps: AdminDeps): void {
     return reply
   })
 
+  // Copy affordance: decrypt secret_enc (schema v3). null = the key predates
+  // reversible storage (its plaintext was never kept) — the WebUI answers
+  // with the "regenerate" hint instead of an error. GET is non-mutating, so
+  // the guard chain stops at the session cookie (no CSRF header needed).
+  app.get('/admin/keys/:id/secret', guarded(), async (request, reply) => {
+    const { id } = request.params as { id: string }
+    if (deps.keys.get(id) === undefined) {
+      await reply.code(404).send({ ok: false, error: 'not found' })
+      return reply
+    }
+    // plaintext rides this response only; it is never logged anywhere.
+    await reply.code(200).send({ ok: true, plaintext: deps.keys.reveal(id) })
+    return reply
+  })
+
+  app.post('/admin/keys/:id/rotate', guarded({ mutating: true }), async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const rotated = deps.keys.rotate(id)
+    if (rotated === undefined) {
+      await reply.code(404).send({ ok: false, error: 'not found' })
+      return reply
+    }
+    // plaintext rides this response exactly once; it is never logged anywhere.
+    await reply.code(200).send({ ok: true, key: { ...keyWithoutPlaintext(rotated) }, plaintext: rotated.plaintext })
+    return reply
+  })
+
   // ---- usage ----
   app.get('/admin/usage', guarded(), async (request, reply) => {
     const q = request.query as Record<string, string | string[] | undefined>
@@ -452,6 +506,7 @@ export function registerAdminApi(app: AdminInstance, deps: AdminDeps): void {
       return Number.isFinite(n) ? n : undefined
     }
     const keyId = one(q.keyId)
+    const accountId = one(q.accountId)
     const model = one(q.model)
     const family = one(q.family)
     const from = num(q.from)
@@ -460,6 +515,7 @@ export function registerAdminApi(app: AdminInstance, deps: AdminDeps): void {
     const offset = num(q.offset)
     const res = deps.ledger.query({
       ...(keyId !== undefined && keyId !== '' ? { keyId } : {}),
+      ...(accountId !== undefined && accountId !== '' ? { accountId } : {}),
       ...(model !== undefined && model !== '' ? { model } : {}),
       ...(family !== undefined && family !== '' ? { family } : {}),
       ...(from !== undefined ? { from } : {}),
@@ -467,7 +523,7 @@ export function registerAdminApi(app: AdminInstance, deps: AdminDeps): void {
       ...(limit !== undefined ? { limit } : {}),
       ...(offset !== undefined ? { offset } : {}),
     })
-    await reply.code(200).send({ ok: true, total: res.total, rows: res.rows })
+    await reply.code(200).send({ ok: true, total: res.total, rows: enrichUsageRows(res.rows, deps.pool) })
     return reply
   })
 
@@ -505,4 +561,21 @@ function keyWithoutPlaintext<T extends { plaintext?: string }>(created: T): Omit
   const out = { ...created } as Record<string, unknown>
   delete out.plaintext
   return out as Omit<T, 'plaintext'>
+}
+
+/** GET /admin/usage row: ledger row + pool-resolved account display fields.
+ *  Enrichment is read-time only — renamed/deleted accounts never rewrite
+ *  history, so an orphan id keeps accountAlias/accountEmail null while the
+ *  raw accountId stays visible (honest attribution). */
+export interface UsageRowView extends UsageRow {
+  accountAlias: string | null
+  accountEmail: string | null
+}
+
+function enrichUsageRows(rows: readonly UsageRow[], pool: AccountPoolManager): UsageRowView[] {
+  const byId = new Map(pool.getAccounts().map((a) => [a.id, a]))
+  return rows.map((row) => {
+    const account = row.accountId !== null ? byId.get(row.accountId) : undefined
+    return { ...row, accountAlias: account?.alias ?? null, accountEmail: account?.email ?? null }
+  })
 }

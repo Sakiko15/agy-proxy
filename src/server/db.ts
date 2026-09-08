@@ -11,7 +11,7 @@ import { dirname } from 'node:path'
 import Database from 'better-sqlite3'
 import { KEY_MARK } from './key-store.ts'
 
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -24,7 +24,13 @@ CREATE TABLE IF NOT EXISTS api_keys (
   daily_token_limit INTEGER NOT NULL DEFAULT 0,
   rpm_limit         INTEGER NOT NULL DEFAULT 0,
   scopes            TEXT,
-  last_used_at      INTEGER
+  last_used_at      INTEGER,
+  -- v3: AES-256-GCM ciphertext of the plaintext key (sidecar master
+  -- keys-enc.key on the data volume) so the admin WebUI can copy/regenerate
+  -- keys; the sha256 hash stays the only auth material. Attached by the
+  -- guarded migration for pre-v3 databases — ciphertext is not plaintext, so
+  -- the M3 DoD "no plaintext in the DB" assertion still holds.
+  secret_enc        TEXT
 );
 
 -- request_id UNIQUE is the ledger idempotency contract (acceptance M3 DoD:
@@ -77,6 +83,7 @@ export function openDb(path: string): Database.Database {
     db.exec(DDL)
     migrateUsageErrorText(db)
     migrateKeyPrefixMarker(db)
+    migrateKeySecretEnc(db)
     db.pragma(`user_version = ${SCHEMA_VERSION}`)
   }
   return db
@@ -101,6 +108,16 @@ function migrateKeyPrefixMarker(db: Database.Database): void {
   db.prepare(`UPDATE api_keys SET prefix = substr(prefix, ${KEY_MARK.length + 1}) WHERE prefix LIKE ? ESCAPE '\\'`).run(
     KEY_MARK.replace(/[-\\%_]/g, (c) => '\\' + c) + '_%',
   )
+}
+
+/** v3 migration: attach api_keys.secret_enc — same PRAGMA table_info guard as
+ *  migrateUsageErrorText, so a v2 database upgrades in place, fresh ones
+ *  no-op, and a restart never re-runs the ALTER. Legacy rows keep NULL
+ *  (reveal → the WebUI's "regenerate" hint; their plaintext was never kept). */
+function migrateKeySecretEnc(db: Database.Database): void {
+  const cols = db.prepare('PRAGMA table_info(api_keys)').all() as Array<{ name: string }>
+  if (cols.some((c) => c.name === 'secret_enc')) return
+  db.exec('ALTER TABLE api_keys ADD COLUMN secret_enc TEXT')
 }
 
 /** Flush the WAL back into the main file and close cleanly (shutdown path). */

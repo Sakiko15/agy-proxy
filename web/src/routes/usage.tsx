@@ -1,8 +1,11 @@
-// Usage log page (charter §9 page 5): filter by key/model/family/protocol/
-// status/from/to, server-paginated ≤500 rows, status chips, client-side CSV
-// export of the filtered rows (button disabled past the 500-row query cap).
-// Schema v2 (M5) added usage.error_text: failed rows carry their terminal
-// error detail — expanded in place under the row and included in the CSV.
+// Usage log page (charter §9 page 5): filter by key/account/model/family/
+// protocol/status/from/to, server-paginated ≤500 rows, status chips,
+// client-side CSV export of the filtered rows (button disabled past the
+// 500-row query cap). Schema v2 (M5) added usage.error_text: failed rows
+// carry their terminal error detail — expanded in place under the row and
+// included in the CSV. Account attribution: the server enriches each row
+// with the pool alias/email (read-time; orphaned/deleted ids keep the raw
+// accountId visible).
 import { Fragment, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
@@ -17,6 +20,7 @@ const PAGE_SIZE = 50
 
 interface Filters {
   keyId: string
+  accountId: string
   model: string
   family: string
   protocol: string
@@ -25,7 +29,7 @@ interface Filters {
   to: string
 }
 
-const EMPTY_FILTERS: Filters = { keyId: '', model: '', family: '', protocol: '', status: '', from: '', to: '' }
+const EMPTY_FILTERS: Filters = { keyId: '', accountId: '', model: '', family: '', protocol: '', status: '', from: '', to: '' }
 
 export function UsagePage(): React.JSX.Element {
   const { t } = useTranslation()
@@ -37,6 +41,7 @@ export function UsagePage(): React.JSX.Element {
     () =>
       buildQuery({
         keyId: filters.keyId,
+        accountId: filters.accountId,
         model: filters.model,
         family: filters.family,
         protocol: filters.protocol,
@@ -50,6 +55,10 @@ export function UsagePage(): React.JSX.Element {
   )
   const rowsQuery = useQuery({ queryKey: ['usage', query], queryFn: () => api.usage(query) })
   const keysQuery = useQuery({ queryKey: ['keys'], queryFn: () => api.keys() })
+  // Full pool data (not /admin/status): disabled accounts still served
+  // historical rows, so the filter lists them too; shares the ['pool'] cache
+  // with the accounts page.
+  const poolQuery = useQuery({ queryKey: ['pool'], queryFn: () => api.pool() })
   const rows = rowsQuery.data?.rows ?? []
   const total = rowsQuery.data?.total ?? 0
   const pages = Math.max(1, Math.ceil(total / PAGE_SIZE))
@@ -61,6 +70,7 @@ export function UsagePage(): React.JSX.Element {
       { header: 'time', value: (r) => new Date(r.createdAt).toISOString() },
       { header: 'key_id', value: (r) => r.keyId },
       { header: 'account_id', value: (r) => r.accountId },
+      { header: 'account_alias', value: (r) => r.accountAlias ?? r.accountEmail ?? r.accountId ?? '' },
       { header: 'model', value: (r) => r.model },
       { header: 'family', value: (r) => r.family },
       { header: 'protocol', value: (r) => r.protocol },
@@ -94,7 +104,7 @@ export function UsagePage(): React.JSX.Element {
       />
 
       <Card className="mb-3">
-        <CardContent className="grid grid-cols-2 gap-2 p-3 sm:grid-cols-4 lg:grid-cols-7">
+        <CardContent className="grid grid-cols-2 gap-2 p-3 sm:grid-cols-4 lg:grid-cols-8">
           <FilterInput label={t('usage.filterModel')} value={filters.model} onChange={(v) => setFilters({ ...filters, model: v })} />
           <FilterInput label={t('usage.filterFamily')} value={filters.family} onChange={(v) => setFilters({ ...filters, family: v })} />
           <FilterSelect
@@ -104,6 +114,15 @@ export function UsagePage(): React.JSX.Element {
             options={[{ value: 'openai', label: 'OpenAI' }, { value: 'anthropic', label: 'Anthropic' }]}
           />
           <FilterInput label={t('usage.filterStatus')} value={filters.status} onChange={(v) => setFilters({ ...filters, status: v })} />
+          <FilterSelect
+            label={t('usage.filterAccount')}
+            value={filters.accountId}
+            onChange={(v) => setFilters({ ...filters, accountId: v })}
+            options={(poolQuery.data?.pool.accounts ?? []).map((a) => ({
+              value: a.id,
+              label: a.email !== undefined && a.email !== '' ? `${a.alias} (${a.email})` : a.alias,
+            }))}
+          />
           <FilterInput label={t('usage.filterFrom')} type="datetime-local" value={filters.from} onChange={(v) => setFilters({ ...filters, from: v })} />
           <FilterInput label={t('usage.filterTo')} type="datetime-local" value={filters.to} onChange={(v) => setFilters({ ...filters, to: v })} />
           <FilterSelect
@@ -126,6 +145,7 @@ export function UsagePage(): React.JSX.Element {
                   <tr className="border-b border-border text-left text-xs text-muted-foreground">
                     <th className="p-2">{t('usage.createdAt')}</th>
                     <th className="p-2">{t('dashboard.model')}</th>
+                    <th className="p-2">{t('dashboard.account')}</th>
                     <th className="p-2">{t('dashboard.status')}</th>
                     <th className="p-2 text-right">{t('usage.promptTokens')}</th>
                     <th className="p-2 text-right">{t('usage.completionTokens')}</th>
@@ -140,6 +160,11 @@ export function UsagePage(): React.JSX.Element {
                       <tr className="border-b border-border/50">
                         <td className="p-2 tabular-nums text-muted-foreground">{formatTime(row.createdAt)}</td>
                         <td className="p-2 font-mono text-xs">{row.model}</td>
+                        {/* Alias first; orphaned/deleted pool ids fall back to
+                            the raw id (full value on hover) — honest attribution. */}
+                        <td className="p-2 font-mono text-xs text-muted-foreground" title={row.accountId ?? undefined}>
+                          {row.accountAlias ?? row.accountEmail ?? (row.accountId !== null ? shortId(row.accountId) : '—')}
+                        </td>
                         <td className="p-2">
                           {row.errorText !== undefined ? (
                             <button
@@ -163,7 +188,7 @@ export function UsagePage(): React.JSX.Element {
                       </tr>
                       {row.errorText !== undefined && expanded === row.seq && (
                         <tr className="border-b border-border/50 bg-muted/40">
-                          <td colSpan={8} className="p-3">
+                          <td colSpan={9} className="p-3">
                             <div className="text-xs font-medium text-muted-foreground">{t('usage.errorTextCol')}</div>
                             <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-foreground">{row.errorText}</pre>
                           </td>

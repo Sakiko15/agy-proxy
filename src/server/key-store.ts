@@ -1,10 +1,15 @@
 // API key store (charter §5 L129 names this module; §8/§10 fix the storage
 // shape): sha256 hash at rest + 8-char plaintext prefix for identification
 // (LiteLLM pattern). High-entropy keys need no slow hash; argon2 is reserved
-// for the admin password. Plaintext exists exactly once — in the create()
-// return value — and never in a table column, a log line, or a response
-// beyond that moment (acceptance M3 DoD: sha256 落库验证).
-import { createHash, randomBytes } from 'node:crypto'
+// for the admin password. Since schema v3 the plaintext additionally rests as
+// AES-256-GCM ciphertext (keys.secret_enc), keyed by a volume-local sidecar
+// master key (keys-enc.key, auto-generated) so the admin WebUI can copy or
+// rotate a key on demand; the hash stays the ONLY auth material and the
+// plaintext never reaches a log line (acceptance M3 DoD: sqlite3 查库确认无
+// 明文 — ciphertext is not plaintext).
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import type BetterSqlite3 from 'better-sqlite3'
 
 export interface ApiKeyRecord {
@@ -20,7 +25,7 @@ export interface ApiKeyRecord {
 }
 
 export interface CreatedApiKey extends ApiKeyRecord {
-  /** The only time the plaintext key leaves this module. */
+  /** The moment the plaintext key leaves this module (create / rotate). */
   plaintext: string
 }
 
@@ -60,6 +65,58 @@ export function generateApiKey(): { plaintext: string; prefix: string } {
   return { plaintext, prefix: plaintext.slice(KEY_MARK.length, KEY_MARK.length + 8) }
 }
 
+const MASTER_KEY_FILE = 'keys-enc.key'
+
+/**
+ * Volume-local sidecar master key (32 random bytes, hex) for the reversible
+ * secret storage: auto-generated on first use, mode 0600 where the OS honors
+ * it (win32 ignores the mode flag and chmod is a no-op — the file still lives
+ * on the protected /data volume next to the DB, same backup lifecycle). A DB
+ * restored without its sidecar file (or vice versa) makes the stored
+ * ciphertext unreadable — deploy.md §5 backs the whole volume for exactly
+ * this reason.
+ */
+export function loadOrCreateMasterKey(dataDir: string): Buffer {
+  const file = join(dataDir, MASTER_KEY_FILE)
+  try {
+    const hex = readFileSync(file, 'utf8').trim()
+    if (/^[0-9a-f]{64}$/i.test(hex)) return Buffer.from(hex, 'hex')
+  } catch {
+    // ENOENT (or unreadable) → generate below
+  }
+  const hex = randomBytes(32).toString('hex')
+  mkdirSync(dataDir, { recursive: true })
+  writeFileSync(file, hex + '\n', { mode: 0o600 })
+  try {
+    chmodSync(file, 0o600)
+  } catch {
+    // win32: the mode flag above is already a hint; never fail startup here
+  }
+  return Buffer.from(hex, 'hex')
+}
+
+/** iv.ciphertext.authTag — three base64 segments (base64 never contains '.'). */
+function sealSecret(master: Buffer, plaintext: string): string {
+  const iv = randomBytes(12)
+  const cipher = createCipheriv('aes-256-gcm', master, iv)
+  const ct = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()])
+  return `${iv.toString('base64')}.${ct.toString('base64')}.${cipher.getAuthTag().toString('base64')}`
+}
+
+/** GCM decrypt; a wrong master key or tampered ciphertext fails the auth tag
+ *  and reports null — the caller treats it as "not recoverable". */
+function openSecret(master: Buffer, blob: string): string | null {
+  const [ivB64, ctB64, tagB64] = blob.split('.')
+  if (ivB64 === undefined || ctB64 === undefined || tagB64 === undefined) return null
+  try {
+    const decipher = createDecipheriv('aes-256-gcm', master, Buffer.from(ivB64, 'base64'))
+    decipher.setAuthTag(Buffer.from(tagB64, 'base64'))
+    return Buffer.concat([decipher.update(Buffer.from(ctB64, 'base64')), decipher.final()]).toString('utf8')
+  } catch {
+    return null
+  }
+}
+
 /** B-M2: last_used_at is admin-UI display data, but the refresh used to be
  *  a full autocommit UPDATE (WAL fsync at synchronous=FULL) on every
  *  authenticated request. Writes are debounced to one per key per window;
@@ -73,6 +130,7 @@ export class KeyStore {
   private readonly stmtGet: BetterSqlite3.Statement
   private readonly stmtByHash: BetterSqlite3.Statement
   private readonly stmtInsert: BetterSqlite3.Statement
+  private readonly stmtRotate: BetterSqlite3.Statement
   private readonly stmtUpdate: BetterSqlite3.Statement
   private readonly stmtDelete: BetterSqlite3.Statement
   private readonly stmtTouch: BetterSqlite3.Statement
@@ -81,7 +139,13 @@ export class KeyStore {
   private readonly lastWritten = new Map<string, number>()
   private readonly touchPending = new Map<string, number>()
 
-  constructor(private readonly db: BetterSqlite3.Database) {
+  /** masterKey (when wired, see loadOrCreateMasterKey) enables the reversible
+   *  secret storage; absent → create/rotate store NULL and reveal() reports
+   *  null (tests and read-only data dirs keep the legacy show-once behavior). */
+  constructor(
+    private readonly db: BetterSqlite3.Database,
+    private readonly masterKey?: Buffer,
+  ) {
     // Prepare-once (same pattern as UsageLedger.insertStmt): verify/get ride
     // every request — per-call prepare churned sqlite_stmt objects each time.
     this.stmtCount = db.prepare('SELECT COUNT(*) AS n FROM api_keys')
@@ -89,9 +153,10 @@ export class KeyStore {
     this.stmtGet = db.prepare('SELECT * FROM api_keys WHERE id = ?')
     this.stmtByHash = db.prepare('SELECT * FROM api_keys WHERE key_hash = ?')
     this.stmtInsert = db.prepare(
-      `INSERT INTO api_keys (id, name, key_hash, prefix, created_at, daily_token_limit, rpm_limit)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO api_keys (id, name, key_hash, prefix, created_at, daily_token_limit, rpm_limit, secret_enc)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     )
+    this.stmtRotate = db.prepare('UPDATE api_keys SET key_hash = ?, prefix = ?, secret_enc = ? WHERE id = ?')
     this.stmtUpdate = db.prepare(
       'UPDATE api_keys SET name = ?, disabled_at = ?, daily_token_limit = ?, rpm_limit = ?, scopes = ? WHERE id = ?',
     )
@@ -108,7 +173,16 @@ export class KeyStore {
     const id = 'key_' + randomBytes(4).toString('hex')
     const dailyTokenLimit = positiveIntOrZero(input.dailyTokenLimit)
     const rpmLimit = positiveIntOrZero(input.rpmLimit)
-    this.stmtInsert.run(id, input.name?.trim() || 'default', hashKey(plaintext), prefix, Date.now(), dailyTokenLimit, rpmLimit)
+    this.stmtInsert.run(
+      id,
+      input.name?.trim() || 'default',
+      hashKey(plaintext),
+      prefix,
+      Date.now(),
+      dailyTokenLimit,
+      rpmLimit,
+      this.masterKey === undefined ? null : sealSecret(this.masterKey, plaintext),
+    )
     return { ...(this.get(id) as ApiKeyRecord), plaintext }
   }
 
@@ -154,6 +228,34 @@ export class KeyStore {
     this.lastWritten.delete(id)
     this.touchPending.delete(id)
     return info.changes > 0
+  }
+
+  /** Plaintext for the admin copy affordance — AES-256-GCM decrypt of
+   *  secret_enc. null for keys created before reversible storage (legacy
+   *  rows, never NULL-sealed), without a wired master key, or on an auth
+   *  failure (wrong/tampered) — the WebUI answers with the "regenerate"
+   *  hint in all three cases. Never logs. */
+  reveal(id: string): string | null {
+    const row = this.stmtGet.get(id) as RawKeyRow | undefined
+    if (row === undefined || row.secret_enc === null || this.masterKey === undefined) return null
+    return openSecret(this.masterKey, row.secret_enc)
+  }
+
+  /** Issue a fresh plaintext for an existing key: hash/prefix/secret_enc are
+   *  swapped in place, so the OLD value stops verifying immediately while
+   *  name/limits/disabled state survive. The new plaintext rides this return
+   *  value exactly once. */
+  rotate(id: string): CreatedApiKey | undefined {
+    const current = this.get(id)
+    if (current === undefined) return undefined
+    const { plaintext, prefix } = generateApiKey()
+    this.stmtRotate.run(
+      hashKey(plaintext),
+      prefix,
+      this.masterKey === undefined ? null : sealSecret(this.masterKey, plaintext),
+      id,
+    )
+    return { ...(this.get(id) as ApiKeyRecord), plaintext }
   }
 
   /** Best-effort last_used refresh — never throws into the request path.
@@ -206,6 +308,7 @@ interface RawKeyRow {
   rpm_limit: number
   scopes: string | null
   last_used_at: number | null
+  secret_enc: string | null
 }
 
 function fromRow(r: RawKeyRow): ApiKeyRecord {

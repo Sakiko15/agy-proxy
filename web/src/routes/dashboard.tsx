@@ -1,12 +1,17 @@
 // Dashboard (charter §9 page 2): today's requests/success-rate/tokens/active
 // accounts from /admin/usage (status split) + /admin/usage/summary + the
 // /admin/status pool snapshot; the live feed rides the /admin/events SSE hook.
-import { useQuery } from '@tanstack/react-query'
+// The model-catalog card renders /admin/status catalog detail (MA5) and the
+// manual re-discovery button.
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
-import { api } from '../api/client.ts'
+import { toast } from 'sonner'
+import { RefreshCw } from 'lucide-react'
+import { api, ApiError } from '../api/client.ts'
+import type { AdminStatus } from '../api/types.ts'
 import { useAdminEvents } from '../sse/useAdminEvents.ts'
 import { formatDuration, formatPercent, formatTime, formatTokens } from '../lib/format.ts'
-import { Badge, Card, CardContent, CardHeader, CardTitle, EmptyState, PageHeader } from '../components/ui.tsx'
+import { Badge, Button, Card, CardContent, CardHeader, CardTitle, EmptyState, PageHeader, Spinner } from '../components/ui.tsx'
 
 function localMidnight(): number {
   const now = new Date()
@@ -21,6 +26,61 @@ function StatCard({ label, value }: { label: string; value: string }) {
         <CardTitle className="text-xs font-medium text-muted-foreground">{label}</CardTitle>
       </CardHeader>
       <CardContent className="py-3 text-2xl font-semibold tabular-nums">{value}</CardContent>
+    </Card>
+  )
+}
+
+// MA5: source badge and lastError render orthogonally — stale-while-revalidate
+// keeps a discovered list serving after a failed re-validation, so the badge
+// says which list is live while the error text explains the last attempt.
+function ModelCatalogCard({ catalog }: { catalog: AdminStatus['catalog'] | undefined }) {
+  const { t } = useTranslation()
+  const queryClient = useQueryClient()
+  const refresh = useMutation({
+    mutationFn: () => api.catalogRefresh(),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['status'] })
+      toast.success(t('dashboard.catalogRefreshed'))
+    },
+    onError: (error) => {
+      toast.error(`${t('dashboard.catalogRefreshFailed')}: ${error instanceof ApiError ? error.message : String(error)}`)
+    },
+  })
+  const source =
+    catalog === undefined ? null : catalog.source === 'discovered' ? (
+      <Badge variant="success">{t('dashboard.catalogSourceDiscovered')}</Badge>
+    ) : (
+      <Badge variant="muted">{t('dashboard.catalogSourceFallback')}</Badge>
+    )
+  return (
+    <Card>
+      <CardHeader className="flex-row items-center justify-between space-y-0 pb-2">
+        <CardTitle className="text-sm">{t('dashboard.modelCatalogTitle')}</CardTitle>
+        <Button size="sm" variant="outline" onClick={() => refresh.mutate()} disabled={refresh.isPending}>
+          {refresh.isPending ? <Spinner className="size-3" /> : <RefreshCw className="size-3.5" />}
+          {t('common.refresh')}
+        </Button>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-1.5 text-sm">
+        <div className="flex items-center justify-between gap-2">
+          {source ?? <span className="text-muted-foreground">—</span>}
+          <span className="tabular-nums">
+            {catalog === undefined ? '—' : `${t('dashboard.catalogModels')}: ${catalog.count}`}
+          </span>
+        </div>
+        <div className="text-xs text-muted-foreground">
+          {t('dashboard.catalogDiscoveredAt')}:{' '}
+          {catalog === undefined ? '—' : catalog.discoveredAt === 0 ? t('common.never') : formatTime(catalog.discoveredAt)}
+        </div>
+        {catalog?.lastError != null && (
+          <p className="break-all rounded border border-destructive/40 bg-destructive/10 p-2 font-mono text-xs text-destructive">
+            {catalog.lastError}
+          </p>
+        )}
+        {catalog !== undefined && catalog.source === 'fallback' && catalog.lastError === null && (
+          <p className="text-xs text-muted-foreground">{t('dashboard.catalogNoAccountHint')}</p>
+        )}
+      </CardContent>
     </Card>
   )
 }
@@ -59,6 +119,12 @@ export function DashboardPage(): React.JSX.Element {
           label={t('dashboard.activeAccounts')}
           value={status.data === undefined ? '—' : `${active.length} / ${accounts.length}`}
         />
+      </div>
+
+      <div className="mt-4 grid gap-3 lg:grid-cols-3">
+        <div className="lg:col-span-3">
+          <ModelCatalogCard catalog={status.data?.catalog} />
+        </div>
       </div>
 
       <div className="mt-4 grid gap-3 lg:grid-cols-3">

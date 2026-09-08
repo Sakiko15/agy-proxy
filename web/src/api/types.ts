@@ -88,6 +88,9 @@ export interface UsageRow {
   requestId: string
   keyId: string | null
   accountId: string | null
+  /** Pool-resolved display fields (server enrichment) — null for orphaned/deleted ids. */
+  accountAlias: string | null
+  accountEmail: string | null
   model: string
   family: string
   protocol: 'openai' | 'anthropic'
@@ -124,7 +127,7 @@ export interface AdminStatus {
     }>
   }
   poolAuth: PoolAuthStatus
-  catalog: { source: string; count: number }
+  catalog: { source: string; count: number; discoveredAt: number; lastError: string | null }
   keys: { count: number }
   usage: { today: UsageSummary }
 }

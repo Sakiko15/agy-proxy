@@ -11,6 +11,7 @@ import * as Dialog from '@radix-ui/react-dialog'
 import { api, ApiError } from '../api/client.ts'
 import type { ApiKeyWithToday } from '../api/types.ts'
 import { formatTime, formatTokens } from '../lib/format.ts'
+import { copyText } from '../lib/clipboard.ts'
 import { Badge, Button, Card, CardContent, EmptyState, Input, Label, PageHeader } from '../components/ui.tsx'
 
 export function KeysPage(): React.JSX.Element {
@@ -54,6 +55,7 @@ export function KeysPage(): React.JSX.Element {
 function KeyRow({ apiKey, onChanged }: { apiKey: ApiKeyWithToday; onChanged: () => void }): React.JSX.Element {
   const { t } = useTranslation()
   const [editing, setEditing] = useState(false)
+  const [rotatedPlaintext, setRotatedPlaintext] = useState<string | null>(null)
   const [dailyLimit, setDailyLimit] = useState(String(apiKey.dailyTokenLimit))
   const [rpmLimit, setRpmLimit] = useState(String(apiKey.rpmLimit))
   const [scopes, setScopes] = useState(apiKey.scopes ?? '')
@@ -86,6 +88,25 @@ function KeyRow({ apiKey, onChanged }: { apiKey: ApiKeyWithToday; onChanged: () 
           {t('keys.lastUsed')}: {formatTime(apiKey.lastUsedAt)}
         </div>
         <div className="ml-auto flex gap-1.5">
+          {/* Copy affordance: null plaintext = the key predates reversible
+              storage — point the admin at "Regenerate" instead of erroring. */}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              void api.revealKeySecret(apiKey.id).then((r) => {
+                if (r.plaintext === null) {
+                  toast.info(t('keys.legacyNoSecret'))
+                  return
+                }
+                void copyText(r.plaintext)
+                  .then(() => toast.success(t('common.copied')))
+                  .catch(() => toast.error(t('keys.copyFailed')))
+              }).catch(showError)
+            }}
+          >
+            {t('keys.copyKey')}
+          </Button>
           <Button variant="outline" size="sm" onClick={() => setEditing((v) => !v)}>
             {t('common.edit')}
           </Button>
@@ -112,6 +133,20 @@ function KeyRow({ apiKey, onChanged }: { apiKey: ApiKeyWithToday; onChanged: () 
             }}
           >
             {t('common.delete')}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              if (window.confirm(t('keys.rotateConfirm'))) {
+                void api.rotateKey(apiKey.id).then((r) => {
+                  setRotatedPlaintext(r.plaintext)
+                  onChanged()
+                }).catch(showError)
+              }
+            }}
+          >
+            {t('keys.rotate')}
           </Button>
         </div>
         {editing && (
@@ -156,6 +191,7 @@ function KeyRow({ apiKey, onChanged }: { apiKey: ApiKeyWithToday; onChanged: () 
             <Button size="sm" type="submit">{t('common.save')}</Button>
           </form>
         )}
+        {rotatedPlaintext !== null && <RotateDialog plaintext={rotatedPlaintext} onClose={() => setRotatedPlaintext(null)} />}
       </CardContent>
     </Card>
   )
@@ -186,7 +222,6 @@ function CreateKeyDialog({
   const [dailyLimit, setDailyLimit] = useState('0')
   const [rpmLimit, setRpmLimit] = useState('0')
   const [plaintext, setPlaintext] = useState<string | null>(null)
-  const [saved, setSaved] = useState(false)
 
   const submit = (event: FormEvent<HTMLFormElement>): void => {
     event.preventDefault()
@@ -198,7 +233,6 @@ function CreateKeyDialog({
       })
       .then((created) => {
         setPlaintext(created.plaintext)
-        setSaved(false)
         onCreated()
       })
       .catch((error: unknown) => toast.error(error instanceof ApiError ? error.message : String(error)))
@@ -237,28 +271,63 @@ function CreateKeyDialog({
               <Button type="submit">{t('common.create')}</Button>
             </form>
           ) : (
-            <div className="mt-3 flex flex-col gap-3">
-              <p className="text-sm font-medium text-amber-700 dark:text-amber-400">{t('keys.plaintextOnce')}</p>
-              <code className="block overflow-x-auto rounded-md border border-border bg-muted p-3 font-mono text-xs select-all">{plaintext}</code>
-              <Button
-                variant="outline"
-                size="sm"
-                className="self-start"
-                onClick={() => {
-                  void navigator.clipboard.writeText(plaintext).then(() => toast.success(t('common.copied')))
-                }}
-              >
-                {t('common.copy')}
-              </Button>
-              <label className="flex items-center gap-2 text-sm">
-                <input type="checkbox" checked={saved} onChange={(e) => setSaved(e.currentTarget.checked)} aria-label={t('keys.saved')} />
-                {t('keys.saved')}
-              </label>
-              <Button disabled={!saved} onClick={() => close(false)}>
-                {t('common.close')}
-              </Button>
-            </div>
+            <PlaintextReveal plaintext={plaintext} onClose={() => close(false)} />
           )}
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  )
+}
+
+/** Shared plaintext-reveal step (create-once + rotate): the value shows
+ *  exactly once per issuance; the copy button survives non-secure contexts
+ *  (copyText fallback) and the "I saved it" checkbox gates the explicit
+ *  close. */
+function PlaintextReveal({ plaintext, onClose }: { plaintext: string; onClose: () => void }): React.JSX.Element {
+  const { t } = useTranslation()
+  const [saved, setSaved] = useState(false)
+  return (
+    <div className="mt-3 flex flex-col gap-3">
+      <p className="text-sm font-medium text-amber-700 dark:text-amber-400">{t('keys.plaintextOnce')}</p>
+      <code className="block overflow-x-auto rounded-md border border-border bg-muted p-3 font-mono text-xs select-all">{plaintext}</code>
+      <Button
+        variant="outline"
+        size="sm"
+        className="self-start"
+        onClick={() => {
+          void copyText(plaintext)
+            .then(() => toast.success(t('common.copied')))
+            .catch(() => toast.error(t('keys.copyFailed')))
+        }}
+      >
+        {t('common.copy')}
+      </Button>
+      <label className="flex items-center gap-2 text-sm">
+        <input type="checkbox" checked={saved} onChange={(e) => setSaved(e.currentTarget.checked)} aria-label={t('keys.saved')} />
+        {t('keys.saved')}
+      </label>
+      <Button disabled={!saved} onClick={onClose}>
+        {t('common.close')}
+      </Button>
+    </div>
+  )
+}
+
+/** Post-rotate reveal: the new plaintext, same once-only gates as create. */
+function RotateDialog({ plaintext, onClose }: { plaintext: string; onClose: () => void }): React.JSX.Element {
+  const { t } = useTranslation()
+  return (
+    <Dialog.Root
+      open
+      onOpenChange={(next: boolean) => {
+        if (next === false) onClose()
+      }}
+    >
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 bg-black/50" />
+        <Dialog.Content className="fixed left-1/2 top-1/2 w-[min(92vw,28rem)] -translate-x-1/2 -translate-y-1/2 rounded-lg border border-border bg-card p-5 focus-visible:outline-ring">
+          <Dialog.Title className="text-sm font-semibold">{t('keys.rotate')}</Dialog.Title>
+          <PlaintextReveal plaintext={plaintext} onClose={onClose} />
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>

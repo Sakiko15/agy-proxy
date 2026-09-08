@@ -5,6 +5,7 @@
 import { describe, it, expect } from 'vitest'
 import { makeAdminServer, login, adminGet, adminSend } from './helpers.admin.ts'
 import { parseCookieHeader } from '../src/server/admin-session.ts'
+import { generateApiKey, hashKey } from '../src/server/key-store.ts'
 
 describe('admin session + guards (charter §10)', () => {
   it('login sets an httpOnly SameSite=Lax cookie; wrong password → 401', async () => {
@@ -154,6 +155,122 @@ describe('keys lifecycle over the admin API (DoD ⑤)', () => {
     expect(missing.statusCode).toBe(404)
     const removed = await adminSend(built, 'DELETE', '/admin/keys/key_nope', cookie)
     expect(removed.statusCode).toBe(404)
+  })
+})
+
+describe('key secret reveal + rotate (schema v3 reversible storage)', () => {
+  it('reveal returns the plaintext of a freshly created key; unauthenticated → 401', async () => {
+    const { built, keys } = makeAdminServer()
+    const created = keys.create({ name: 'rev' })
+    // No cookie → the guard chain denies before anything is decrypted.
+    const denied = await adminGet(built, `/admin/keys/${created.id}/secret`, '')
+    expect(denied.statusCode).toBe(401)
+    const { cookie } = await login(built)
+    const res = await adminGet(built, `/admin/keys/${created.id}/secret`, cookie)
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toEqual({ ok: true, plaintext: created.plaintext })
+  })
+
+  it('a legacy row (secret_enc NULL) answers plaintext null without erroring', async () => {
+    const { built, db } = makeAdminServer()
+    // Hand-built pre-v3 row — the plaintext was never stored server-side.
+    const { plaintext } = generateApiKey()
+    db.prepare(`INSERT INTO api_keys (id, name, key_hash, prefix, created_at) VALUES ('key_legacy', 'pre-v3', ?, 'Qq11Ww22', 1)`).run(hashKey(plaintext))
+    const { cookie } = await login(built)
+    const res = await adminGet(built, '/admin/keys/key_legacy/secret', cookie)
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toEqual({ ok: true, plaintext: null })
+  })
+
+  it('reveal/rotate on an unknown key id → 404', async () => {
+    const { built } = makeAdminServer()
+    const { cookie } = await login(built)
+    expect((await adminGet(built, '/admin/keys/key_nope/secret', cookie)).statusCode).toBe(404)
+    expect((await adminSend(built, 'POST', '/admin/keys/key_nope/rotate', cookie, {})).statusCode).toBe(404)
+  })
+
+  it('rotate issues a new plaintext once, kills the old one, and re-arms reveal', async () => {
+    const { built, keys } = makeAdminServer()
+    const created = keys.create({ name: 'rot', dailyTokenLimit: 100 })
+    const { cookie } = await login(built)
+    const res = await adminSend(built, 'POST', `/admin/keys/${created.id}/rotate`, cookie, {})
+    expect(res.statusCode).toBe(200)
+    const body = res.json() as { ok: boolean; key: { id: string; prefix: string }; plaintext: string }
+    expect(body.ok).toBe(true)
+    expect(body.plaintext).toMatch(/^sk-agy-/)
+    expect(body.plaintext).not.toBe(created.plaintext)
+    expect(body.key.prefix).not.toBe(created.prefix)
+    // The auth material swapped atomically: old → unknown, new → ok.
+    expect(keys.verify(created.plaintext).verdict).toBe('unknown')
+    expect(keys.verify(body.plaintext).verdict).toBe('ok')
+    // Reveal now hands out the NEW value (reversible storage re-armed).
+    const revealed = await adminGet(built, `/admin/keys/${created.id}/secret`, cookie)
+    expect(revealed.json()).toEqual({ ok: true, plaintext: body.plaintext })
+  })
+
+  it('rotate is a mutation: missing x-requested-with → 403 csrf', async () => {
+    const { built, keys } = makeAdminServer()
+    const created = keys.create({ name: 'csrf' })
+    const { cookie } = await login(built)
+    const res = await built.app.inject({
+      method: 'POST',
+      url: `/admin/keys/${created.id}/rotate`,
+      payload: {},
+      headers: { cookie, 'content-type': 'application/json' },
+    })
+    expect(res.statusCode).toBe(403)
+    expect((res.json() as { error: string }).error).toContain('x-requested-with')
+  })
+})
+
+describe('usage route account attribution (read-time pool enrichment)', () => {
+  interface UsageBody {
+    ok: boolean
+    total: number
+    rows: Array<{ requestId: string; accountId: string | null; accountAlias: string | null; accountEmail: string | null }>
+  }
+
+  it('resolves accountAlias from the pool; orphan and null ids stay honest', async () => {
+    const { built, pool, ledger } = makeAdminServer()
+    const alpha = pool.createAccountSlot('alpha')
+    // Three rows: served by a live pool account, by a deleted-then-removed id
+    // (orphan), and by no account at all (root key / pool-less run).
+    ledger.record({ requestId: 'u-live', keyId: null, accountId: alpha.id, model: 'gemini-3.7-flash', family: 'google', protocol: 'openai', promptTokens: 1, completionTokens: 1, status: 'OK' })
+    ledger.record({ requestId: 'u-ghost', keyId: null, accountId: 'acc_ghost', model: 'gemini-3.7-flash', family: 'google', protocol: 'openai', promptTokens: 1, completionTokens: 1, status: 'OK' })
+    ledger.record({ requestId: 'u-none', keyId: null, accountId: null, model: 'gemini-3.7-flash', family: 'google', protocol: 'openai', promptTokens: 1, completionTokens: 1, status: 'OK' })
+    await ledger.flush()
+
+    const { cookie } = await login(built)
+    const res = await adminGet(built, '/admin/usage', cookie)
+    expect(res.statusCode).toBe(200)
+    const body = res.json() as UsageBody
+    expect(body.ok).toBe(true)
+    expect(body.total).toBe(3)
+    const byId = new Map(body.rows.map((r) => [r.requestId, r]))
+    expect(byId.get('u-live')).toMatchObject({ accountId: alpha.id, accountAlias: 'alpha', accountEmail: null })
+    // Orphan: enrichment null, raw id preserved (honest attribution).
+    expect(byId.get('u-ghost')).toMatchObject({ accountId: 'acc_ghost', accountAlias: null, accountEmail: null })
+    expect(byId.get('u-none')).toMatchObject({ accountId: null, accountAlias: null, accountEmail: null })
+  })
+
+  it('the accountId query filter narrows to exactly the matching rows', async () => {
+    const { built, pool, ledger } = makeAdminServer()
+    const alpha = pool.createAccountSlot('alpha')
+    const beta = pool.createAccountSlot('beta')
+    for (const [id, account] of [['f-alpha', alpha.id], ['f-beta', beta.id], ['f-none', null]] as const) {
+      ledger.record({ requestId: id, keyId: null, accountId: account, model: 'gemini-3.7-flash', family: 'google', protocol: 'openai', promptTokens: 1, completionTokens: 1, status: 'OK' })
+    }
+    await ledger.flush()
+    const { cookie } = await login(built)
+    const filtered = await adminGet(built, `/admin/usage?accountId=${encodeURIComponent(alpha.id)}`, cookie)
+    expect(filtered.statusCode).toBe(200)
+    const body = filtered.json() as UsageBody
+    expect(body.total).toBe(1)
+    expect(body.rows.map((r) => r.requestId)).toEqual(['f-alpha'])
+    expect(body.rows[0]?.accountAlias).toBe('alpha')
+    // Unfiltered total stays 3 — the filter genuinely narrows the query.
+    const all = await adminGet(built, '/admin/usage', cookie)
+    expect((all.json() as UsageBody).total).toBe(3)
   })
 })
 

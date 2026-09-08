@@ -86,7 +86,7 @@ must carry a non-empty `x-requested-with` header). Session cookie: `HttpOnly; Sa
 |---|---|
 | `POST /admin/login` | `{password}` → session cookie; wrong password answers 401 after a 300ms damping delay |
 | `POST /admin/logout` · `GET /admin/me` | Drop the session · remaining TTL |
-| `GET /admin/status` | Gateway posture, catalog, key count, today's usage summary, pool overview — never token/key material |
+| `GET /admin/status` | Gateway posture, catalog (`source`/`count`/`discoveredAt`/`lastError`), key count, today's usage summary, pool overview — never token/key material |
 | `GET /admin/pool` | Account pool data (aliases, dirs, cooldowns, quota, auth state) |
 | `POST /admin/pool/auth/begin` | `{alias?}` → paste-URL login flow state (`phase`/`url`/`mode`) |
 | `GET /admin/pool/auth/status` | Current flow state |
@@ -96,6 +96,7 @@ must carry a non-empty `x-requested-with` header). Session cookie: `HttpOnly; Sa
 | `PATCH`/`DELETE /admin/pool/accounts/{id}` | Alias / enable / proxy changes · remove the account |
 | `POST /admin/pool/accounts/{id}/clear-cooldown` · `/refresh-quota` · `/clear-auth` | Manual pool maintenance (M5: `/clear-auth` recovers a misfired VALIDATION_REQUIRED/auth quarantine) |
 | `POST /admin/pool/quota/refresh` · `/admin/pool/mode` · `/admin/pool/reorder` | Pool-wide refresh, selection mode, sticky order |
+| `POST /admin/catalog/refresh` | Manual model re-discovery (`agy models` inside a signed-in pool account's isolated HOME) — always answers 200 with the resulting `{source, count, discoveredAt, lastError}`; failures land in `lastError`, not in an HTTP error |
 | `GET/POST/PATCH/DELETE /admin/keys` | Key lifecycle — `POST` returns the `sk-agy-` plaintext **exactly once**; it is never logged. `PATCH` accepts `scopes` (comma/newline-separated model whitelist; empty = unrestricted) |
 | `GET /admin/usage` · `/admin/usage/summary` | Ledger query (`keyId`,`model`,`family`,`from`,`to`,`limit`≤500,`offset`) and today's totals |
 | `GET /admin/events` | **SSE** (`text/event-stream`): seq-stamped `snapshot`/`run`/`pool` events; reconnects replay from `Last-Event-ID` (snapshot XOR replay) |
@@ -191,7 +192,13 @@ log sites). To verify: send a request with a fake key, then grep the log output 
 - **Unknown models**: with a *discovered* catalog, unknown ids → 404 `model_not_found` with
   the available list; when no discovery has happened (not signed in), the fallback catalog
   stays advisory and unknown ids pass through to agy (its real error text comes back as a
-  502 `error.message`).
+  502 `error.message`). Discovery itself runs `agy models` inside a signed-in pool
+  account's isolated HOME on a 60s poller gated by the 300s catalog TTL (stale-while-
+  revalidate; failure backoff caps at 10 minutes) — it needs at least one enabled,
+  non-quarantined account; with zero accounts the fallback list serves and the last
+  discovery error is visible on the dashboard (`GET /admin/status` → `catalog.lastError`).
+- **Fallback lineup** (served when discovery cannot run): gemini-3.8/3.7/3.6/3.5-flash,
+  gemini-3.1-pro, claude-sonnet-4-6, claude-opus-4-6-thinking, gpt-oss-120b-medium.
 - **Truncation** (`max_completion_tokens`/`max_tokens`): non-streaming does a proportional
   text cut, approximate by design (no tokenizer); tool-call spans are never truncated;
   `finish_reason:'length'`. Streaming enforces the cap with the same `estimateTokens`

@@ -77,10 +77,10 @@ describe('usage table idempotency contract', () => {
   })
 })
 
-describe('schema v2 migration (error_text)', () => {
-  /** Build a genuine v1-shaped database by hand: v1 DDL without error_text +
-   *  user_version=1 + one already-landed row to prove the upgrade preserves it. */
-  function makeV1Db(path: string): { db: Database.Database; ts: number } {
+/** Build a genuine v1-shaped database by hand: v1 DDL without error_text +
+ *  user_version=1 + one already-landed row to prove the upgrade preserves it.
+ *  (Module scope: reused by the schema v3 migration suite below.) */
+function makeV1Db(path: string): { db: Database.Database; ts: number } {
     const db = new Database(path)
     db.pragma('journal_mode = WAL')
     db.exec(`
@@ -129,10 +129,11 @@ describe('schema v2 migration (error_text)', () => {
     // stored as the display prefix — a shape the v2 data fix must normalize.
     db.prepare(`INSERT INTO api_keys (id, name, key_hash, prefix, created_at) VALUES ('kA', 'legacy-a', 'hash-a', 'sk-agy-Qw8n', 10)`).run()
     db.prepare(`INSERT INTO api_keys (id, name, key_hash, prefix, created_at) VALUES ('kB', 'clean-b', 'hash-b', 'Zx45Kq9p', 20)`).run()
-    return { db, ts: 1234 }
-  }
+  return { db, ts: 1234 }
+}
 
-  it('a hand-built v1 database upgrades in place: column attached, rows intact, user_version 2', () => {
+describe('schema v2 migration (error_text)', () => {
+  it('a hand-built v1 database upgrades in place: column attached, rows intact, user_version reaches SCHEMA_VERSION', () => {
     const dir = mkdtempSync(join(tmpdir(), 'agy-db-mig-'))
     dirs.push(dir)
     const path = join(dir, 'v1.db')
@@ -141,7 +142,7 @@ describe('schema v2 migration (error_text)', () => {
     const reopened = openDb(path)
     const cols = (reopened.prepare('PRAGMA table_info(usage)').all() as Array<{ name: string }>).map((c) => c.name)
     expect(cols).toContain('error_text')
-    expect(reopened.pragma('user_version', { simple: true })).toBe(2)
+    expect(reopened.pragma('user_version', { simple: true })).toBe(SCHEMA_VERSION)
     // existing rows and their projection survive the ALTER
     const row = reopened.prepare('SELECT request_id, status, error_text FROM usage').get() as { request_id: string; status: string; error_text: string | null }
     expect(row).toEqual({ request_id: 'v1-row', status: 'OK', error_text: null })
@@ -163,9 +164,59 @@ describe('schema v2 migration (error_text)', () => {
     makeV1Db(path).db.close()
     openDb(path).close()
     const third = openDb(path)
-    expect(third.pragma('user_version', { simple: true })).toBe(2)
+    expect(third.pragma('user_version', { simple: true })).toBe(SCHEMA_VERSION)
     const cols = (third.prepare('PRAGMA table_info(usage)').all() as Array<{ name: string }>).map((c) => c.name)
     expect(cols.filter((c) => c === 'error_text')).toHaveLength(1)
     checkpointAndClose(third)
+  })
+})
+
+describe('schema v3 migration (secret_enc)', () => {
+  /** A genuine v2 database: v1 tables + the v2 error_text column +
+   *  user_version=2, plus one pre-v3 key row whose plaintext was never kept. */
+  function makeV2Db(path: string): Database.Database {
+    const { db } = makeV1Db(path)
+    db.exec('ALTER TABLE usage ADD COLUMN error_text TEXT')
+    db.pragma('user_version = 2')
+    db.prepare(`INSERT INTO api_keys (id, name, key_hash, prefix, created_at) VALUES ('k-v2', 'pre-v3', 'hash-v2', 'Qq11Ww22', 30)`).run()
+    return db
+  }
+
+  it('a v2 database upgrades in place: secret_enc attached, rows intact, legacy row stays NULL', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-db-mig3-'))
+    dirs.push(dir)
+    const path = join(dir, 'v2.db')
+    makeV2Db(path).close()
+    const reopened = openDb(path)
+    expect(reopened.pragma('user_version', { simple: true })).toBe(SCHEMA_VERSION)
+    const cols = (reopened.prepare('PRAGMA table_info(api_keys)').all() as Array<{ name: string }>).map((c) => c.name)
+    expect(cols.filter((c) => c === 'secret_enc')).toHaveLength(1)
+    const row = reopened.prepare('SELECT id, prefix, secret_enc FROM api_keys WHERE id = ?').get('k-v2') as {
+      id: string
+      prefix: string
+      secret_enc: string | null
+    }
+    expect(row).toEqual({ id: 'k-v2', prefix: 'Qq11Ww22', secret_enc: null })
+    checkpointAndClose(reopened)
+  })
+
+  it('re-opening an upgraded v2 database never re-ALTERs (idempotent)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-db-mig3b-'))
+    dirs.push(dir)
+    const path = join(dir, 'v2b.db')
+    makeV2Db(path).close()
+    openDb(path).close()
+    const third = openDb(path)
+    expect(third.pragma('user_version', { simple: true })).toBe(SCHEMA_VERSION)
+    const cols = (third.prepare('PRAGMA table_info(api_keys)').all() as Array<{ name: string }>).map((c) => c.name)
+    expect(cols.filter((c) => c === 'secret_enc')).toHaveLength(1)
+    checkpointAndClose(third)
+  })
+
+  it('a fresh database gets secret_enc from the DDL', () => {
+    const { db } = tempDb('g.db')
+    const cols = (db.prepare('PRAGMA table_info(api_keys)').all() as Array<{ name: string }>).map((c) => c.name)
+    expect(cols).toContain('secret_enc')
+    checkpointAndClose(db)
   })
 })

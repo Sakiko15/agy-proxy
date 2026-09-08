@@ -122,7 +122,7 @@ agy-proxy 是自托管的 LLM 网关：把 Google Antigravity 官方 `agy` CLI �
 | mapper.ts | 移植；解除 dsh-llm 3 个符号依赖（CallId/StreamChunk/TokenUsage 本地化） |
 | mirror-tool.ts | **改造移植**：去 dsh-tools 视图类型与 run_code 双模（DSH 专用），保留 agy 工具活动→tool-call 块切分与 `agytc-<runId>-<eventIndex>` 游标续传 |
 | adapter.ts | 重写为引擎入口 `engine.ts`：吸收 buildArgs/结算/重试策略/continuation 检测，抛自有 `EngineError{code}`（Err 码表照搬） |
-| pool.ts / pool-auth.ts / quota.ts / oauth.ts / auth.ts / net.ts / sessions.ts / media.ts / models.ts | 原样移植；**禁用 systemHome 主账号路径**（bootstrapDefaultAccount），容器内全部隔离账号 |
+| pool.ts / pool-auth.ts / quota.ts / oauth.ts / auth.ts / net.ts / sessions.ts / media.ts / models.ts | 移植；models.ts 为 modified（defaultEffortFor 收 GatewayConfig）；**禁用 systemHome 主账号路径**（bootstrapDefaultAccount），容器内全部隔离账号 |
 | ask-tool.ts / commands.ts / client/ / mcp-bridge.ts | 弃用（DSH 专用） |
 | common/config.ts + types.ts + pool-types.ts | 移植；`DSH_AGY_*` 前缀改 `AGY_PROXY_*`（保留兼容读取） |
 | index.ts 的 17 个路由 handler | 改写进 Fastify 服务层 + **必须加鉴权中间件**（原实现零鉴权）；删除 osascript/cmd.exe 开终端路由，改"复制登录 URL" |
@@ -156,7 +156,7 @@ agy-proxy 是自托管的 LLM 网关：把 Google Antigravity 官方 `agy` CLI �
 - **吞吐**：并发度 = 账号数（每账号串行，防风控与竞态）；跨账号真并行
 - **流式**：parser 逐行 → mapper → SSE 直通，无缓冲聚合；Fastify `reply.hijack()` + `reply.raw` 写流，背压交 Node stream
 - **记账开销**：usage 写 SQLite 异步批量（内存缓冲 + 定时 flush + 关停前 flush），不阻塞流
-- **模型目录**：`agy models` 缓存 TTL 300s + stale-while-revalidate + 内置 fallback 目录（移植）
+- **模型目录（MA5 修订）**：`agy models` 发现 **经已登录池账号的隔离 HOME** spawn（账号 HOME 持有唯一 OAuth 凭据——签退 spawn 只在池空时兜底；需 ≥1 个 enabled 且未被 auth 隔离的账号），**60s 轮询器驱动 `refreshIfNeeded` TTL 300s 门（stale-while-revalidate 兑现）**，连续失败指数退避（封顶 10min）；失败文本进 `catalog.lastError`，经 `GET /admin/status` 与仪表盘「模型目录」卡片可见，`POST /admin/catalog/refresh` 手动重发现；池空/离线时服务内置 fallback 目录（现含 gemini-3.8-flash，agy 1.1.22 live 证据）
 - **资源 sizing**：容器内存 ≈ 并发 agy 进程数 × ~150MB + 基线 ~200MB；文档给出配表（如 3 账号 → 1GB+）
 
 ## 8. 技术选型（2026-08-30 核实定稿）
@@ -169,7 +169,7 @@ agy-proxy 是自托管的 LLM 网关：把 Google Antigravity 官方 `agy` CLI �
 | 持久化 | **better-sqlite3 + WAL** | ^13 | node:sqlite 在 Node 24 LTS 仍实验性（RC），密钥/账本库不冒险；命名卷，禁网络 FS 挂载 |
 | 进程编排 | **p-queue 每账号一队列** | ^9 | M3 实际落地为 concurrency:1 + AbortSignal 贯通；RPM 限流改由 auth hook 的 rate-limiter-flexible 承担（未用 intervalCap）；p-limit 作最小备选 |
 | key 限流 | **rate-limiter-flexible (Memory)** | ^11 | 固定窗口够用；Retry-After/X-RateLimit 头现成；Redis 升级路径预留 |
-| API key 存储 | **sha256 哈希 + 前缀明文**（LiteLLM 模式） | — | 高熵 key 无需慢哈希；argon2 仅用于管理员登录密码 |
+| API key 存储 | **sha256 哈希鉴权 + AES-256-GCM 密文可逆留存**（LiteLLM 模式 + schema v3 增补） | — | 鉴权仍只用 sha256（高熵 key 无需慢哈希；argon2 仅用于管理员登录密码）；密文（`secret_enc`）供管理界面按需复制/重新生成，主密钥为数据卷内 sidecar `keys-enc.key`（自动生成、0600），与 DB 同卷同备份生命周期 |
 | Admin 会话 | **DB opaque session（自研 ~50 行）** | — | Lucia 已弃用（2025-03）；httpOnly+SameSite=Lax cookie；jose JWT 备选 |
 | 日志 | **pino → stdout NDJSON** | ^10 | Fastify 原生；pino-pretty 仅 dev worker 传输；OTel 推迟（Logs SDK 仍 Development 状态） |
 | 静态 WebUI 托管 | **@fastify/static** | ^8 | M4 增补（用户定案）；`wildcard:false`（逐文件路由，不遮蔽 /v1、/admin、/healthz）+ 应用层 SPA fallback（保留协议形 404）；备选零依赖手写 handler（未采信——Range/MIME/缓存边角自担成本更高）。**§9 表格虚拟滚动在 M4 未引入**（usage 服务端分页 ≤500 行） |
@@ -183,7 +183,7 @@ agy-proxy 是自托管的 LLM 网关：把 Google Antigravity 官方 `agy` CLI �
 1. **登录**：管理员密码（argon2 哈希），可选 `ADMIN_ALLOW_CIDR` 限定
 2. **仪表盘**：今日请求数/成功率/Token 用量/活跃账号、最近错误流（SSE 实时推送）
 3. **账号池**：卡片式——每账号邮箱、5h/7d 双桶配额条（Google 官方配额端点，移植 quota.ts）、冷却倒计时、健康状态、登录（粘贴回调 URL 流程 + QR 码）、启用/禁用、代理设置
-4. **API Keys**：创建（sk- 前缀）、明文仅展示一次、哈希存储、前缀辨识；每 key 限额（请求/Token/日）、模型白名单、启用/禁用
+4. **API Keys**：创建（sk- 前缀）、明文仅展示一次、sha256 鉴权 + 密文可逆留存（创建后可随时复制，schema v3）、重新生成（旧值立即失效）、前缀辨识；每 key 限额（请求/Token/日）、模型白名单、启用/禁用；存量 key（升级前创建，无密文）复制时引导重新生成
 5. **用量日志**：按 key/模型/账号/状态过滤，耗时/Token/错误文本，导出 CSV
 6. **设置**：默认模型/effort/超时/并发、权限模式（skip-permissions 二次确认 + 警示横幅）、版本信息
 
@@ -191,7 +191,7 @@ agy-proxy 是自托管的 LLM 网关：把 Google Antigravity 官方 `agy` CLI �
 
 ## 10. 安全设计
 
-- **API key**：sha256 哈希 + 前 8 位前缀辨识；每 key RateLimiterMemory 限流 + 429 带 Retry-After；模型白名单**已落地（M5）**——`getScopes(keyId)` 引擎预 spawn 对实际服务模型（fallback 解析后）判定，`Err.MODEL_NOT_ALLOWED` → 双协议 403 permission_error；根 key 与未配置白名单的 key 旁路（空=不限，非 deny-all）
+- **API key**：sha256 哈希鉴权 + 前 8 位前缀辨识；明文另以 AES-256-GCM 密文可逆留存（schema v3 `secret_enc`，主密钥为卷内 sidecar `keys-enc.key`——防 DB 单点泄露，不防整机攻陷；明文仅出现在 create/rotate 响应与受管理员会话保护的 reveal 端点，无日志落点）；每 key RateLimiterMemory 限流 + 429 带 Retry-After；模型白名单**已落地（M5）**——`getScopes(keyId)` 引擎预 spawn 对实际服务模型（fallback 解析后）判定，`Err.MODEL_NOT_ALLOWED` → 双协议 403 permission_error；根 key 与未配置白名单的 key 旁路（空=不限，非 deny-all）
 - **Admin 面**：argon2 密码 + DB session（哈希落库、可吊销）；同源 SPA + SameSite=Lax；admin 变更路由要求自定义头（X-Requested-With）作 CSRF 双保险；默认监听 127.0.0.1、由反代对外
 - **agy 权限（受控工具执行）**：workspace 限定网关专用目录（每账号独立子目录），权限模式默认 `plan`；`--dangerously-skip-permissions` 默认关闭，设置页开启需二次确认 + 全程警示横幅（skip = key 持有者可在容器内执行任意命令——本立项最大单点风险）；`--sandbox` 兼容性评估列入 M5（官方 issue #36：不可与 skip 组合）
 - **凭证卫生**：token material 永不复制/导出/入日志；quota 轮询**就地读写**账号自身 token 文件（`getStoredToken`/`persistRefreshedToken`：读取 access/refresh 供配额端点认证，过期即用 refresh_token 刷新并回写**原文件原格式**——agy 与轮询共享同一份新鲜凭证，避免每次轮询重复刷新；token 是唯一可信身份锚点，防止取错账号配额）；doctor 式脱敏（auth URL / `4/` 授权码 / `ya29.` / Bearer 全 scrub）

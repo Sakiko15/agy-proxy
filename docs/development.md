@@ -25,6 +25,8 @@
 
 CI 中 build 先于 test（集成测试可能引用构建产物），与 dsh-agy-link 同款教训。GitHub Actions 单 job ubuntu-latest + node 24 即可，不搞矩阵。
 
+web/ 子项目另受两道门禁约束：`npm run web:check`（tsc strict）与 `npm run web:test`（vitest）；连同 console.log grep 扫描 web/src（G4 parity）一起构成 ci.yml 的实际门禁集。
+
 ## 4. PR 完成定义（DoD）
 
 - 新功能必须带测试：协议适配层改动 → golden 用例更新并说明理由（见 acceptance.md §2）；引擎层改动 → fake-agy 新场景或单测；错误路径必须有对应测试

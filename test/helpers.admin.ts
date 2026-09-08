@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import { afterEach } from 'vitest'
 import { defaultConfig, type GatewayConfig } from '../src/common/types.ts'
 import { AgyEngine, type EngineDeps } from '../src/host/engine.ts'
-import { ModelCatalog } from '../src/host/models.ts'
+import { ModelCatalog, type DiscoverFn } from '../src/host/models.ts'
 import { SessionStore } from '../src/host/sessions.ts'
 import { RunRegistry } from '../src/host/recording.ts'
 import { AccountPoolManager } from '../src/host/pool.ts'
@@ -18,7 +18,7 @@ import { buildLogger } from '../src/server/logger.ts'
 import { GatewaySemaphore } from '../src/server/semaphore.ts'
 import { AdminEventBus } from '../src/server/events.ts'
 import { openDb } from '../src/server/db.ts'
-import { KeyStore } from '../src/server/key-store.ts'
+import { KeyStore, loadOrCreateMasterKey } from '../src/server/key-store.ts'
 import { UsageLedger } from '../src/server/usage-ledger.ts'
 import { AdminSessionStore } from '../src/server/admin-session.ts'
 
@@ -34,7 +34,10 @@ afterEach(() => {
   delete process.env.AGY_PROXY_CONVERSATIONS_DIR
 })
 
-export function makeAdminServer(cfgOverrides: Partial<GatewayConfig> = {}) {
+export function makeAdminServer(
+  cfgOverrides: Partial<GatewayConfig> = {},
+  opts: { discover?: DiscoverFn } = {},
+) {
   const cfg: GatewayConfig = { ...defaultConfig(), permissionMode: 'plan', timeoutMs: 20_000, adminPassword: 'drill-admin', ...cfgOverrides }
   const dir = mkdtempSync(join(tmpdir(), 'agy-admin-'))
   dbs.push(dir)
@@ -42,7 +45,9 @@ export function makeAdminServer(cfgOverrides: Partial<GatewayConfig> = {}) {
   workDirs.push(workDir)
   process.env.AGY_PROXY_CONVERSATIONS_DIR = join(workDir, 'convs')
   const db = openDb(join(dir, 't.db'))
-  const keys = new KeyStore(db)
+  // Production wiring: the temp dir doubles as AGY_PROXY_DATA_DIR, so the
+  // sidecar keys-enc.key is generated exactly like index.ts does.
+  const keys = new KeyStore(db, loadOrCreateMasterKey(dir))
   const ledger = new UsageLedger(db, { flushIntervalMs: 50 })
   const sessions = new AdminSessionStore(db, { ttlMs: 60_000 })
   const pool = new AccountPoolManager(join(dir, 'accounts'))
@@ -50,7 +55,11 @@ export function makeAdminServer(cfgOverrides: Partial<GatewayConfig> = {}) {
   pool.onChange(() => events.schedulePoolChange())
   const quota = new QuotaService(pool)
   const poolAuth = new PoolAuthFlow(pool, quota, () => {})
-  const catalog = new ModelCatalog(async () => { throw new Error('no discovery in tests') }, cfg.fallbackModels, 300_000)
+  const catalog = new ModelCatalog(
+    opts.discover ?? (async () => { throw new Error('no discovery in tests') }),
+    cfg.fallbackModels,
+    300_000,
+  )
   const sem = new GatewaySemaphore(() => cfg.maxConcurrent, () => cfg.maxQueueDepth)
   const engine = new AgyEngine({
     getConfig: () => cfg,

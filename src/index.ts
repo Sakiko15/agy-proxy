@@ -7,7 +7,7 @@
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { resolveConfig, dataDir, stateDir } from './common/config.ts'
-import { resolveAgyBin, probeProcess, startAgyProcess, MIN_AGY_VERSION, createBinCache } from './host/runner.ts'
+import { resolveAgyBin, probeProcess, MIN_AGY_VERSION, createBinCache } from './host/runner.ts'
 import { AgyEngine } from './host/engine.ts'
 import { ModelCatalog } from './host/models.ts'
 import { SessionStore } from './host/sessions.ts'
@@ -17,6 +17,8 @@ import { QuotaService } from './host/quota.ts'
 import { PoolAuthFlow } from './host/pool-auth.ts'
 import { defaultMediaDir } from './host/media.ts'
 import { startMediaSweeper } from './host/media-sweeper.ts'
+import { makeCatalogDiscoverFn, pickDiscoveryAccount } from './host/catalog-discovery.ts'
+import { startCatalogPoller } from './host/catalog-poller.ts'
 import { redactLine } from './host/diagnostics.ts'
 import { buildLogger } from './server/logger.ts'
 import { buildServer } from './server/app.ts'
@@ -24,7 +26,7 @@ import { GatewaySemaphore } from './server/semaphore.ts'
 import { installShutdown } from './server/shutdown.ts'
 import { AdminEventBus } from './server/events.ts'
 import { openDb } from './server/db.ts'
-import { KeyStore, parseKeyScopes } from './server/key-store.ts'
+import { KeyStore, loadOrCreateMasterKey, parseKeyScopes } from './server/key-store.ts'
 import { UsageLedger } from './server/usage-ledger.ts'
 import { AdminSessionStore, ensureAdminPassword, verifyAdminPassword } from './server/admin-session.ts'
 
@@ -116,7 +118,9 @@ async function main(): Promise<void> {
   // ---- SQLite storage (keys / usage ledger / admin sessions) ----
   const dbPath = getConfig().dbPath !== '' ? getConfig().dbPath : join(dataDir(), 'agy-proxy.db')
   const db = openDb(dbPath)
-  const keys = new KeyStore(db)
+  // Volume-local sidecar master key (keys-enc.key): enables the reversible
+  // secret storage behind the WebUI copy/regenerate affordances.
+  const keys = new KeyStore(db, loadOrCreateMasterKey(dataDir()))
   const ledger = new UsageLedger(db, { flushIntervalMs: 1_000, log: (m) => log.warn(m) })
   const sessions = new AdminSessionStore(db, { ttlMs: getConfig().adminSessionTtlMs })
   await ensureAdminPassword(db, getConfig, log)
@@ -147,24 +151,23 @@ async function main(): Promise<void> {
     log.error('agy binary vanished between probe and wiring')
     process.exit(1)
   }
-  const catalog = new ModelCatalog(
-    async (signal) => {
-      // probeProcess only exposes the parsed --version string; discovery
-      // needs the raw `agy models` stdout for parseModelsOutput.
-      const run = startAgyProcess({ bin, args: ['models'], timeoutMs: 30_000, signal })
-      const out = await run.outcome
-      if (out.code !== 0) throw new Error(out.stderrTail.trim() !== '' ? out.stderrTail.trim() : `agy models exited with code ${out.code}`)
-      return { stdout: out.stdout, stderr: out.stderrTail }
-    },
-    getConfig().fallbackModels,
-    getConfig().modelsCacheTtlMs,
-  )
-  const store = new SessionStore(join(stateDir(), 'sessions.json'))
   // A-M1: the per-spawn bin resolution used to rescan every PATH dir
   // synchronously on each request; the cache memoizes it and the engine's
   // invalidateBin drops it after any failed attempt (retry finds a
   // (re)installed binary — same seam semantics, one scan per healthy run).
   const binCache = createBinCache(() => resolveAgyBin(getConfig().agyBin))
+  const catalog = new ModelCatalog(
+    // MA5: discovery spawns `agy models` inside a signed-in pool account's
+    // isolated HOME — the account HOMEs hold the only OAuth credentials, and
+    // the previous inline callback ran signed-out under the container HOME,
+    // so discovery failed and the gateway stayed on the fallback list forever.
+    // Zero-account deployments keep the legacy signed-out spawn; its failure
+    // now lands in catalog.lastError (dashboard-visible) instead of silence.
+    makeCatalogDiscoverFn({ bin: () => binCache.resolve(), pool, getConfig }),
+    getConfig().fallbackModels,
+    getConfig().modelsCacheTtlMs,
+  )
+  const store = new SessionStore(join(stateDir(), 'sessions.json'))
   const runs = new RunRegistry(Math.max(8, getConfig().maxConcurrent + 2))
   const sem = new GatewaySemaphore(
     () => getConfig().maxConcurrent,
@@ -290,6 +293,22 @@ async function main(): Promise<void> {
     (m) => log.info({ src: 'media-sweeper' }, redactLine(m)),
   )
 
+  // Catalog refresh poller (MA5): drives the ModelCatalog TTL — stale-while-
+  // revalidate only happens if something calls refreshIfNeeded, which used to
+  // be the boot call alone (TTL was dead code; charter §7 unrealized). The
+  // tick is skipped entirely while no eligible account exists, so zero-account
+  // deployments spawn nothing here; lastError text is upstream stderr, so the
+  // free-form log site redacts like every other one.
+  const catalogPoller = startCatalogPoller({
+    catalog,
+    canDiscover: () => pickDiscoveryAccount(pool.getAccounts(), 0) !== null,
+    log: {
+      warn: (m) => log.warn({ src: 'catalog' }, redactLine(m)),
+      info: (m) => log.info({ src: 'catalog' }, redactLine(m)),
+      debug: (m) => log.debug({ src: 'catalog' }, redactLine(m)),
+    },
+  })
+
   // Soak observability (M5): raw process metrics for the harness — one NDJSON
   // line per tick on stdout, deliberately NOT through pino (the harness
   // greps for the `"debug":"metrics"` marker). Off by default.
@@ -308,6 +327,7 @@ async function main(): Promise<void> {
       teardown: async () => {
         clearTimeout(bootRefresh)
         clearInterval(poller)
+        catalogPoller.stop()
         metricsTimer.stop()
         mediaSweeper.stop()
         bus.closeAll() // ends hijacked /admin/events streams — app.close() does not

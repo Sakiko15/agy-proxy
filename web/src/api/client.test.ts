@@ -69,4 +69,40 @@ describe('apiSend', () => {
     await api.patchKey('key_1', { dailyTokenLimit: 5, scopes: '' })
     expect(FETCHED[2]!.init.body).toBe('{"dailyTokenLimit":5,"scopes":""}')
   })
+
+  it('poolMode posts the scheduling mode verbatim for both values', async () => {
+    mockFetch(200, { ok: true })
+    await api.poolMode('round-robin')
+    expect(FETCHED[0]!.url).toBe('/admin/pool/mode')
+    expect(FETCHED[0]!.init.method).toBe('POST')
+    expect((FETCHED[0]!.init.headers as Record<string, string>)['x-requested-with']).toBe('agy-proxy-webui')
+    expect(FETCHED[0]!.init.body).toBe('{"mode":"round-robin"}')
+    await api.poolMode('sequential')
+    expect(FETCHED[1]!.init.body).toBe('{"mode":"sequential"}')
+  })
+
+  it('catalogRefresh POSTs the catalog route with CSRF + empty body', async () => {
+    mockFetch(200, { ok: true, catalog: { source: 'discovered', count: 3, discoveredAt: 1, lastError: null } })
+    const out = await api.catalogRefresh()
+    expect(out.catalog.source).toBe('discovered')
+    expect(FETCHED[0]!.url).toBe('/admin/catalog/refresh')
+    expect(FETCHED[0]!.init.method).toBe('POST')
+    expect((FETCHED[0]!.init.headers as Record<string, string>)['x-requested-with']).toBe('agy-proxy-webui')
+    expect(FETCHED[0]!.init.body).toBe('{}')
+  })
+
+  it('revealKeySecret GETs without CSRF; rotateKey POSTs the rotate route with CSRF + empty body', async () => {
+    mockFetch(200, { ok: true, plaintext: 'sk-agy-x' })
+    await api.revealKeySecret('key_1')
+    expect(FETCHED[0]!.url).toBe('/admin/keys/key_1/secret')
+    expect(FETCHED[0]!.init.method).toBeUndefined() // apiGet leaves GET implicit
+    expect((FETCHED[0]!.init.headers as Record<string, string> | undefined)?.['x-requested-with']).toBeUndefined()
+
+    mockFetch(200, { ok: true, key: { id: 'key_1' }, plaintext: 'sk-agy-y' })
+    await api.rotateKey('key_1')
+    expect(FETCHED[1]!.url).toBe('/admin/keys/key_1/rotate')
+    expect(FETCHED[1]!.init.method).toBe('POST')
+    expect((FETCHED[1]!.init.headers as Record<string, string>)['x-requested-with']).toBe('agy-proxy-webui')
+    expect(FETCHED[1]!.init.body).toBe('{}')
+  })
 })

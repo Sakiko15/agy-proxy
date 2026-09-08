@@ -168,6 +168,21 @@ describe('query', () => {
     expect(paged.rows).toHaveLength(1)
     checkpointAndClose(db)
   })
+
+  it('filters by accountId (exact match on account_id)', async () => {
+    const { ledger, db } = mkLedger()
+    ledger.record(rec('a1', { accountId: 'acc_1' }))
+    ledger.record(rec('a2', { accountId: 'acc_2' }))
+    ledger.record(rec('a3'))
+    await ledger.flush()
+    const byAccount = ledger.query({ accountId: 'acc_1' })
+    expect(byAccount.total).toBe(1)
+    expect(byAccount.rows.map((r) => r.requestId)).toEqual(['a1'])
+    // Combined with another filter, both clauses AND together.
+    const combo = ledger.query({ accountId: 'acc_1', keyId: 'ka' })
+    expect(combo.total).toBe(0)
+    checkpointAndClose(db)
+  })
 })
 
 describe('close semantics', () => {

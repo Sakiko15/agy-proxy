@@ -22,7 +22,9 @@ export interface Catalog {
   source: 'discovered' | 'fallback'
   models: readonly CatalogEntry[]
   discoveredAt: number
-  /** Last discovery error, surfaced by the admin UI and doctor. */
+  /** Last discovery error, surfaced by GET /admin/status and the WebUI
+   *  dashboard card (MA5); the doctor report in diagnostics.ts also renders
+   *  it, though writeDoctorReport currently has no caller. */
   lastError?: string
 }
 

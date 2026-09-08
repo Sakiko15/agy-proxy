@@ -83,6 +83,8 @@ export const api = {
   logout: () => apiSend<{ ok: boolean }>('POST', '/admin/logout'),
   me: () => apiGet<{ ok: boolean }>('/admin/me'),
   status: () => apiGet<{ ok: boolean } & AdminStatus>('/admin/status'),
+  catalogRefresh: () =>
+    apiSend<{ ok: boolean; catalog: AdminStatus['catalog'] }>('POST', '/admin/catalog/refresh', {}),
   pool: () => apiGet<{ ok: boolean; pool: AccountPoolData }>('/admin/pool'),
   authBegin: (alias?: string) => apiSend<PoolAuthStatus>('POST', '/admin/pool/auth/begin', alias !== undefined ? { alias } : {}),
   authStatus: () => apiGet<PoolAuthStatus>('/admin/pool/auth/status'),
@@ -102,6 +104,8 @@ export const api = {
   patchKey: (id: string, patch: { name?: string; disabled?: boolean; dailyTokenLimit?: number; rpmLimit?: number; scopes?: string | null }) =>
     apiSend<{ ok: boolean; key: ApiKeyRecord }>('PATCH', `/admin/keys/${encodeURIComponent(id)}`, patch),
   deleteKey: (id: string) => apiSend<{ ok: boolean }>('DELETE', `/admin/keys/${encodeURIComponent(id)}`),
+  revealKeySecret: (id: string) => apiGet<{ ok: boolean; plaintext: string | null }>(`/admin/keys/${encodeURIComponent(id)}/secret`),
+  rotateKey: (id: string) => apiSend<{ ok: boolean; key: ApiKeyRecord; plaintext: string }>('POST', `/admin/keys/${encodeURIComponent(id)}/rotate`, {}),
   usage: (query: string) => apiGet<{ ok: boolean; total: number; rows: UsageRow[] }>(`/admin/usage${query}`),
   usageSummary: () => apiGet<{ ok: boolean; today: UsageSummary }>('/admin/usage/summary'),
   settings: () => apiGet<{ ok: boolean } & SettingsView>('/admin/settings'),

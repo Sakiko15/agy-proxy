@@ -63,6 +63,7 @@ describe('MA1: OpenAI list shape', () => {
       expect(m).toEqual({ id: m.id, object: 'model', created: MODEL_CREATED, owned_by: 'antigravity' })
     }
     // The default fallback catalog carries the gemini/claude/gpt-oss lines.
+    expect(ids).toContain('gemini-3.8-flash')
     expect(ids).toContain('gemini-3.7-flash')
     expect(ids).toContain('claude-sonnet-4-6')
     await built.app.close()

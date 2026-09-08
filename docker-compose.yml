@@ -1,4 +1,4 @@
-# agy-proxy compose — image defaults to the published Docker Hub tag (override
+# agy-proxy compose — image defaults to the published ghcr.io tag (override
 # via AGY_PROXY_IMAGE in .env); runbook: docs/deploy.md
 services:
   gateway:

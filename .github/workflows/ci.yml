@@ -20,6 +20,7 @@ jobs:
       - run: npm ci
       - run: npm ci --prefix web
       - run: npm run check
+      - run: npm run web:check
       - run: npm run build
       - run: npm test
       - run: npm run web:test

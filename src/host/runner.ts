@@ -4,7 +4,8 @@
 // is streamed line-by-line to the caller.
 // Ported from dsh-agy-link src/host/runner.ts @ 46984db (verbatim except:
 // resolveAgyBin signature takes the bin-hint string instead of PluginConfig;
-// probeProcess returns {ok,version,error} for the startup report).
+// probeProcess returns {ok,version,error} for the startup report;
+// proxyEnv helper added for non-run spawns that need account proxying).
 import { spawn, type ChildProcess } from 'node:child_process'
 import { accessSync, constants, existsSync, readdirSync } from 'node:fs'
 import { delimiter, join } from 'node:path'
@@ -45,6 +46,23 @@ export function isolatedHomeEnv(dir: string): Record<string, string> {
     }
   }
   return env
+}
+
+/**
+ * Proxy variables for one account's outbound URL — the exact 6-var spread the
+ * engine's envFor composes per run spawn (engine.ts envFor). Extracted so the
+ * model-discovery spawn (catalog-discovery.ts) injects the same set without a
+ * second drifting copy; engine.ts keeps its inline copy (run semantics frozen).
+ */
+export function proxyEnv(proxyUrl: string): Record<string, string> {
+  return {
+    ALL_PROXY: proxyUrl,
+    HTTPS_PROXY: proxyUrl,
+    HTTP_PROXY: proxyUrl,
+    all_proxy: proxyUrl,
+    https_proxy: proxyUrl,
+    http_proxy: proxyUrl,
+  }
 }
 
 export const MIN_AGY_VERSION = '1.1.8'

@@ -136,6 +136,8 @@ docker run --rm -v <实际卷名>:/data -v $PWD:/bak alpine \
 
 恢复 = 停容器（1Panel：编排停止）→ 清空卷 → 解包 → 起服。卷内所有凭证 device-bound，**跨机器迁移等于重新登录**（换机后每个账号需重跑 admin UI 的 login 流程）。
 
+`keys-enc.key`（API key 可逆留存的主密钥，schema v3 起存在）与 DB 同卷，上面的整卷打包已覆盖；**必须随 /data 一并备份**——丢失该文件后 `secret_enc` 无法解密，API Keys 页的「复制密钥」失效（密钥鉴权不受影响，重新生成即可恢复可复制状态）。
+
 ## 5.1 日界时区（S-M9）
 
 per-key 每日 token 预算按**容器本地午夜**切日（`startOfToday` 用 `setHours(0,0,0,0)`

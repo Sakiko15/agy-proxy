@@ -53,6 +53,10 @@
 // Records its argv (JSON, one per line) to FAKE_AGY_ARGS_FILE when set;
 // records cwd to FAKE_AGY_CWD_FILE when set; records its pid to
 // FAKE_AGY_PID_FILE when set (lifetime observation for kill drills).
+// Records an env ALLOWLIST (single JSON line) to FAKE_AGY_ENV_FILE when set —
+// only {HOME, USERPROFILE, HOMEDRIVE, HOMEPATH, GEMINI_CLI_HOME, HTTPS_PROXY,
+// HTTP_PROXY, ALL_PROXY}: a full dump would carry the parent test env's
+// AGY_PROXY_* secrets into a shared record file.
 //
 // FAKE_AGY_MODE_FILE (M5): path to a file holding the mode name, read at
 // every PROCESS START — lets a drill flip the failure mode between engine
@@ -80,6 +84,16 @@ if (process.env.FAKE_AGY_PID_FILE) {
   // Lets a test observe this process's lifetime (disconnect → tree-kill drill:
   // poll until process.kill(pid, 0) throws ESRCH).
   try { appendFileSync(process.env.FAKE_AGY_PID_FILE, String(process.pid) + '\n') } catch {}
+}
+if (process.env.FAKE_AGY_ENV_FILE) {
+  try {
+    const envKeys = ['HOME', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'GEMINI_CLI_HOME', 'HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY']
+    const snapshot = {}
+    for (const k of envKeys) {
+      if (process.env[k] !== undefined) snapshot[k] = process.env[k]
+    }
+    appendFileSync(process.env.FAKE_AGY_ENV_FILE, JSON.stringify(snapshot) + '\n')
+  } catch {}
 }
 
 if (argv[0] === '--version') {
