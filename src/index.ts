@@ -7,7 +7,7 @@
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { resolveConfig, dataDir, stateDir } from './common/config.ts'
-import { resolveAgyBin, probeProcess, MIN_AGY_VERSION, createBinCache } from './host/runner.ts'
+import { resolveAgyBin, probeProcess, MIN_AGY_VERSION, createBinCache, sanitizeChildEnv } from './host/runner.ts'
 import { AgyEngine } from './host/engine.ts'
 import { ModelCatalog } from './host/models.ts'
 import { SessionStore } from './host/sessions.ts'
@@ -136,6 +136,31 @@ async function main(): Promise<void> {
 
   const getConfig = () => resolveConfig()
 
+  // Code-review #5/#12: startup() short-circuits before any binary work when
+  // disabled, so a live-enable through runtime-overrides would otherwise skip
+  // the MIN_AGY_VERSION gate entirely and every upstream poller would stay
+  // disarmed forever (they were cleared at boot). Probe the binary here —
+  // with a sanitized env per the A-M1 spawn-site rule; the gateway's own
+  // AGY_PROXY_* variables must never reach an agy child — warn without
+  // exiting on failure, and gate the pollers on the outcome.
+  let disabledBin: string | null = null
+  let binaryHealthy = report.kind === 'ready'
+  if (report.kind === 'disabled') {
+    disabledBin = await resolveAgyBin(getConfig().agyBin)
+    if (disabledBin === null) {
+      log.warn('disabled boot: agy binary not found — background pollers stay off until the official CLI is installed')
+    } else {
+      const probe = await probeProcess(disabledBin, ['--version'], 30_000, undefined, sanitizeChildEnv(process.env))
+      if (!probe.ok) {
+        log.warn(`disabled boot: agy --version failed (${probe.error ?? 'unknown error'}) — background pollers stay off`)
+      } else if (probe.version && compareVersions(probe.version, MIN_AGY_VERSION) < 0) {
+        log.warn(`disabled boot: agy ${probe.version} is too old (minimum ${MIN_AGY_VERSION}) — background pollers stay off until the CLI is upgraded`)
+      } else {
+        binaryHealthy = true
+      }
+    }
+  }
+
   // ---- SQLite storage (keys / usage ledger / admin sessions) ----
   const dbPath = getConfig().dbPath !== '' ? getConfig().dbPath : join(dataDir(), 'agy-proxy.db')
   const db = openDb(dbPath)
@@ -195,8 +220,11 @@ async function main(): Promise<void> {
   })
   pool.onChange(() => bus.schedulePoolChange())
 
-  const bin = await resolveAgyBin(getConfig().agyBin)
-  if (bin === null) {
+  // Code-review #2: in ready mode this re-resolution is the vanish guard; in
+  // disabled mode the probe block above already resolved (or warned about)
+  // the binary, and a missing one must keep degrading — never exit.
+  const bin = report.kind === 'ready' ? await resolveAgyBin(getConfig().agyBin) : disabledBin
+  if (bin === null && report.kind === 'ready') {
     // Unreachable after startup() unless the binary vanished in between.
     log.error('agy binary vanished between probe and wiring')
     process.exit(1)
@@ -322,12 +350,14 @@ async function main(): Promise<void> {
       verifyPassword: (pw) => verifyAdminPassword(db, pw),
     },
   })
-  // B4/S3: disabled-mode boots skip every upstream-spawning poller — there
-  // is nothing to discover or refresh while /v1 is 503, and each would just
-  // burn a signed-out spawn timeout. The catalog poller likewise stays off
-  // until the gateway is actually ready.
-  const ready = report.kind === 'ready'
-  if (ready) void catalog.refreshIfNeeded().catch(() => undefined)
+  // Code-review #5: the pollers ride binaryHealthy, not `ready`. A disabled
+  // boot with a healthy binary keeps quota + catalog refreshed in the
+  // background, so flipping enabled back on (runtime-overrides) is live
+  // immediately; a disabled boot with a broken/missing binary keeps its warn
+  // and stays quiet — there is nothing to discover or refresh, and each
+  // upstream spawn would just burn a timeout.
+  const pollersArmed = binaryHealthy
+  if (pollersArmed) void catalog.refreshIfNeeded().catch(() => undefined)
   await built.app.listen({ port: getConfig().port, host: getConfig().host })
   log.info({ port: getConfig().port, host: getConfig().host }, 'agy-proxy listening')
 
@@ -341,7 +371,7 @@ async function main(): Promise<void> {
     void quota.refreshAllQuotas().catch(() => undefined)
   }, Math.max(60_000, getConfig().quotaPollIntervalMs))
   poller.unref()
-  if (!ready) {
+  if (!pollersArmed) {
     clearTimeout(bootRefresh)
     clearInterval(poller)
   }
@@ -370,7 +400,7 @@ async function main(): Promise<void> {
       debug: (m) => log.debug({ src: 'catalog' }, redactLine(m)),
     },
   })
-  if (!ready) catalogPoller.stop() // B4/S3: no upstream spawns while disabled
+  if (!pollersArmed) catalogPoller.stop() // no healthy binary — no upstream spawns
 
   // Soak observability (M5): raw process metrics for the harness — one NDJSON
   // line per tick on stdout, deliberately NOT through pino (the harness
