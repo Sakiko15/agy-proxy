@@ -4,7 +4,9 @@
 // progress noise) surface as garbage events so the caller can count them
 // without dying. Field-name candidates cover snake_case and camelCase
 // spellings observed in the agy binary strings.
-// Ported from dsh-agy-link src/host/parser.ts @ 46984db (verbatim).
+// Ported from dsh-agy-link src/host/parser.ts @ 46984db (modified: feed()
+// scans with a start cursor and compacts the buffer once per feed instead of
+// slicing the remainder per line — B2/P2, byte-identical output).
 import { extractAuthUrl, looksLikeAuthFailure, type AgyEvent, type AgyStepKind, type AgyToolInfo, type RawUsage } from '../common/types.ts'
 
 // agy 1.1.15 stream-json vocabulary (verified against a live binary):
@@ -244,15 +246,23 @@ export class StreamJsonParser {
 
   /** Feed a stdout chunk; returns the events completed by it. */
   feed(chunk: string): AgyEvent[] {
-    this.buffer += chunk
+    // B2/P2: scan with a start cursor and compact once per feed — the old loop
+    // re-sliced the remaining buffer on every complete line (O(lines × buffer)
+    // memcpy for line-dense chunks). The cursor walks the joined buffer; the
+    // single end compaction leaves `this.buffer` exactly the unconsumed
+    // suffix, so torn-line buffering and the MAX_PENDING cap below see
+    // identical bytes.
+    const pending = this.buffer + chunk
     const out: AgyEvent[] = []
+    let start = 0
     let nl: number
-    while ((nl = this.buffer.indexOf('\n')) >= 0) {
-      const line = this.buffer.slice(0, nl).replace(/\r$/, '')
-      this.buffer = this.buffer.slice(nl + 1)
+    while ((nl = pending.indexOf('\n', start)) >= 0) {
+      const line = pending.slice(start, nl).replace(/\r$/, '')
+      start = nl + 1
       const ev = this.takeLine(line)
       if (ev) out.push(ev)
     }
+    this.buffer = start > 0 ? pending.slice(start) : pending
     // S-M6: a torn "line" pending past the cap is pathological (agy hung
     // mid-write or flooding without newlines) — discard the pending bytes
     // instead of growing without bound. Complete lines were already processed

@@ -485,10 +485,12 @@ async function streamAnthropicMessages(args: {
   const budget = meta.maxTokens !== undefined ? new OutputBudget(meta.maxTokens) : null
   let stopSequence: string | undefined
   let budgetCut = false
+  // B2/P6: one socket write per engine chunk — eventAll joins the same
+  // per-event frames the loop above wrote singly (identical formatters), so
+  // wire bytes are unchanged while the Anthropic leg drops from up to three
+  // writes per chunk (message_delta pairs) to one.
   const emit = async (chunk: StreamChunk): Promise<void> => {
-    for (const ev of anthropicStreamEvents({ id, model: call.model, chunk, state, usage, inputTokens: inputEstimate, stopSequence })) {
-      await sse.event(ev.event, ev.data)
-    }
+    await sse.eventAll([...anthropicStreamEvents({ id, model: call.model, chunk, state, usage, inputTokens: inputEstimate, stopSequence })])
   }
   try {
     sse.open()
@@ -601,10 +603,12 @@ async function streamOpenAiChat(args: {
   const budget = meta.maxTokens !== undefined ? new OutputBudget(meta.maxTokens) : null
   let stopSequence: string | undefined
   let budgetCut = false
+  // B2/P6: one socket write per engine chunk — dataAll joins the same frames
+  // the loop above wrote singly (identical formatter), so wire bytes are
+  // unchanged while text-heavy chunks drop from one write per delta to one
+  // write per engine chunk.
   const emit = async (chunk: StreamChunk): Promise<void> => {
-    for (const frame of openAiStreamFrames({ id, created, model: call.model, chunk, state, includeUsage: meta.includeUsage, usage })) {
-      await sse.data(frame)
-    }
+    await sse.dataAll([...openAiStreamFrames({ id, created, model: call.model, chunk, state, includeUsage: meta.includeUsage, usage })])
   }
   try {
     sse.open()

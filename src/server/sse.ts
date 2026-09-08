@@ -25,6 +25,19 @@ export function stallWindowMs(heartbeatMs: number): number {
   return heartbeatMs > 0 ? Math.max(3 * heartbeatMs, 180_000) : 180_000
 }
 
+/** B2/P6 pure frame formatters: build the wire bytes without touching the
+ *  socket, so data()/event() and the batch writers (dataAll/eventAll) emit
+ *  byte-identical frames from one definition. */
+function dataFrame(payload: unknown): string {
+  const body = payload === '[DONE]' ? '[DONE]' : JSON.stringify(payload)
+  return 'data: ' + body + '\n\n'
+}
+
+function eventFrame(name: string, payload: unknown, id?: number): string {
+  const idLine = typeof id === 'number' ? 'id: ' + id + '\n' : ''
+  return 'event: ' + name + '\n' + idLine + 'data: ' + JSON.stringify(payload) + '\n\n'
+}
+
 export class SseWriter {
   private readonly raw: ServerResponse
   private readonly heartbeatMs: number
@@ -126,9 +139,8 @@ export class SseWriter {
 
   /** `data: <json>\n\n` (OpenAI chunk / [DONE] sentinel). */
   async data(payload: unknown): Promise<void> {
-    const body = payload === '[DONE]' ? '[DONE]' : JSON.stringify(payload)
     this.lastSendAt = Date.now()
-    await this.writeRaw('data: ' + body + '\n\n')
+    await this.writeRaw(dataFrame(payload))
   }
 
   /** `event: <name>\ndata: <json>\n\n` (Anthropic event style). With `id`,
@@ -136,8 +148,26 @@ export class SseWriter {
    *  Last-Event-ID reconnects (admin event stream, M4). */
   async event(name: string, payload: unknown, id?: number): Promise<void> {
     this.lastSendAt = Date.now()
-    const idLine = typeof id === 'number' ? 'id: ' + id + '\n' : ''
-    await this.writeRaw('event: ' + name + '\n' + idLine + 'data: ' + JSON.stringify(payload) + '\n\n')
+    await this.writeRaw(eventFrame(name, payload, id))
+  }
+
+  /** B2/P6: one socket write for N frames — the exact concatenation of the
+   *  singles' frames (the pure formatters below), so the wire bytes are
+   *  unchanged while the Anthropic leg drops from up to three writes per
+   *  engine chunk to one. `lastSendAt` updates once: batch members are
+   *  logically simultaneous. Backpressure/stall semantics are per writeRaw,
+   *  which the batch pays once instead of once per frame. */
+  async dataAll(payloads: readonly unknown[]): Promise<void> {
+    if (payloads.length === 0) return
+    this.lastSendAt = Date.now()
+    await this.writeRaw(payloads.map(dataFrame).join(''))
+  }
+
+  /** B2/P6 batch form of event(): same frame bytes, one write. */
+  async eventAll(items: ReadonlyArray<{ event: string; data: unknown; id?: number }>): Promise<void> {
+    if (items.length === 0) return
+    this.lastSendAt = Date.now()
+    await this.writeRaw(items.map((item) => eventFrame(item.event, item.data, item.id)).join(''))
   }
 
   /** True once close() ran (or the stream is already ended) — the public read

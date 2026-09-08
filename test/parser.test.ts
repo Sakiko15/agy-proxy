@@ -150,3 +150,68 @@ describe('parser S-M6 memory bounds', () => {
     expect(p.stats.garbage).toBe(1)
   })
 })
+
+// B2/P2: feed() was rewritten from per-line remainder slicing to a start
+// cursor with one compaction per feed. The one-shot feed of the full text is
+// the reference implementation (both algorithms reduce to "split the text on
+// newlines" there), so every chunk partition must reproduce its events, stats
+// and diagnostics tail exactly — that pins the cursor arithmetic and the
+// end-of-feed compaction against regression.
+describe('parser cursor feed equivalence (B2/P2)', () => {
+  const TEXT = [
+    '⚠ auth banner visit https://accounts.google.com/o/oauth2/auth?code=4/AbC',
+    '{"event":"init","conversation_id":"cP","model":"gemini-3-7-flash"}',
+    '', // empty line: skipped by takeLine in both implementations
+    '{"event":"step_update","idx":1,"step_type":"thinking","text":"思考 中😀 emoji"}',
+    '\r', // whitespace-only line
+    '{"event":"step_update","idx":2,"step_type":"tool","tool_info":{"name":"bash","parameters":{"cmd":"ls"}}}',
+    'garbage without json',
+    '{"event":"result","result":{"conversation_id":"cP","status":"DONE","response":"ok","usage":{"input_tokens":7,"output_tokens":3}}}',
+    '{"event":"step_update","idx":3,"step_type":"text","text":"trailing"}', // no final newline → flush territory
+  ].join('\n')
+
+  it('every chunk partition reproduces the one-shot reference', () => {
+    const ref = new StreamJsonParser()
+    const refEvs = ref.feed(TEXT)
+    refEvs.push(...ref.flush())
+
+    for (const size of [1, 2, 3, 5, 7, 13, 64, 512, 4096]) {
+      const p = new StreamJsonParser()
+      const evs: AgyEvent[] = []
+      for (let i = 0; i < TEXT.length; i += size) evs.push(...p.feed(TEXT.slice(i, i + size)))
+      evs.push(...p.flush())
+      expect(evs, `partition size ${size}`).toEqual(refEvs)
+      expect(p.stats, `partition size ${size}`).toEqual(ref.stats)
+      expect(p.recentLines, `partition size ${size}`).toEqual(ref.recentLines)
+    }
+  })
+
+  it('no-newline feeds leave the buffer byte-identical to the append form', () => {
+    // The rewrite's one visible state is the pending torn line: a chunk with
+    // no complete line must leave exactly chunk-appended bytes buffered.
+    const a = new StreamJsonParser()
+    const b = new StreamJsonParser()
+    a.feed('{"event":"init","conversation')
+    a.feed('":"torn"}')
+    b.feed('{"event":"init","conversation":"torn"}')
+    expect(a.flush()).toEqual(b.flush())
+    expect(a.stats).toEqual(b.stats)
+  })
+
+  it('parsing stays tolerant when the cap trips mid-line across feeds', () => {
+    // Partition-dependent by design (the cap keys on the post-loop remainder
+    // in both the old and new algorithms): a huge torn line split across
+    // feeds trips the cap mid-line, but the parser must stay tolerant — the
+    // well-formed lines after the flood still parse.
+    const p = new StreamJsonParser()
+    const evs: AgyEvent[] = []
+    const flood = 'x'.repeat(1_400_000)
+    for (let i = 0; i < flood.length; i += 200_000) evs.push(...p.feed(flood.slice(i, i + 200_000)))
+    // The leading newline terminates the leftover flood tail so the result
+    // line is a line of its own (the flood has no newlines of its own).
+    evs.push(...p.feed('\n{"event":"result","result":{"conversation_id":"c1","status":"DONE","response":"recovered"}}' + '\n'))
+    expect(p.stats.overflowDrops).toBeGreaterThanOrEqual(1)
+    const res = asResult(evs.at(-1))
+    expect(res.ok).toBe(true)
+  })
+})

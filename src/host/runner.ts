@@ -413,7 +413,12 @@ export function startAgyProcess(opts: RunOptions): RunningProcess {
     if (hasChunkConsumer) {
       stdoutTotal += chunk.length
       if (stdoutHead.length < HEAD_KEEP) stdoutHead = (stdoutHead + chunk).slice(0, HEAD_KEEP)
-      stdoutTail = (stdoutTail + chunk).slice(-TAIL_KEEP)
+      // B2/P1: amortized trim — slicing to the window on every chunk rebuilt
+      // a ~64KB string per chunk (a 20k-chunk run paid ~1.3GB of transient
+      // allocations). Grow freely, trim once past 2x the window; the resolve
+      // excerpt below takes the exact TAIL_KEEP suffix, byte-identical.
+      stdoutTail += chunk
+      if (stdoutTail.length > TAIL_KEEP * 2) stdoutTail = stdoutTail.slice(-TAIL_KEEP * 2)
       safeOnChunk(chunk)
       return
     }
@@ -429,7 +434,10 @@ export function startAgyProcess(opts: RunOptions): RunningProcess {
   })
   child.stderr?.on('data', (chunk: string) => {
     refreshWatchdog()
-    stderr = (stderr + chunk).slice(-4096)
+    // B2/P1: same amortized trim as the stdout tail — grow to 2x the excerpt
+    // window, trim there; resolve slices the exact 4096-char suffix.
+    stderr += chunk
+    if (stderr.length > 8192) stderr = stderr.slice(-8192)
   })
 
   const outcome = new Promise<RunOutcome>((resolve) => {
@@ -451,8 +459,8 @@ export function startAgyProcess(opts: RunOptions): RunningProcess {
         // A-M5: chunk-consuming runs report only the head+tail excerpt (the
         // tail is skipped when the whole stream fit in the head window —
         // otherwise short streams would be duplicated).
-        stdout: hasChunkConsumer ? (stdoutTotal <= HEAD_KEEP ? stdoutHead : stdoutHead + stdoutTail) : stdout,
-        stderrTail: stderr,
+        stdout: hasChunkConsumer ? (stdoutTotal <= HEAD_KEEP ? stdoutHead : stdoutHead + stdoutTail.slice(-TAIL_KEEP)) : stdout,
+        stderrTail: stderr.slice(-4096),
         durationMs: Date.now() - started,
       })
     }
