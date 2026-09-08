@@ -15,7 +15,10 @@
 // mutable per-stream state.
 // Ported from dsh-agy-link src/host/recording.ts @ 46984db (verbatim;
 // modified M5: hasClientMappedEvents() getter added — the engine-level
-// retry guard needs to know whether any client-visible step ever shipped).
+// retry guard needs to know whether any client-visible step ever shipped;
+// modified B4/S6: the registry capacity may be a supplier evaluated per
+// create, and eviction prefers settled-no-continuation runs over settled
+// ones over in-flight ones).
 import { randomUUID } from 'node:crypto'
 import type { AgyEvent, RawUsage } from '../common/types.ts'
 
@@ -259,16 +262,20 @@ const MAX_RETAINED_RUNS = 8
 /** Bounded registry keeping the most recent runs for continuation spans. */
 export class RunRegistry {
   private readonly runs = new Map<string, RunRecording>()
-  private readonly capacity: number
+  private readonly capacityFn: () => number
 
   /**
    * `capacity` (A-M4): how many recordings to retain. Callers size it from
    * the real concurrency ceiling (maxConcurrent + headroom); the historical
    * fixed 8 could evict an in-progress run's recording when more runs than
    * the cap were live, breaking that run's mirror-tool continuation.
+   * B4/S6: the capacity may be a SUPPLIER — maxConcurrent is runtime-writable
+   * (admin settings), and a fixed number captured at startup would go stale
+   * after a hot resize: shrink it and in-flight recordings get evicted
+   * (mirror 404s), grow it and retention stays tighter than needed.
    */
-  constructor(capacity: number = MAX_RETAINED_RUNS) {
-    this.capacity = Math.max(1, Math.floor(capacity))
+  constructor(capacity: number | (() => number) = MAX_RETAINED_RUNS) {
+    this.capacityFn = typeof capacity === 'function' ? capacity : () => capacity
   }
 
   create(): RunRecording {
@@ -279,11 +286,35 @@ export class RunRegistry {
 
   remember(rec: RunRecording): void {
     this.runs.set(rec.runId, rec)
-    while (this.runs.size > this.capacity) {
-      const oldest = this.runs.keys().next().value
-      if (oldest === undefined) break
-      this.runs.delete(oldest)
+    // B4/S6 eviction preference, lowest class first: ① settled without
+    // keepForContinuation (cannot serve any continuation — dead weight),
+    // ② settled but kept (a continuation may still resume it), ③ unsettled
+    // (in-flight) only as the last resort. Within a class the oldest
+    // insertion wins (Map preserves order). The old oldest-first loop could
+    // evict an in-flight recording while a dead settled one sat untouched.
+    while (this.runs.size > Math.max(1, this.capacityFn())) {
+      const victim = this.pickVictim()
+      if (victim === undefined) break
+      this.runs.delete(victim)
     }
+  }
+
+  /** Oldest recording of the most-evictable class, or undefined when the
+   *  map is empty. Unsettled (class 3) entries stay evictable as the last
+   *  resort — the historical oldest-first behavior for >capacity live runs
+   *  (A-M4 pins it) — they just lose to any settled victim. */
+  private pickVictim(): string | undefined {
+    let fallback: string | undefined
+    let fallbackClass = 4 // above every class so class 3 is selectable
+    for (const [id, rec] of this.runs) {
+      const cls = rec.isSettled ? (rec.keepForContinuation ? 2 : 1) : 3
+      if (cls < fallbackClass) {
+        fallbackClass = cls
+        fallback = id
+        if (cls === 1) break // best possible victim; no need to keep scanning
+      }
+    }
+    return fallback
   }
 
   get(runId: string): RunRecording | undefined {

@@ -7,7 +7,9 @@
 // defaultPoolDir re-roots to the gateway state dir; pool file shape and
 // scheduling untouched; M4 adds an additive onChange() mutation hook fired at
 // the end of persist() — no scheduling/persistence behavior change; M5 adds
-// clearAuthRequired() — the administrative inverse of markAuthRequired).
+// clearAuthRequired() — the administrative inverse of markAuthRequired;
+// B4/S4/S5 add a corrupt-file quarantine, an optional log seam and a
+// throttled persist-failure warning — recovery outcomes unchanged).
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { stateDir } from '../common/config.ts'
@@ -28,13 +30,19 @@ export function defaultPoolDir(): string {
 
 /** Debounce window for hot-path pool persists (S-M8). */
 export const PERSIST_DEBOUNCE_MS = 500
+/** B4/S5: minimum gap between persist-failure warnings (one per minute). */
+const PERSIST_WARN_MS = 60_000
 
 export class AccountPoolManager {
   private data: AccountPoolData
   private readonly baseDir: string
   private readonly file: string
+  private lastPersistWarnAt = 0
 
-  constructor(baseDir = defaultPoolDir()) {
+  constructor(
+    baseDir = defaultPoolDir(),
+    private readonly log?: (msg: string) => void,
+  ) {
     this.baseDir = baseDir
     this.file = join(baseDir, 'pool.json')
     this.data = this.load()
@@ -51,11 +59,29 @@ export class AccountPoolManager {
             ...parsed,
           }
         }
+        // B4/S4: valid JSON of the wrong shape — same rebuild outcome, but
+        // quarantine the file so the next persist cannot destroy it.
+        this.quarantineCorrupt('unexpected JSON shape')
+        return defaultPoolData()
       }
-    } catch {
-      // Corrupt file recovery
+    } catch (err) {
+      // B4/S4: corrupt file (torn tmp rename, truncated disk write) — the old
+      // catch rebuilt from defaults and silently let the next persist destroy
+      // the only copy. Quarantine first, then rebuild.
+      this.quarantineCorrupt(String(err))
     }
     return defaultPoolData()
+  }
+
+  /** B4/S4: rename an unreadable pool file aside (best-effort, never throws)
+   *  so the rebuild does not lose the original bytes without a trace. */
+  private quarantineCorrupt(reason: string): void {
+    try {
+      renameSync(this.file, this.file + '.corrupt-' + Date.now())
+      this.log?.(`pool store quarantined (unreadable: ${reason}) — rebuilt from defaults: ${this.file}`)
+    } catch (renameErr) {
+      this.log?.(`pool store unreadable and quarantine rename failed (${String(renameErr)}): ${reason}`)
+    }
   }
 
   private persist(): void {
@@ -69,8 +95,15 @@ export class AccountPoolManager {
       const tmp = join(dirname(this.file), '.pool.json.tmp')
       writeFileSync(tmp, JSON.stringify(this.data, null, 2), 'utf8')
       renameSync(tmp, this.file)
-    } catch {
-      // Best-effort persistence
+    } catch (err) {
+      // Best-effort persistence — B4/S5: a persist that never succeeds drops
+      // the pool at the next restart; warn (throttled) instead of staying
+      // fully silent.
+      const now = Date.now()
+      if (now - this.lastPersistWarnAt > PERSIST_WARN_MS) {
+        this.lastPersistWarnAt = now
+        this.log?.(`pool persist failed (throttled 60s): ${String(err)}`)
+      }
     }
     this.notify()
   }

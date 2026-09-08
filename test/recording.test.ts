@@ -91,4 +91,53 @@ describe('RunRegistry capacity + keep/forget lifecycle (A-M4)', () => {
   it('keepForContinuation defaults to false (engine-owned lifecycle flag)', () => {
     expect(new RunRecording('r-flag').keepForContinuation).toBe(false)
   })
+
+  // ---- B4/S6: supplier capacity + eviction preference ----
+
+  it('supplier capacity is evaluated per create (hot maxConcurrent resize)', () => {
+    let cap = 2
+    const reg = new RunRegistry(() => cap)
+    const a = reg.create()
+    const b = reg.create()
+    expect(reg.get(a.runId)).toBeDefined()
+    expect(reg.get(b.runId)).toBeDefined()
+    cap = 1 // admin shrinks concurrency: the next create shrinks the map to 1
+    const c = reg.create()
+    expect(reg.get(a.runId)).toBeUndefined()
+    expect(reg.get(b.runId)).toBeUndefined()
+    expect(reg.get(c.runId)).toBeDefined()
+    cap = 5 // grows again: the next creates fit without eviction
+    reg.create()
+    reg.create()
+    reg.create()
+    expect(reg.get(c.runId)).toBeDefined()
+  })
+
+  it('eviction prefers settled-no-continuation over kept over in-flight (S6)', () => {
+    const reg = new RunRegistry(3)
+    const inflight: RunRecording[] = [reg.create(), reg.create(), reg.create()]
+    for (const rec of inflight) rec.append(step(0))
+    // Settle the oldest (plain) and the middle (kept): eviction must take the
+    // class-1 victim, never the kept recording or the in-flight one.
+    inflight[0]!.settle(null)
+    inflight[1]!.settle(null)
+    inflight[1]!.keepForContinuation = true
+    const d = reg.create()
+    expect(reg.get(inflight[0]!.runId)).toBeUndefined()
+    expect(reg.get(inflight[1]!.runId)).toBeDefined()
+    expect(reg.get(inflight[2]!.runId)).toBeDefined()
+    expect(reg.get(d.runId)).toBeDefined()
+  })
+
+  it('a kept recording is evicted before an in-flight one when no dead run exists', () => {
+    const reg = new RunRegistry(2)
+    const a = reg.create()
+    const b = reg.create()
+    a.settle(null)
+    a.keepForContinuation = true
+    const c = reg.create()
+    expect(reg.get(a.runId)).toBeUndefined()
+    expect(reg.get(b.runId)).toBeDefined()
+    expect(reg.get(c.runId)).toBeDefined()
+  })
 })

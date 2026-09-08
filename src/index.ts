@@ -27,7 +27,7 @@ import { GatewaySemaphore } from './server/semaphore.ts'
 import { installShutdown } from './server/shutdown.ts'
 import { AdminEventBus } from './server/events.ts'
 import { openDb } from './server/db.ts'
-import { KeyStore, loadOrCreateMasterKey, parseKeyScopes } from './server/key-store.ts'
+import { KeyStore, loadOrCreateMasterKey } from './server/key-store.ts'
 import { UsageLedger } from './server/usage-ledger.ts'
 import { AdminSessionStore, ensureAdminPassword, verifyAdminPassword } from './server/admin-session.ts'
 
@@ -35,6 +35,13 @@ export { resolveConfig, dataDir } from './common/config.ts'
 
 export interface StartupReport {
   ok: boolean
+  /** B4/S3: why startup did not reach ready. 'disabled' (enabled=false) is
+   *  the one kind that still boots: the gateway listens and serves the
+   *  runtime-disabled 503s on /v1/* plus /healthz + /admin + the WebUI, so
+   *  an operator can flip enabled back on without a crashlooping container.
+   *  Every binary failure kind exits 1 — without agy there is nothing to
+   *  serve, and the fast failure is what makes a misconfigured deploy loud. */
+  kind: 'ready' | 'disabled' | 'binary-missing' | 'binary-probe-failed' | 'binary-too-old'
   /** Set when the gateway cannot serve: reason is surfaced on the admin UI. */
   dormantReason?: string
   agyBin?: string
@@ -44,15 +51,17 @@ export interface StartupReport {
 
 export async function startup(): Promise<StartupReport> {
   const cfg = resolveConfig()
-  const report: StartupReport = { ok: false, dataDir: dataDir() }
+  const report: StartupReport = { ok: false, kind: 'ready', dataDir: dataDir() }
 
   if (!cfg.enabled) {
+    report.kind = 'disabled'
     report.dormantReason = 'disabled by config (enabled=false)'
     return report
   }
 
   const bin = await resolveAgyBin(cfg.agyBin)
   if (!bin) {
+    report.kind = 'binary-missing'
     report.dormantReason =
       'agy binary not found — install the official CLI (https://antigravity.google/cli) or set AGY_PROXY_BIN'
     return report
@@ -61,11 +70,13 @@ export async function startup(): Promise<StartupReport> {
 
   const probe = await probeProcess(bin, ['--version'])
   if (!probe.ok) {
+    report.kind = 'binary-probe-failed'
     report.dormantReason = `agy --version failed: ${probe.error ?? 'unknown error'}`
     return report
   }
   report.agyVersion = probe.version
   if (probe.version && compareVersions(probe.version, MIN_AGY_VERSION) < 0) {
+    report.kind = 'binary-too-old'
     report.dormantReason = `agy ${probe.version} is too old (minimum ${MIN_AGY_VERSION}) — upgrade the official CLI`
     return report
   }
@@ -108,9 +119,18 @@ export function startDebugMetrics(intervalMs: number): { stop: () => void } {
 async function main(): Promise<void> {
   const log = buildLogger()
   const report = await startup()
-  if (!report.ok) {
+  if (report.kind !== 'ready' && report.kind !== 'disabled') {
     log.error({ ...report }, report.dormantReason ?? 'startup failed')
     process.exit(1)
+  }
+  // B4/S3 (user-approved failure-path change): enabled=false now DEGRADES to
+  // a listening gateway instead of exit 1. /v1/* answers the existing
+  // runtime-disabled 503 shape (runtime.enabled=false), /healthz and the
+  // admin/WebUI stay up, and flipping enabled back on takes effect live —
+  // no supervisor fighting a crashlooping container. Binary failures still
+  // exit 1: without agy there is nothing to serve.
+  if (report.kind === 'disabled') {
+    log.warn({ reason: report.dormantReason }, 'gateway disabled — listening in 503 mode; /healthz + /admin + WebUI stay up')
   }
   log.info({ agyBin: report.agyBin, agyVersion: report.agyVersion, dataDir: report.dataDir }, 'agy probe ok')
 
@@ -153,11 +173,16 @@ async function main(): Promise<void> {
   }
 
   // ---- account pool + quota + login flow (ported upstream subsystems) ----
-  const pool = new AccountPoolManager()
+  // B4/S4: the pool's corrupt-file quarantine and throttled persist warnings
+  // ride the log seam instead of vanishing into console silence.
+  const pool = new AccountPoolManager(undefined, (m) => log.warn({ src: 'pool' }, redactLine(m)))
   const quota = new QuotaService(pool)
   const poolAuth = new PoolAuthFlow(pool, quota, (m) => log.warn({ src: 'pool-auth' }, redactLine(m)))
   pool.sweepStaleStaging()
   pool.sweepOldLogs(getConfig().logRetentionDays)
+  // B4/S8: the usage retention prune also runs once at boot (the hourly
+  // housekeeper below owns it afterwards); 0 = keep every row forever.
+  if (getConfig().usageRetentionDays > 0) ledger.pruneOlderThan(getConfig().usageRetentionDays)
 
   // ---- admin event bus (M4): /admin/events SSE. Run events share the
   // ledger row's fields (both fed from the onRun hook below); pool snapshots
@@ -192,8 +217,12 @@ async function main(): Promise<void> {
     getConfig().fallbackModels,
     getConfig().modelsCacheTtlMs,
   )
-  const store = new SessionStore(join(stateDir(), 'sessions.json'))
-  const runs = new RunRegistry(Math.max(8, getConfig().maxConcurrent + 2))
+  const store = new SessionStore(join(stateDir(), 'sessions.json'), (m) =>
+    log.warn({ src: 'sessions' }, redactLine(m)),
+  )
+  // B4/S6: capacity as a supplier — maxConcurrent is runtime-writable, and a
+  // number captured here would go stale after a hot admin resize.
+  const runs = new RunRegistry(() => Math.max(8, getConfig().maxConcurrent + 2))
   const sem = new GatewaySemaphore(
     () => getConfig().maxConcurrent,
     () => getConfig().maxQueueDepth,
@@ -205,16 +234,15 @@ async function main(): Promise<void> {
     pool,
     bin: () => binCache.resolve(),
     invalidateBin: binCache.invalidate,
-    acquire: () => sem.acquire(),
+    // B3/P4: the call's AbortSignal rides into acquire — parked waiters are
+    // rejected on disconnect instead of pinning a queue position.
+    acquire: (signal) => sem.acquire(signal),
     runs,
     // Per-key model whitelist (M5): resolved per call from the keys table.
     // Root key (null) and unknown ids stay unrestricted — the root key is a
-    // charter red line. Parsed once per request; the table is small.
-    getScopes: (keyId) => {
-      if (keyId === null) return null
-      const rec = keys.get(keyId)
-      return rec !== undefined ? parseKeyScopes(rec.scopes) : null
-    },
+    // charter red line. B3/P9: served from the key-store's parsed-scope
+    // cache instead of a row fetch + parse per request.
+    getScopes: (keyId) => (keyId === null ? null : keys.scopesOf(keyId)),
     log: (m) => log.warn({ src: 'engine' }, redactLine(m)),
     onRun: (i) => {
       // Enriched settle hook (one per actual agy spawn attempt — continuations
@@ -294,7 +322,12 @@ async function main(): Promise<void> {
       verifyPassword: (pw) => verifyAdminPassword(db, pw),
     },
   })
-  void catalog.refreshIfNeeded().catch(() => undefined)
+  // B4/S3: disabled-mode boots skip every upstream-spawning poller — there
+  // is nothing to discover or refresh while /v1 is 503, and each would just
+  // burn a signed-out spawn timeout. The catalog poller likewise stays off
+  // until the gateway is actually ready.
+  const ready = report.kind === 'ready'
+  if (ready) void catalog.refreshIfNeeded().catch(() => undefined)
   await built.app.listen({ port: getConfig().port, host: getConfig().host })
   log.info({ port: getConfig().port, host: getConfig().host }, 'agy-proxy listening')
 
@@ -308,6 +341,10 @@ async function main(): Promise<void> {
     void quota.refreshAllQuotas().catch(() => undefined)
   }, Math.max(60_000, getConfig().quotaPollIntervalMs))
   poller.unref()
+  if (!ready) {
+    clearTimeout(bootRefresh)
+    clearInterval(poller)
+  }
 
   // Media sweeper (M5): staged request images live on the volume until the
   // TTL prunes them — the same dir resolution the engine's stager uses.
@@ -333,11 +370,26 @@ async function main(): Promise<void> {
       debug: (m) => log.debug({ src: 'catalog' }, redactLine(m)),
     },
   })
+  if (!ready) catalogPoller.stop() // B4/S3: no upstream spawns while disabled
 
   // Soak observability (M5): raw process metrics for the harness — one NDJSON
   // line per tick on stdout, deliberately NOT through pino (the harness
   // greps for the `"debug":"metrics"` marker). Off by default.
   const metricsTimer = startDebugMetrics(getConfig().debugMetricsMs)
+
+  // B4/S8: one hourly housekeeping timer. Pool log sweeps used to run only
+  // at boot; usage retention (default 0 = keep forever) prunes when an
+  // operator opts in. unref'd so it never holds the process; cleared in
+  // teardown.
+  const housekeeper = setInterval(() => {
+    pool.sweepOldLogs(getConfig().logRetentionDays)
+    const days = getConfig().usageRetentionDays
+    if (days > 0) {
+      const pruned = ledger.pruneOlderThan(days)
+      if (pruned > 0) log.info({ pruned }, 'usage retention prune ran')
+    }
+  }, 3_600_000)
+  housekeeper.unref()
 
   installShutdown(
     { app: built.app, inFlight: built.inFlight, server: built.app.server },
@@ -359,11 +411,13 @@ async function main(): Promise<void> {
       teardown: async () => {
         clearTimeout(bootRefresh)
         clearInterval(poller)
+        clearInterval(housekeeper) // B4/S8
         catalogPoller.stop()
         metricsTimer.stop()
         mediaSweeper.stop()
         bus.closeAll() // ends hijacked /admin/events streams — app.close() does not
         pool.flush() // write out a pending debounced hot-path persist (S-M8)
+        store.flush() // land the sessions store's debounced persist (B2/P5)
         keys.flushTouch() // land debounced last_used_at refreshes (B-M2)
         await poolAuth.cancel().catch(() => undefined)
         await ledger.close().catch(() => undefined) // flush → WAL checkpoint → close

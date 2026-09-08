@@ -149,6 +149,46 @@ describe('catalog poller', () => {
     }
   })
 
+  it('a failed re-validation of a discovered catalog engages backoff (S7)', async () => {
+    vi.useFakeTimers()
+    let calls = 0
+    let fail = false
+    const discover: DiscoverFn = vi.fn(async () => {
+      calls += 1
+      if (fail) throw new Error('quota exhausted')
+      return { stdout: JSON.stringify([{ id: 'm1', display_name: 'm1' }]), stderr: '' }
+    })
+    const poller = startCatalogPoller({
+      catalog: makeCatalog(discover, 60_000), // TTL elapses mid-run
+      canDiscover: () => true,
+    })
+    try {
+      await vi.advanceTimersByTimeAsync(60_000) // t=60: initial discovery ok
+      expect(calls).toBe(1)
+      fail = true
+      // t=120: TTL expired → re-discovery fails while the discovered list
+      // keeps serving (SWR). The old source sniff read this as a recovery:
+      // failures reset to 0 and every later tick sat at the base cadence.
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(calls).toBe(2)
+      // failures=1 → next attempt only at +120s (t=240).
+      await vi.advanceTimersByTimeAsync(59_000)
+      expect(calls).toBe(2)
+      await vi.advanceTimersByTimeAsync(61_000)
+      expect(calls).toBe(3)
+      // And a later success resets backoff to the base cadence again.
+      fail = false
+      await vi.advanceTimersByTimeAsync(240_000) // t=480: failures=2 slot
+      expect(calls).toBe(4)
+      await vi.advanceTimersByTimeAsync(59_000)
+      expect(calls).toBe(4)
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(calls).toBe(5)
+    } finally {
+      poller.stop()
+    }
+  })
+
   it('stop() ends the chain — no further attempts', async () => {
     vi.useFakeTimers()
     let calls = 0

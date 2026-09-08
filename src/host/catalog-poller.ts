@@ -51,11 +51,18 @@ export function startCatalogPoller(deps: CatalogPollerDeps): { stop(): void } {
       }
       // refreshIfNeeded never throws and dedupes in-flight refreshes, so
       // overlap with the boot call or a manual forceRefresh is safe.
-      await deps.catalog.refreshIfNeeded()
-      const catalog = deps.catalog.get()
-      if (catalog.source === 'discovered') {
-        // A failed re-validation keeps serving the previous list (SWR) and
-        // must not trigger backoff — the TTL keeps the cadence.
+      // B4/S7: branch on the reported outcome instead of sniffing
+      // catalog.source — a failed re-validation of a discovered catalog
+      // spreads the old 'discovered' source over the stale timestamp, so
+      // the source check used to read every failure as a recovery and kept
+      // `failures` pinned at 0 (the §7 backoff promise never engaged after
+      // the first successful discovery). SWR is untouched: the stale list
+      // keeps serving while the poller backs off.
+      const outcome = await deps.catalog.refreshIfNeeded()
+      if (outcome !== 'failed') {
+        // 'ok' = discovery succeeded; 'fresh' = the TTL gate skipped the
+        // attempt (only reachable after a success, incl. an out-of-band
+        // forceRefresh) — both are healthy states.
         if (failures > 0 || lastReported !== undefined) {
           deps.log?.info('model discovery recovered — catalog serves the discovered list')
         }
@@ -64,15 +71,11 @@ export function startCatalogPoller(deps: CatalogPollerDeps): { stop(): void } {
         schedule(CATALOG_POLL_INTERVAL_MS)
         return
       }
-      if (catalog.lastError === undefined) {
-        // Initial fallback catalog whose first refresh has not settled yet.
-        schedule(CATALOG_POLL_INTERVAL_MS)
-        return
-      }
       failures += 1
-      if (catalog.lastError !== lastReported) {
-        deps.log?.warn(`model discovery failing (consecutive ${failures}): ${catalog.lastError}`)
-        lastReported = catalog.lastError
+      const message = deps.catalog.get().lastError ?? 'model discovery failed'
+      if (message !== lastReported) {
+        deps.log?.warn(`model discovery failing (consecutive ${failures}): ${message}`)
+        lastReported = message
       } else {
         deps.log?.debug(`model discovery still failing (consecutive ${failures})`)
       }

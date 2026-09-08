@@ -62,6 +62,13 @@ export function registerStaticWeb(
     prefix: '/',
     wildcard: false, // per-file routes only — API routes always win
     index: 'index.html',
+    // P3-svc: the vite build writes .gz/.br siblings next to every asset
+    // (web/vite.config.ts closeBundle). preCompressed picks one by
+    // Accept-Encoding and falls back to the plain file when no sibling
+    // exists or the client negotiates nothing — byte-identical delivery
+    // then. setHeaders below receives the sibling path, which lives in the
+    // same assets/ dir, so the immutable/no-cache decision is unchanged.
+    preCompressed: true,
     // send() would stamp its own `public, max-age=0` over setHeaders — own
     // every cache-control decision here instead.
     cacheControl: false,

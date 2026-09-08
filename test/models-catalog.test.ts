@@ -110,6 +110,20 @@ describe('ModelCatalog', () => {
     expect(after.discoveredAt).toBeGreaterThan(0)
   })
 
+  it('refreshIfNeeded reports fresh/ok/failed outcomes (B4/S7)', async () => {
+    let fail = true
+    const discover: DiscoverFn = vi.fn(async () => {
+      if (fail) throw new Error('Please sign in')
+      return okCatalog(['m1'])
+    })
+    const catalog = new ModelCatalog(discover, FALLBACK, 300_000)
+    await expect(catalog.refreshIfNeeded()).resolves.toBe('failed')
+    fail = false
+    await expect(catalog.refreshIfNeeded()).resolves.toBe('ok')
+    // TTL-fresh: no attempt, and the stub's call count stays at one success.
+    await expect(catalog.refreshIfNeeded()).resolves.toBe('fresh')
+  })
+
   it('defaultEffortFor picks high → medium → low unless config pins one', () => {
     const cfg = defaultConfig()
     const entry = { id: 'g', name: 'g', efforts: ['low', 'medium', 'high'] }

@@ -6,7 +6,11 @@
 // a bundled catalog so the model list is never empty.
 // Ported from dsh-agy-link src/host/models.ts @ 46984db (modified: the
 // defaultEffortFor config parameter type is GatewayConfig instead of
-// PluginConfig — same fields consumed).
+// PluginConfig — same fields consumed; modified B4/S7: refreshIfNeeded
+// reports 'fresh'|'ok'|'failed' so the poller can back off a failed
+// re-validation of a discovered catalog — refresh()'s spread keeps
+// source: 'discovered', which used to hide failures from the poller's
+// source sniff).
 import type { FallbackModelDef, GatewayConfig } from '../common/types.ts'
 
 export interface RawModel { slug: string; label: string }
@@ -174,7 +178,7 @@ export type DiscoverFn = (signal?: AbortSignal) => Promise<{ stdout: string; std
 
 export class ModelCatalog {
   private current: Catalog;
-  private refreshing: Promise<void> | null = null;
+  private refreshing: Promise<'ok' | 'failed'> | null = null;
 
   constructor(
     private readonly discover: DiscoverFn,
@@ -192,11 +196,16 @@ export class ModelCatalog {
     return this.current;
   }
 
-  /** Refresh if stale; never throws — failures keep the previous catalog. */
-  async refreshIfNeeded(): Promise<void> {
+  /**
+   * Refresh if stale; never throws — failures keep the previous catalog.
+   * B4/S7: reports what happened so the poller can branch — 'fresh' (TTL
+   * gate skipped the attempt), 'ok' (discovery succeeded), 'failed'
+   * (attempted and failed; lastError now carries the reason).
+   */
+  async refreshIfNeeded(): Promise<'fresh' | 'ok' | 'failed'> {
     if (this.refreshing) return this.refreshing;
     const age = Date.now() - this.current.discoveredAt;
-    if (this.current.source === 'discovered' && age < this.ttlMs) return;
+    if (this.current.source === 'discovered' && age < this.ttlMs) return 'fresh';
     this.refreshing = this.refresh().finally(() => {
       this.refreshing = null;
     });
@@ -208,7 +217,7 @@ export class ModelCatalog {
     return this.current;
   }
 
-  private async refresh(): Promise<void> {
+  private async refresh(): Promise<'ok' | 'failed'> {
     try {
       const ac = new AbortController();
       const timer = setTimeout(() => ac.abort(), 30_000);
@@ -217,7 +226,7 @@ export class ModelCatalog {
         const raw = parseModelsOutput(stdout);
         if (raw.length > 0) {
           this.current = { source: 'discovered', models: foldEfforts(raw), discoveredAt: Date.now() };
-          return;
+          return 'ok';
         }
         this.current = { ...this.current, lastError: 'agy models returned no entries' };
       } finally {
@@ -226,6 +235,7 @@ export class ModelCatalog {
     } catch (err) {
       this.current = { ...this.current, lastError: err instanceof Error ? err.message : String(err) };
     }
+    return 'failed';
   }
 }
 

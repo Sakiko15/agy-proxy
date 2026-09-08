@@ -302,7 +302,15 @@ export class QuotaService {
       // concurrent agy spawn read torn JSON and fail auth — quarantining a
       // healthy account with no self-heal path (audit M3).
       const tmp = file + '.tmp'
-      writeFileSync(tmp, JSON.stringify(raw), 'utf8')
+      // B4/S5: a failed writeFileSync (disk full, EPERM mid-write) used to
+      // leave the partial .tmp behind — the rename path cleans up, so the
+      // write path cleans up the same way.
+      try {
+        writeFileSync(tmp, JSON.stringify(raw), 'utf8')
+      } catch (writeErr) {
+        try { unlinkSync(tmp) } catch { /* best-effort cleanup */ }
+        throw writeErr
+      }
       try {
         renameSync(tmp, file)
       } catch (renameErr) {

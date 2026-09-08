@@ -48,6 +48,54 @@ describe('with a registered web root', () => {
     expect(res.body).toContain('fixture asset')
   })
 
+  // ---- P3-svc: precompressed sibling negotiation (sentinel sibling files
+  // make the served variant exact; @fastify/static streams their bytes and
+  // stamps content-encoding without inspecting the container). ----
+
+  it('serves the .br sibling when the client negotiates brotli (P3-svc)', async () => {
+    process.env.AGY_PROXY_WEB_DIST = fixture
+    const { built } = makeAdminServer()
+    const res = await built.app.inject({
+      method: 'GET',
+      url: '/assets/app-4f2b9c.js',
+      headers: { 'accept-encoding': 'br' },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(res.headers['content-encoding']).toBe('br')
+    // content-type comes from the original path, not the sibling.
+    expect(res.headers['content-type']).toContain('javascript')
+    expect(res.headers['cache-control']).toBe('public, max-age=31536000, immutable')
+    expect(res.body).toBe('BR-SIBLING of app-4f2b9c.js (precompressed at build time)')
+  })
+
+  it('serves the .gz sibling when the client negotiates gzip only (P3-svc)', async () => {
+    process.env.AGY_PROXY_WEB_DIST = fixture
+    const { built } = makeAdminServer()
+    const res = await built.app.inject({
+      method: 'GET',
+      url: '/assets/app-4f2b9c.js',
+      headers: { 'accept-encoding': 'gzip' },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(res.headers['content-encoding']).toBe('gzip')
+    expect(res.body).toBe('GZ-SIBLING of app-4f2b9c.js (precompressed at build time)')
+  })
+
+  it('no or unsupported Accept-Encoding falls back to the plain file (P3-svc)', async () => {
+    process.env.AGY_PROXY_WEB_DIST = fixture
+    const { built } = makeAdminServer()
+    const bare = await built.app.inject({ method: 'GET', url: '/assets/app-4f2b9c.js' })
+    expect(bare.headers['content-encoding']).toBeUndefined()
+    expect(bare.body).toContain('fixture asset')
+    const deflate = await built.app.inject({
+      method: 'GET',
+      url: '/assets/app-4f2b9c.js',
+      headers: { 'accept-encoding': 'deflate' },
+    })
+    expect(deflate.headers['content-encoding']).toBeUndefined()
+    expect(deflate.body).toContain('fixture asset')
+  })
+
   it('dot-free GET paths fall back to index.html (client routing)', async () => {
     process.env.AGY_PROXY_WEB_DIST = fixture
     const { built } = makeAdminServer()

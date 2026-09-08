@@ -104,15 +104,34 @@ export async function ensureAdminPassword(
   getConfig: () => GatewayConfig,
   log: { warn: (o: object, m: string) => void },
 ): Promise<void> {
+  // B4/S3: a degraded boot (enabled=false with a broken/unwritable data dir)
+  // must still come up and answer /healthz + the disabled-mode 503s — a
+  // failed password bootstrap breaks admin login, not the gateway. The
+  // volume-local master-key sidecar keeps the opposite contract (loud fail),
+  // because its breakage silently corrupts reveal/rotate rather than just
+  // blocking login.
   const envPassword = getConfig().adminPassword
   if (envPassword !== '') {
-    db.prepare('INSERT OR REPLACE INTO admin_settings (key, value) VALUES (?, ?)').run(SETTINGS_KEY, await hash(envPassword))
+    try {
+      db.prepare('INSERT OR REPLACE INTO admin_settings (key, value) VALUES (?, ?)').run(SETTINGS_KEY, await hash(envPassword))
+    } catch (err) {
+      log.warn({ err: err instanceof Error ? err.message : String(err) }, 'admin password rehash failed — admin login may be unavailable')
+    }
     return
   }
-  const existing = db.prepare('SELECT value FROM admin_settings WHERE key = ?').get(SETTINGS_KEY) as { value?: string } | undefined
+  let existing: { value?: string } | undefined
+  try {
+    existing = db.prepare('SELECT value FROM admin_settings WHERE key = ?').get(SETTINGS_KEY) as { value?: string } | undefined
+  } catch (err) {
+    log.warn({ err: err instanceof Error ? err.message : String(err) }, 'admin password lookup failed — treating as first boot')
+  }
   if (existing?.value !== undefined) return
   const generated = randomBytes(12).toString('base64url')
-  db.prepare('INSERT OR REPLACE INTO admin_settings (key, value) VALUES (?, ?)').run(SETTINGS_KEY, await hash(generated))
+  try {
+    db.prepare('INSERT OR REPLACE INTO admin_settings (key, value) VALUES (?, ?)').run(SETTINGS_KEY, await hash(generated))
+  } catch (err) {
+    log.warn({ err: err instanceof Error ? err.message : String(err) }, 'admin password store failed — admin login may be unavailable')
+  }
   log.warn(
     { note: 'this value is shown exactly once and cannot be recovered' },
     `first boot: generated admin password (shown ONCE): ${generated}`,

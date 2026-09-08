@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { resolveConfig } from '../src/common/config.ts'
 import { compareVersions, parseVersion, binCandidates, isCmdShim, isolatedHomeEnv, probeProcess, startAgyProcess } from '../src/host/runner.ts'
-import { compareVersions as cmp2 } from '../src/index.ts'
+import { compareVersions as cmp2, startup } from '../src/index.ts'
 
 const NODE = process.execPath
 // fileURLToPath handles Windows drive letters correctly (URL.pathname yields
@@ -105,6 +105,66 @@ describe('config layering (env > overrides > defaults)', () => {
     expect(resolveConfig({ AGY_PROXY_SHUTDOWN_GRACE_MS: '500' } as NodeJS.ProcessEnv, {}).shutdownGraceMs).toBe(25_000)
     // non-numeric falls through
     expect(resolveConfig({ AGY_PROXY_SHUTDOWN_GRACE_MS: 'soon' } as NodeJS.ProcessEnv, {}).shutdownGraceMs).toBe(25_000)
+  })
+})
+
+// B4/S3: startup()'s outcome kinds. 'disabled' and 'binary-missing' are
+// spawn-free (the latter scrubs every candidate source so the PATH /
+// default-location scan cannot trip over a real install on this machine);
+// the binary-probe kinds need a spawnable binary and are pinned by the
+// probeProcess tests in the runner describe instead.
+describe('startup outcome kinds (B4/S3)', () => {
+  const STASH = ['AGY_PROXY_ENABLED', 'AGY_PROXY_BIN', 'PATH', 'LOCALAPPDATA', 'APPDATA', 'USERPROFILE'] as const
+  const saved: Record<string, string | undefined> = {}
+  const scratch: string[] = []
+
+  function stashEnv(): void {
+    for (const k of STASH) saved[k] = process.env[k]
+  }
+  function restoreEnv(): void {
+    for (const k of STASH) {
+      if (saved[k] === undefined) delete process.env[k]
+      else process.env[k] = saved[k]
+    }
+    for (const dir of scratch.splice(0)) {
+      try { rmSync(dir, { recursive: true, force: true }) } catch { /* tmp */ }
+    }
+  }
+
+  it('enabled=false reports kind disabled without probing any binary', async () => {
+    stashEnv()
+    try {
+      // env beats whatever the local overrides file holds
+      process.env.AGY_PROXY_ENABLED = 'false'
+      const r = await startup()
+      expect(r.kind).toBe('disabled')
+      expect(r.ok).toBe(false)
+      expect(r.dormantReason).toContain('disabled')
+    } finally {
+      restoreEnv()
+    }
+  })
+
+  it('no agy anywhere reports kind binary-missing (env beats a local overrides file)', async () => {
+    stashEnv()
+    try {
+      process.env.AGY_PROXY_ENABLED = 'true' // defeat a local overrides enabled=false
+      process.env.AGY_PROXY_BIN = join(tmpdir(), 'agy-proxy-missing-bin', 'agy.exe')
+      // Scrub every candidate source: hint is a missing path, PATH empty,
+      // per-platform default roots emptied or pointed at a fresh tmp home.
+      process.env.PATH = ''
+      process.env.LOCALAPPDATA = ''
+      process.env.APPDATA = ''
+      const home = mkdtempSync(join(tmpdir(), 'agy-startup-home-'))
+      scratch.push(home)
+      process.env.USERPROFILE = home
+      const r = await startup()
+      expect(r.kind).toBe('binary-missing')
+      expect(r.ok).toBe(false)
+      expect(r.dormantReason).toContain('agy binary not found')
+    } finally {
+      restoreEnv()
+    }
   })
 })
 
