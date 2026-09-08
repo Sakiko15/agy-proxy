@@ -123,6 +123,25 @@ async function main(): Promise<void> {
   // secret storage behind the WebUI copy/regenerate affordances.
   const keys = new KeyStore(db, loadOrCreateMasterKey(dataDir()))
   const ledger = new UsageLedger(db, { flushIntervalMs: 1_000, log: (m) => log.warn(m) })
+  // S1c: process-level net. The engine's guarded regions (S1a/S1b) close the
+  // known escape hatches; this converts any residual stray throw/rejection
+  // from an unobservable hard-crash into an observable one: log verbatim,
+  // land the ledger buffer once (flush()'s synchronous insertBatch completes
+  // before exit — WAL+FULL keeps rows durable), then exit 1. The in-process
+  // state after an uncaught exception is untrustworthy for a credential-
+  // holding gateway, so we exit rather than keep serving; docker
+  // restart: unless-stopped turns that into a clean recovery.
+  const crashToExit = (source: string, err: unknown): void => {
+    log.error({ err: err instanceof Error ? (err.stack ?? err.message) : String(err) }, `${source} — flushing usage ledger and exiting`)
+    try {
+      void ledger.flush().catch(() => undefined)
+    } catch {
+      // a poisoned ledger must not break the exit path
+    }
+    process.exit(1)
+  }
+  process.on('uncaughtException', (err) => crashToExit('uncaughtException', err))
+  process.on('unhandledRejection', (reason) => crashToExit('unhandledRejection', reason))
   const sessions = new AdminSessionStore(db, { ttlMs: getConfig().adminSessionTtlMs })
   await ensureAdminPassword(db, getConfig, log)
 
@@ -324,12 +343,19 @@ async function main(): Promise<void> {
     { app: built.app, inFlight: built.inFlight, server: built.app.server },
     {
       log,
+      graceMs: getConfig().shutdownGraceMs, // S2: ops-tunable drain window (default 25s < compose 40s)
       // B-H1: end the hijacked /admin/events streams BEFORE app.close() — a
       // live admin SSE client parks its connection past Fastify's close and
       // used to hang the whole sequence until docker's SIGKILL skipped the
       // ledger flush + WAL checkpoint. Idempotent (the teardown call below is
       // a no-op when preClose already ran).
-      preClose: () => bus.closeAll(),
+      // S2: flush() has no await before its insertBatch, so this synchronous
+      // call lands the 1s-buffered rows before app.close() even starts — a
+      // close that hangs past grace (docker SIGKILL) can no longer lose them.
+      preClose: () => {
+        bus.closeAll()
+        void ledger.flush()
+      },
       teardown: async () => {
         clearTimeout(bootRefresh)
         clearInterval(poller)

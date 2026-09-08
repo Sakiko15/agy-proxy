@@ -64,4 +64,8 @@ VOLUME ["/data"]
 EXPOSE 8080
 # tini as PID 1
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["node", "dist/index.js"]
+# S9 heap cap: soak RSS peaks ~226MB — 512MB old-space leaves >2x headroom
+# while bounding a runaway heap. Set in CMD, not NODE_OPTIONS: that env var
+# is inherited by every spawned agy child (sanitizeChildEnv only strips
+# AGY_PROXY_*) and would silently cap the upstream CLI's heap too.
+CMD ["node", "--max-old-space-size=512", "dist/index.js"]

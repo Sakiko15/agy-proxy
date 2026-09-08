@@ -159,6 +159,7 @@ export function resolveConfig(
     trustedProxies: asString(get('trustedProxies')) ?? base.trustedProxies,
     dbPath: asString(get('dbPath')) ?? base.dbPath,
     adminSessionTtlMs: asNum(get('adminSessionTtlMs')) ?? base.adminSessionTtlMs,
+    shutdownGraceMs: asNum(get('shutdownGraceMs')) ?? base.shutdownGraceMs,
     webDist: asString(get('webDist')) ?? base.webDist,
   }
   // Env wins last.
@@ -226,6 +227,12 @@ export function resolveConfig(
   if (env.AGY_PROXY_ADMIN_SESSION_TTL_MS) {
     const t = asNum(env.AGY_PROXY_ADMIN_SESSION_TTL_MS)
     if (t && t >= 60_000) cfg.adminSessionTtlMs = t
+  }
+  if (env.AGY_PROXY_SHUTDOWN_GRACE_MS) {
+    const t = asNum(env.AGY_PROXY_SHUTDOWN_GRACE_MS)
+    // S2: clamped, not silently narrowed — below 1s there is no drain window
+    // to speak of, so sub-second values are rejected rather than honored.
+    if (t && t >= 1_000) cfg.shutdownGraceMs = t
   }
   if (env.AGY_PROXY_WEB_DIST) cfg.webDist = env.AGY_PROXY_WEB_DIST
   if (env.AGY_PROXY_DEBUG_METRICS_MS) {

@@ -142,7 +142,7 @@ agy-proxy 是自托管的 LLM 网关：把 Google Antigravity 官方 `agy` CLI �
 - **空响应检测**：官方 #902 报告约 10% 长工具回合以 CANCELED/空响应结束 → 结算层把"CANCELED 或 response 为空"归为可重试失败，计入账号健康度
 - **invalid_grant / 403 熔断**：立即冷却该账号不重试，WebUI 高亮；VALIDATION_REQUIRED 透传 validation_url
 - **SSE 心跳**：反代/Cloudflare 存活（OpenAI 端发注释行 `: ping`，Anthropic 端发 `ping` 事件）
-- **优雅停机**：SIGTERM → 停止接新 → 等待在跑 agy（带上限，docker `stop_grace_period: 30s`）→ kill 残留进程组 → SQLite checkpoint → 关闭 DB
+- **优雅停机**：SIGTERM → 停止接新 → 等待在跑 agy（带上限，默认 25s 经 `AGY_PROXY_SHUTDOWN_GRACE_MS` 可调，S2；docker `stop_grace_period: 40s` 留足余量）→ kill 残留进程组 → SQLite checkpoint → 关闭 DB（preClose 先落账本缓冲行）
 - **崩溃恢复**：SQLite `journal_mode=WAL; synchronous=FULL; busy_timeout`；usage 记账以**服务端**请求 id 幂等去重（引擎级重试合并为一行；客户端自选 `x-request-id` 不作为记账键、仅观测透传——记账键可被客户端操纵会让每日预算形同虚设，S-H1 安全修复）；pool.json/sessions.json 损坏时自动备份重建
 - **并发防护**：每账号串行队列（p-queue `concurrency:1`，已实现——同时消除同账号并发互踩会话绑定的竞态）+ 全局队列深度上限（超出即 429 BUSY）+ 客户端断连（AbortSignal）级联取消 agy 进程。调度补强（M5）：选择时跳过有在跑/排队的账号（busy-aware 参与参数），并发请求横向铺开而非堆叠一个账号的队列——验收 §4「互不阻塞 / ≥2.5× 吞吐」的结构性前提
 - **引擎级单次重试（M5 落地）**：仅覆盖无线上输出的故障类别（TIMEOUT / PROCESS_EXIT / 无结果 INVALID_OUTPUT），按 RETRY_POLICY 抖动延迟后重选账号重跑；任何已下发客户端可见输出（任一 step 事件）或结果形态可终止 span 的失败一律不重放。`RETRYABLE_CODES/RETRY_POLICY` 自 ADR-11 移植以来首次接入消费者

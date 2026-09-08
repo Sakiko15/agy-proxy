@@ -6,7 +6,12 @@ services:
     container_name: agy-proxy
     restart: unless-stopped
     init: false # tini is the in-container PID 1 (Docker's --init must not wrap it)
-    stop_grace_period: 30s # in-flight agy children get the full teardown window
+    stop_grace_period: 40s # must exceed the in-process grace (shutdownGraceMs, default 25s) + teardown margin
+    logging: # S9: bound log growth on the volume (per-request NDJSON is chatty)
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "127.0.0.1:8080:8080" # loopback only; front with a TLS reverse proxy (docs/deploy.md)
     volumes:

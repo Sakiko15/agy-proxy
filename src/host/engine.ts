@@ -1103,10 +1103,29 @@ export class AgyEngine {
           }
         }
       } catch (err) {
-        releaseOnce()
-        rec.settle({ kind: 'error', code: Err.PROCESS_EXIT, message: 'internal error: ' + brief(String(err)) })
+        // S1: the dispatch guard must be escape-proof — a throw inside
+        // releaseOnce/settle/untrackBusy would reject this detached IIFE and
+        // hard-crash the gateway (unhandled rejection = process exit by
+        // default), bypassing ledger flush and SSE teardown. If settle itself
+        // fails the recording stays unsettled; the span pump's end-of-stream
+        // fallback below then serves the client a bounded terminal error
+        // instead of a hang.
+        try {
+          releaseOnce()
+        } catch (releaseErr) {
+          this.deps.log?.('slot release after dispatch error failed: ' + brief(String(releaseErr)))
+        }
+        try {
+          rec.settle({ kind: 'error', code: Err.PROCESS_EXIT, message: 'internal error: ' + brief(String(err)) })
+        } catch (settleErr) {
+          this.deps.log?.('settle after dispatch error failed: ' + brief(String(settleErr)))
+        }
       } finally {
-        this.untrackBusy(attemptAccount?.id)
+        try {
+          this.untrackBusy(attemptAccount?.id)
+        } catch {
+          // busy-mark hygiene must never escape the dispatch IIFE
+        }
       }
     })()
 
@@ -1144,14 +1163,22 @@ export class AgyEngine {
     let clientSawToolCall = false
     let completed = false
     void (async () => {
-      const mapper = new EventMapper({
-        runId: rec.runId,
-        cutOnTool,
-        initialSawText: rec.sawTextBefore(from),
-        usage: rec,
-      })
-      let i = from
+      // S1: the pump guard is escape-proof. The mapper construction sits
+      // inside the guarded region — a constructor throw would otherwise leave
+      // the queue open forever and park the SSE leg on this span. The catch's
+      // emitFailure is guarded too (it is the terminal-failure funnel: if IT
+      // throws, a fixed internal-string fallback chunk pair closes the span
+      // without crossing any token material), and queue.close() is
+      // unconditional — every consumer of drain() must see the span end.
+      let mapper: EventMapper | undefined
       try {
+        mapper = new EventMapper({
+          runId: rec.runId,
+          cutOnTool,
+          initialSawText: rec.sawTextBefore(from),
+          usage: rec,
+        })
+        let i = from
         for await (const ev of rec.eventsFrom(from)) {
           for (const ch of mapper.map(ev, i)) {
             if (ch.type === 'finish' && ch.reason.kind === 'tool-calls') cutOnToolEnd = true
@@ -1169,9 +1196,17 @@ export class AgyEngine {
           }
         }
       } catch (err) {
-        for (const ch of mapper.emitFailure('error', Err.PROCESS_EXIT, 'internal error: ' + brief(String(err)))) queue.push(ch)
+        try {
+          const fallback = mapper ?? new EventMapper({ runId: rec.runId, cutOnTool, initialSawText: rec.sawTextBefore(from), usage: rec })
+          for (const ch of fallback.emitFailure('error', Err.PROCESS_EXIT, 'internal error: ' + brief(String(err)))) queue.push(ch)
+        } catch {
+          // Last resort: fixed internal strings only, zero scrubbing risk.
+          queue.push({ type: 'usage', usage: { inputTokens: 0, outputTokens: 0 } })
+          queue.push({ type: 'finish', reason: { kind: 'error', failure: { message: 'internal error', code: Err.PROCESS_EXIT } } })
+        }
+      } finally {
+        queue.close()
       }
-      queue.close()
     })()
     try {
       for await (const ch of queue.drain()) {

@@ -85,6 +85,12 @@ export interface GatewayConfig {
   dbPath: string
   /** Admin session lifetime in ms (default 7 days). */
   adminSessionTtlMs: number
+  /** Graceful-shutdown grace window in ms (S2): at expiry in-flight agy runs
+   *  are aborted and raw sockets reaped (shutdown.ts). Ops-level tuning —
+   *  reboot-effective, deliberately not admin-UI writable. The default sits
+   *  below the documented docker stop_grace_period (40s) so the graceful
+   *  drain wins the race against SIGKILL. */
+  shutdownGraceMs: number
   /** Static WebUI directory override. Empty = auto-detect (env
    *  AGY_PROXY_WEB_DIST, then the entry's sibling web/dist, then cwd). */
   webDist: string
@@ -147,6 +153,7 @@ export function defaultConfig(): GatewayConfig {
     sseHeartbeatMs: 60_000,
     dbPath: '',
     adminSessionTtlMs: 7 * 86_400_000,
+    shutdownGraceMs: 25_000,
     webDist: '',
   }
 }

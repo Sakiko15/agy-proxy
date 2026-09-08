@@ -89,6 +89,23 @@ describe('config layering (env > overrides > defaults)', () => {
     const fromEnv = resolveConfig({ AGY_PROXY_MAX_QUEUE_DEPTH: '-5' } as NodeJS.ProcessEnv, { maxQueueDepth: -5 })
     expect(fromEnv.maxQueueDepth).toBe(0)
   })
+
+  it('shutdownGraceMs layers like the other ops knobs (S2)', () => {
+    expect(resolveConfig({}, {}).shutdownGraceMs).toBe(25_000)
+    expect(resolveConfig({}, { shutdownGraceMs: 42_000 }).shutdownGraceMs).toBe(42_000)
+    // env wins over the overrides layer
+    expect(
+      resolveConfig({ AGY_PROXY_SHUTDOWN_GRACE_MS: '30000' } as NodeJS.ProcessEnv, { shutdownGraceMs: 42_000 }).shutdownGraceMs,
+    ).toBe(30_000)
+    // clamp: below 1s there is no drain window — the value is rejected, not
+    // narrowed, so lower layers (or the default) keep the effective window.
+    expect(
+      resolveConfig({ AGY_PROXY_SHUTDOWN_GRACE_MS: '500' } as NodeJS.ProcessEnv, { shutdownGraceMs: 42_000 }).shutdownGraceMs,
+    ).toBe(42_000)
+    expect(resolveConfig({ AGY_PROXY_SHUTDOWN_GRACE_MS: '500' } as NodeJS.ProcessEnv, {}).shutdownGraceMs).toBe(25_000)
+    // non-numeric falls through
+    expect(resolveConfig({ AGY_PROXY_SHUTDOWN_GRACE_MS: 'soon' } as NodeJS.ProcessEnv, {}).shutdownGraceMs).toBe(25_000)
+  })
 })
 
 describe('runner helpers', () => {

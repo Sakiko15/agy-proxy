@@ -160,6 +160,7 @@ Layering: `AGY_PROXY_*` environment variables > `~/.agy-proxy/gateway/runtime-ov
 | `AGY_PROXY_CONVERSATIONS_DIR` | *(agy default)* | Override for agy conversation discovery. |
 | `AGY_PROXY_DB_PATH` | `<dataDir>/agy-proxy.db` | SQLite file for API keys, the usage ledger and admin sessions. WAL mode. |
 | `AGY_PROXY_ADMIN_SESSION_TTL_MS` | `604800000` (7d) | Admin session cookie lifetime (clamped ≥ 60s). |
+| `AGY_PROXY_SHUTDOWN_GRACE_MS` | `25000` | Graceful-shutdown drain window (clamped ≥ 1s) before in-flight runs are aborted; keep below docker's `stop_grace_period` (compose default 40s). Not admin-UI writable — reboot-effective ops tuning. |
 | `AGY_PROXY_ADMIN_ALLOW_CIDR` | *(empty = any)* | CIDR allowlist gating every `/admin/*` route, re-read per request. Comma-separated; IPv4 (v6-mapped forms normalized). Empty allows all — always narrow this on a VPS. |
 | `AGY_PROXY_ADMIN_PASSWORD` | *(generated)* | Admin password; env wins over the stored hash and re-hashes (argon2id) at boot. Unset + no stored hash → a random password is generated and printed exactly once. |
 | `AGY_PROXY_TRUSTED_PROXIES` | *(empty)* | Comma-separated proxy IPs/CIDRs; when the client IP is in this set, `X-Forwarded-For` decides the admin-CIDR client address. |

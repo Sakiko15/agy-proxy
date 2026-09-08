@@ -1,7 +1,8 @@
 // Graceful shutdown (charter §6): SIGTERM/SIGINT → stop accepting → grace
 // window → abort in-flight requests (the engine cascades the abort into the
 // agy process-group kill) → app.close() → exit. New code, not a port. The
-// 25s grace sits below the documented docker stop_grace_period of 30s.
+// 25s default grace (shutdownGraceMs) sits below the documented docker
+// stop_grace_period of 40s.
 // Batch 2: the sequence is an exported awaitable (createShutdown) so tests
 // can drive it without process.exit; a preClose hook runs BEFORE app.close()
 // (ending hijacked /admin/events streams that Fastify's close cannot reap —
