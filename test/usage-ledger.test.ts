@@ -147,6 +147,115 @@ describe('day budget (MA5)', () => {
   })
 })
 
+describe('day budget cache (B3/P2-svc)', () => {
+  const NOW = new Date().setHours(15, 0, 0, 0)
+
+  it('record() advances a seeded entry without a flush; the seed includes buffered rows', () => {
+    const { ledger, db } = mkLedger({ now: () => NOW })
+    // No flush yet — the row is still in the buffer. The seed must count it
+    // (it is today's by construction: created_at is stamped at flush time).
+    ledger.record(rec('b1', { keyId: 'k', promptTokens: 10, completionTokens: 5 }))
+    expect(ledger.tokensUsedToday('k')).toBe(15)
+    // A seeded entry accumulates O(1) on record — still nothing in the DB.
+    ledger.record(rec('b2', { keyId: 'k', promptTokens: 7, completionTokens: 3 }))
+    expect(ledger.tokensUsedToday('k')).toBe(25)
+    expect((db.prepare('SELECT COUNT(*) AS n FROM usage').get() as { n: number }).n).toBe(0)
+    checkpointAndClose(db)
+  })
+
+  it('seed and accumulate agree whichever path runs first', () => {
+    const { ledger, db } = mkLedger({ now: () => NOW })
+    ledger.record(rec('c1', { keyId: 'k', promptTokens: 10, completionTokens: 5 }))
+    ledger.record(rec('c2', { keyId: 'k', promptTokens: 7, completionTokens: 3 }))
+    // No seed was requested between the two records — the re-seed path must
+    // reach the same total the accumulate path would have.
+    expect(ledger.tokensUsedToday('k')).toBe(25)
+    checkpointAndClose(db)
+  })
+
+  it('a flush lands the buffered rows and the cache stays consistent', async () => {
+    const { ledger, db } = mkLedger({ now: () => NOW })
+    ledger.record(rec('f1', { keyId: 'k', promptTokens: 100, completionTokens: 50 }))
+    expect(ledger.tokensUsedToday('k')).toBe(150)
+    await ledger.flush()
+    // Cache hit returns the same number the DB now holds.
+    expect(ledger.tokensUsedToday('k')).toBe(150)
+    expect(
+      (db.prepare('SELECT COALESCE(SUM(total_tokens), 0) AS s FROM usage WHERE key_id = ?').get('k') as { s: number }).s,
+    ).toBe(150)
+    checkpointAndClose(db)
+  })
+
+  it('a cross-midnight entry is re-seeded from the new day, not accumulated into', async () => {
+    let nowMs = new Date().setHours(23, 59, 0, 0)
+    const { ledger, db } = mkLedger({ now: () => nowMs })
+    ledger.record(rec('pre', { keyId: 'k', promptTokens: 100 }))
+    await ledger.flush()
+    expect(ledger.tokensUsedToday('k')).toBe(105)
+    nowMs += 2 * 60_000 // 00:01 next day
+    // The stale day entry is skipped by record(); the new day re-seeds.
+    ledger.record(rec('post', { keyId: 'k', promptTokens: 10 }))
+    expect(ledger.tokensUsedToday('k')).toBe(15)
+    // After the flush the new day's DB sum holds only the post-midnight row:
+    // created_at is stamped at flush time (now in the new day), so 'pre'
+    // stays in yesterday.
+    await ledger.flush()
+    const midnight = new Date(nowMs)
+    midnight.setHours(0, 0, 0, 0)
+    expect(
+      (db.prepare('SELECT COALESCE(SUM(total_tokens), 0) AS s FROM usage WHERE key_id = ? AND created_at >= ?').get('k', midnight.getTime()) as { s: number }).s,
+    ).toBe(15)
+    checkpointAndClose(db)
+  })
+
+  it('a replayed request id still advances the cache (documented ±1-row drift)', async () => {
+    const { ledger, db } = mkLedger({ now: () => NOW })
+    ledger.record(rec('seeded', { keyId: 'k', promptTokens: 10 }))
+    await ledger.flush()
+    expect(ledger.tokensUsedToday('k')).toBe(15) // seed
+    // Same request id twice: the cache advances per record, the DB keeps one
+    // row (INSERT OR IGNORE). Drift = one row — the tolerance the ledger
+    // header declares for per-key sums.
+    ledger.record(rec('dup', { keyId: 'k', promptTokens: 10 }))
+    ledger.record(rec('dup', { keyId: 'k', promptTokens: 10 }))
+    await ledger.flush()
+    expect((db.prepare('SELECT COUNT(*) AS n FROM usage WHERE request_id = ?').get('dup') as { n: number }).n).toBe(1)
+    expect(ledger.tokensUsedToday('k')).toBe(45)
+    checkpointAndClose(db)
+  })
+})
+
+describe('retention prune (B4/S8)', () => {
+  it('deletes rows older than N full days, keeping newer ones', async () => {
+    const nowMs = new Date().setHours(15, 0, 0, 0)
+    const { ledger, db } = mkLedger({ now: () => nowMs })
+    ledger.record(rec('fresh', { promptTokens: 1 }))
+    await ledger.flush()
+    // Two legacy rows: 3 days ago and 10 days ago.
+    db.prepare('UPDATE usage SET created_at = ? WHERE request_id = ?').run(nowMs - 3 * 86_400_000, 'fresh')
+    ledger.record(rec('legacy', { promptTokens: 1 }))
+    await ledger.flush()
+    db.prepare('UPDATE usage SET created_at = ? WHERE request_id = ?').run(nowMs - 10 * 86_400_000, 'legacy')
+    // days=7: cutoff = local midnight 7 days ago → 10-day-old row goes,
+    // 3-day-old row stays.
+    expect(ledger.pruneOlderThan(7)).toBe(1)
+    const remaining = db.prepare('SELECT COUNT(*) AS n FROM usage').get() as { n: number }
+    expect(remaining.n).toBe(1)
+    expect(ledger.query({}).rows.map((r) => r.requestId)).toEqual(['fresh'])
+    checkpointAndClose(db)
+  })
+
+  it('a zero/negative retention is a no-op (default keeps current behavior)', async () => {
+    const { ledger } = mkLedger()
+    ledger.record(rec('kept'))
+    await ledger.flush()
+    expect(ledger.pruneOlderThan(0)).toBe(0)
+    expect(ledger.pruneOlderThan(-3)).toBe(0)
+    expect(ledger.pruneOlderThan(Number.NaN)).toBe(0)
+    expect(ledger.query({}).total).toBe(1)
+  })
+})
+
 describe('query', () => {
   it('filters by keyId/model and paginates newest-first', async () => {
     const { ledger, db } = mkLedger()

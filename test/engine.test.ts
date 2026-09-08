@@ -17,6 +17,7 @@ import { ModelCatalog } from '../src/host/models.ts'
 import { SessionStore } from '../src/host/sessions.ts'
 import { RunRegistry } from '../src/host/recording.ts'
 import { executeMirrorTool } from '../src/host/mirror.ts'
+import { GatewaySemaphore } from '../src/server/semaphore.ts'
 import type { StreamChunk } from '../src/host/stream-types.ts'
 import { defaultConfig, Err, type GatewayConfig } from '../src/common/types.ts'
 
@@ -742,6 +743,33 @@ describe('S-H1/S-H2/H1 regressions: tenant scoping, media keys, busy tracking', 
     await expect(collect(onceBusy.engine.stream(call([msg('user', 'hello')])))).rejects.toMatchObject({ code: Err.BUSY })
     await runTurn(onceBusy.engine, [msg('user', 'hello again')], { meta: { keyId: 'root' } })
     expect(busySeen?.has('acc-1')).toBe(false)
+  })
+})
+
+// B3/P4 engine integration: a call parked on the REAL GatewaySemaphore leaves
+// the queue with ABORTED when its client disconnects — the semaphore unit
+// suite pins the waiter mechanics; this pins that the engine forwards
+// call.signal into acquire and that a rejected parked acquire leaves no
+// residue (no spawn, no onRun, no slot, no queue entry).
+describe('semaphore abort integration (B3/P4)', () => {
+  it('parked + disconnect rejects ABORTED and leaves the queue without consuming a slot', async () => {
+    const sem = new GatewaySemaphore(() => 1, () => 8)
+    const { engine } = makeEngine({}, { acquire: (signal) => sem.acquire(signal) })
+    // Occupy the only slot out-of-band so the engine call must park.
+    const held = await sem.acquire()
+    const ctrl = new AbortController()
+    const parked = collect(engine.stream(call([msg('user', 'hello')], { signal: ctrl.signal })))
+    await waitFor(() => (sem.depth === 1 ? true : undefined))
+    ctrl.abort()
+    await expect(parked).rejects.toMatchObject({ code: 'ABORTED' })
+    // The dropped waiter left the queue; the out-of-band slot is untouched.
+    expect(sem.depth).toBe(0)
+    expect(sem.inFlight).toBe(1)
+    // Hand the slot back: the queue is clean, counts return to zero exactly.
+    held()
+    expect(sem.inFlight).toBe(0)
+    const again = await sem.acquire()
+    again()
   })
 })
 

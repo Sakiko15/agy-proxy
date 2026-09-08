@@ -164,8 +164,13 @@ export interface EngineDeps {
    * empty (the real agy binary takes the args directly).
    */
   binArgs?: readonly string[]
-  /** Shared semaphore for cross-session concurrency. */
-  acquire: () => Promise<() => void>
+  /** Shared semaphore for cross-session concurrency. B3/P4: takes the call's
+   *  AbortSignal — a parked waiter is rejected (ABORTED) on disconnect
+   *  instead of occupying the queue until a slot frees up, so a pile-up of
+   *  dead connections cannot starve live ones. The fast path (a free slot)
+   *  ignores the signal: an already-disconnected call still acquires and
+   *  hits the post-acquire check below. */
+  acquire: (signal?: AbortSignal) => Promise<() => void>
   log?: (msg: string) => void
   /** Recordings shared with the agy_tool mirror (continuation spans). */
   runs: RunRegistry
@@ -206,9 +211,10 @@ export interface EngineDeps {
    * callback = the feature is off. The engine checks the model actually
    * SERVED (post-fallback resolution) and rejects with Err.MODEL_NOT_ALLOWED
    * (403, both protocols). The root key (keyId=null) must resolve null —
-   * charter red line: the bootstrap key is unrestricted.
+   * charter red line: the bootstrap key is unrestricted. Readonly: the
+   * engine only compares membership — key-store hands back its frozen cache.
    */
-  getScopes?: (keyId: string | null) => string[] | null
+  getScopes?: (keyId: string | null) => readonly string[] | null
   /** Reads image bytes from protocol-layer attachment storage. */
   readImage?: (ref: ImageRefLike) => Promise<Uint8Array | null>
   /**
@@ -726,7 +732,7 @@ export class AgyEngine {
         args.push('--json-schema', file)
         schemaCleanup = () => rm(dir, { recursive: true, force: true })
       }
-      release = await this.deps.acquire()
+      release = await this.deps.acquire(call.signal)
       if (call.signal?.aborted ?? false) {
         // A-M2: aborted while parked in the semaphore queue. The catch below
         // only untracks the busy mark — the semaphore slot (and any schema
@@ -744,6 +750,13 @@ export class AgyEngine {
       // must release the busy mark here, or the account is suppressed from
       // selection until restart.
       this.untrackBusy(account?.id)
+      // B3/P4: every pre-dispatch throw also leaves the --json-schema temp
+      // dir behind (the post-acquire branch above cleans its own) — a parked
+      // acquire rejected by a disconnect, and the pre-existing queue-full
+      // BUSY, leaked the staged schema file until the tmp volume was
+      // cleaned by hand.
+      if (schemaCleanup) void schemaCleanup().catch(() => undefined)
+      schemaCleanup = null
       throw err
     }
     // ---- dispatch with a single engine-level retry (M5) ----

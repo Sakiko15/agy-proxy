@@ -13,7 +13,6 @@
 // is never logged, and no route exposes key_hash or session tokens.
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import { RateLimiterMemory } from 'rate-limiter-flexible'
-import QRCode from 'qrcode'
 import type { Logger } from 'pino'
 import type { GatewayConfig } from '../common/types.ts'
 import type { AccountPoolData, ManagedAccount, ModelFamily } from '../common/pool-types.ts'
@@ -335,6 +334,11 @@ export function registerAdminApi(app: AdminInstance, deps: AdminDeps): void {
       await reply.code(404).send({ ok: false, error: 'no login flow is waiting — POST /admin/pool/auth/begin first' })
       return reply
     }
+    // B3/P10: lazy import — qrcode (and its PNG dependency chain) loaded only
+    // when an OAuth QR is actually requested, instead of taxing startup and
+    // memory for an admin-only endpoint. The route awaits it per call; the
+    // module cache makes every call after the first a resolved promise.
+    const QRCode = (await import('qrcode')).default
     const png = await QRCode.toBuffer(status.url, { type: 'png', width: 320 })
     await reply.code(200).header('content-type', 'image/png').header('cache-control', 'no-store').send(png)
     return reply

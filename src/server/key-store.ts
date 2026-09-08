@@ -138,6 +138,15 @@ export class KeyStore {
    *  touchPending (latest wins) for flushTouch(). remove() cleans both. */
   private readonly lastWritten = new Map<string, number>()
   private readonly touchPending = new Map<string, number>()
+  /** B3/P9: parsed per-key model whitelist cache. The engine's getScopes read
+   *  rode every request as a row fetch + JSON.parse of the scopes column;
+   *  the cache serves the parsed (frozen) array instead. update()/remove()
+   *  invalidate; create()/rotate() mint unchanged-or-new ids — a new id is a
+   *  natural miss, and rotate leaves the whitelist untouched. Cached arrays
+   *  are shared with the consumer (the engine reads, never mutates — the
+   *  frozen boundary enforces it); unknown ids are deliberately NOT cached:
+   *  a key may be created at any moment and a miss is one indexed SELECT. */
+  private readonly scopesCache = new Map<string, readonly string[] | null>()
 
   /** masterKey (when wired, see loadOrCreateMasterKey) enables the reversible
    *  secret storage; absent → create/rotate store NULL and reveal() reports
@@ -203,6 +212,20 @@ export class KeyStore {
     return key.disabledAt !== null ? { verdict: 'disabled', key } : { verdict: 'ok', key }
   }
 
+  /** B3/P9: parsed scopes for one key id (the per-key model whitelist the
+   *  engine checks post-fallback). Cached parsed form; `null` conflates "no
+   *  whitelist" with "unknown id" exactly like the get() call it replaces. */
+  scopesOf(id: string): readonly string[] | null {
+    const hit = this.scopesCache.get(id)
+    if (hit !== undefined) return hit
+    const rec = this.get(id)
+    if (rec === undefined) return null
+    const parsed = parseKeyScopes(rec.scopes)
+    const cached: readonly string[] | null = parsed === null ? null : Object.freeze(parsed)
+    this.scopesCache.set(id, cached)
+    return cached
+  }
+
   update(
     id: string,
     patch: { name?: string; disabled?: boolean; dailyTokenLimit?: number; rpmLimit?: number; scopes?: string | null },
@@ -220,6 +243,7 @@ export class KeyStore {
       scopes,
       id,
     )
+    this.scopesCache.delete(id) // B3/P9: the parsed whitelist just changed
     return this.get(id)
   }
 
@@ -227,6 +251,7 @@ export class KeyStore {
     const info = this.stmtDelete.run(id)
     this.lastWritten.delete(id)
     this.touchPending.delete(id)
+    this.scopesCache.delete(id)
     return info.changes > 0
   }
 

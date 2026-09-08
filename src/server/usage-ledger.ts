@@ -101,6 +101,18 @@ export class UsageLedger {
   /** B-M2: tokensUsedToday rides every authenticated request (daily budget
    *  check) — prepare-once instead of per-call sqlite_stmt churn. */
   private readonly tokensTodayStmt: BetterSqlite3.Statement
+  /** B4/S8: retention prune — prepared once; idx_usage_time covers the range. */
+  private readonly pruneStmt: BetterSqlite3.Statement
+  /** B3/P2-svc: per-key daily-token cache for the MA5 budget gate. record()
+   *  accumulates O(1) into the day's entry; the first miss per (key, day)
+   *  seeds from the DB SUM plus the still-buffered rows — which are the same
+   *  day's by construction, because a row's created_at is stamped at FLUSH
+   *  time: rows flushed after midnight land in the new day in the DB, and the
+   *  seed counts them the same way. Net effect vs. the old DB-only read: the
+   *  budget gate sees buffered rows one flush window sooner (the old SUM
+   *  silently missed them) — inside the ±1-request tolerance this file's
+   *  header already declares. */
+  private readonly tokensTodayCache = new Map<string, { day: number; total: number }>()
   /** Warn once about post-close record() calls (straggler run callbacks). */
   private warnedClosed = false
   /** Timestamp of the last flush-failure warning (throttle state). */
@@ -133,6 +145,7 @@ export class UsageLedger {
     this.tokensTodayStmt = db.prepare(
       'SELECT COALESCE(SUM(total_tokens), 0) AS s FROM usage WHERE key_id = ? AND created_at >= ?',
     )
+    this.pruneStmt = db.prepare('DELETE FROM usage WHERE created_at < ?')
     this.armTimer()
   }
 
@@ -167,6 +180,16 @@ export class UsageLedger {
           : null,
       createdAt: 0, // stamped at flush time
     })
+    // B3/P2-svc: O(1) budget-gate accumulation. Only a same-day cache entry is
+    // advanced; a stale (cross-midnight) entry is left to the next
+    // tokensUsedToday() re-seed, which reads the authoritative SUM.
+    if (rec.keyId !== null) {
+      const cached = this.tokensTodayCache.get(rec.keyId)
+      if (cached !== undefined && cached.day === startOfToday(this.now)) {
+        cached.total += rec.promptTokens || 0
+        cached.total += rec.completionTokens || 0
+      }
+    }
     if (this.buffer.length >= 500) void this.flush()
   }
 
@@ -199,11 +222,23 @@ export class UsageLedger {
     }
   }
 
-  /** SUM(total_tokens) for one key since LOCAL midnight (MA5 daily budget). */
+  /** SUM(total_tokens) for one key since LOCAL midnight (MA5 daily budget).
+   *  B3/P2-svc: served from the per-key cache once seeded; the seed is the DB
+   *  SUM plus the key's still-buffered rows (today's by construction — see
+   *  the field comment). Rows ignored by INSERT OR IGNORE (a replayed request
+   *  id) still advance the cache — the drift is bounded by the same
+   *  ±1-request tolerance the ledger header declares. */
   tokensUsedToday(keyId: string): number {
     const midnight = startOfToday(this.now)
+    const cached = this.tokensTodayCache.get(keyId)
+    if (cached !== undefined && cached.day === midnight) return cached.total
     const row = this.tokensTodayStmt.get(keyId, midnight) as { s: number }
-    return row.s
+    let total = row.s
+    for (const b of this.buffer) {
+      if (b.keyId === keyId) total += b.totalTokens
+    }
+    this.tokensTodayCache.set(keyId, { day: midnight, total })
+    return total
   }
 
   summarizeToday(): { requests: number; promptTokens: number; completionTokens: number; totalTokens: number } {
@@ -217,6 +252,27 @@ export class UsageLedger {
          FROM usage WHERE created_at >= ?`,
       )
       .get(midnight) as { requests: number; promptTokens: number; completionTokens: number; totalTokens: number }
+  }
+
+  /**
+   * B4/S8: delete usage rows older than `days` full days (local-midnight
+   * aligned); returns the deleted row count. Default config keeps retention
+   * off (0), so nothing changes until an operator opts in. Never throws —
+   * the caller is a periodic sweep; a failure warns throttled and the next
+   * window retries. The single DELETE rides idx_usage_time, so the scan is
+   * bounded to the pruned range; on a large legacy table the first prune may
+   * take a moment, which is acceptable for hourly maintenance.
+   */
+  pruneOlderThan(days: number): number {
+    if (!Number.isFinite(days) || days <= 0) return 0
+    const cutoff = startOfToday(this.now) - Math.floor(days) * 86_400_000
+    try {
+      const info = this.pruneStmt.run(cutoff)
+      return Number(info.changes)
+    } catch (err) {
+      this.warnThrottled(`usage ledger prune failed (${describeError(err)})`)
+      return 0
+    }
   }
 
   query(q: UsageQuery): { total: number; rows: UsageRow[] } {
@@ -249,6 +305,7 @@ export class UsageLedger {
     if (this.closed) return
     this.disarmTimer()
     this.closed = true
+    this.tokensTodayCache.clear() // B3/P2-svc: nothing after close may read a stale day total
     if (this.buffer.length > 0) {
       const batch = this.buffer
       this.buffer = [] // teardown: rows are dropped on failure, not requeued

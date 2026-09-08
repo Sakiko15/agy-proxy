@@ -45,11 +45,29 @@ export function overridesPath(): string {
  */
 let overridesCache: { file: string; mtimeMs: number; size: number; data: OverridesFile } | null = null
 
+/**
+ * P5-svc: memoized overrides→base layering (defaultConfig() + the ~45 as*
+ * coercions), keyed on the same stat identity as the B-M3 overrides memo.
+ * resolveConfig() with no explicit overrides runs once per overrides-file
+ * change instead of once per request.
+ */
+let baseCache: { key: string; base: GatewayConfig } | null = null
+
 export function invalidateOverridesCache(): void {
   overridesCache = null
+  baseCache = null
 }
 
-export function readOverrides(file: string = overridesPath()): OverridesFile {
+export interface OverridesRead {
+  file: string
+  /** statSync result, or null when it failed (missing file etc.). */
+  st: { mtimeMs: number; size: number } | null
+  /** false = corrupt/unreadable — tolerated as {} and NEVER memoized. */
+  parsed: boolean
+  data: OverridesFile
+}
+
+export function readOverridesWithStat(file: string = overridesPath()): OverridesRead {
   let st: { mtimeMs: number; size: number } | null = null
   try {
     const s = statSync(file)
@@ -61,7 +79,7 @@ export function readOverrides(file: string = overridesPath()): OverridesFile {
   if (st !== null && cached !== null && cached.file === file && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
     // Shallow copy: callers get a fresh top-level object per call, as before
     // (values are scalars — the overrides format is flat).
-    return { ...cached.data }
+    return { file, st, parsed: true, data: { ...cached.data } }
   }
   let data: OverridesFile = {}
   try {
@@ -70,10 +88,14 @@ export function readOverrides(file: string = overridesPath()): OverridesFile {
       if (v && typeof v === 'object') data = v as Record<string, unknown>
     }
   } catch {
-    return {} // corrupt/unreadable — tolerated, never cached
+    return { file, st, parsed: false, data: {} } // corrupt/unreadable — tolerated, never cached
   }
   if (st !== null) overridesCache = { file, mtimeMs: st.mtimeMs, size: st.size, data }
-  return data
+  return { file, st, parsed: true, data }
+}
+
+export function readOverrides(file: string = overridesPath()): OverridesFile {
+  return readOverridesWithStat(file).data
 }
 
 function asString(v: unknown): string | undefined {
@@ -103,23 +125,18 @@ function asMode(v: unknown): PermissionMode | undefined {
 }
 
 /**
- * Layered config read. NOTE (perf): the default `overrides` parameter does a
- * SYNCHRONOUS disk read (readOverrides()) on every call, and the host's
- * getConfig thunk (index.ts) calls this uncached — so every request used to
- * pay a small stat+read on the overrides file. B-M3 replaces that with the
- * mtime+size memo in readOverrides(): the no-restart semantics are untouched,
- * the per-request cost is one statSync on a hit.
+ * P5-svc: the overrides→base layering as a pure function of the parsed
+ * overrides file — defaultConfig() plus the as* coercions, nothing else. env
+ * and the floors are applied by the caller on a fresh copy, so the result is
+ * safely shareable across calls (see resolveConfig's base memo).
  */
-export function resolveConfig(
-  env: NodeJS.ProcessEnv = process.env,
-  overrides: OverridesFile = readOverrides(),
-): GatewayConfig {
+function buildBase(overrides: OverridesFile): GatewayConfig {
   const base = defaultConfig()
   const get = (k: string): unknown => {
     if (overrides[k] !== undefined && overrides[k] !== null && overrides[k] !== '') return overrides[k]
     return undefined
   }
-  const cfg: GatewayConfig = {
+  return {
     ...base,
     enabled: asBool(get('enabled')) ?? base.enabled,
     agyBin: asString(get('agyBin')) ?? base.agyBin,
@@ -149,6 +166,7 @@ export function resolveConfig(
     rateLimitPerMinute: asNum(get('rateLimitPerMinute')) ?? base.rateLimitPerMinute,
     autoFallbackModel: asBool(get('autoFallbackModel')) ?? base.autoFallbackModel,
     logRetentionDays: asNum(get('logRetentionDays')) ?? base.logRetentionDays,
+    usageRetentionDays: asNum(get('usageRetentionDays')) ?? base.usageRetentionDays,
     quotaPollIntervalMs: asNum(get('quotaPollIntervalMs')) ?? base.quotaPollIntervalMs,
     disableTelemetry: asBool(get('disableTelemetry')) ?? base.disableTelemetry,
     dataDir: asString(get('dataDir')) ?? base.dataDir,
@@ -162,6 +180,9 @@ export function resolveConfig(
     shutdownGraceMs: asNum(get('shutdownGraceMs')) ?? base.shutdownGraceMs,
     webDist: asString(get('webDist')) ?? base.webDist,
   }
+}
+
+function applyEnv(cfg: GatewayConfig, env: NodeJS.ProcessEnv): GatewayConfig {
   // Env wins last.
   if (env.AGY_PROXY_ENABLED !== undefined) cfg.enabled = asBool(env.AGY_PROXY_ENABLED) ?? cfg.enabled
   if (env.AGY_PROXY_BIN) cfg.agyBin = env.AGY_PROXY_BIN
@@ -210,6 +231,12 @@ export function resolveConfig(
     const l = asNum(env.AGY_PROXY_LOG_RETENTION_DAYS)
     if (l && l > 0) cfg.logRetentionDays = l
   }
+  if (env.AGY_PROXY_USAGE_RETENTION_DAYS) {
+    const d = asNum(env.AGY_PROXY_USAGE_RETENTION_DAYS)
+    // B4/S8: 0 keeps every row forever (the default); only positive day
+    // counts enable the hourly prune.
+    if (d && d > 0) cfg.usageRetentionDays = Math.floor(d)
+  }
   if (env.AGY_PROXY_QUOTA_POLL_INTERVAL_MS) {
     const q = asNum(env.AGY_PROXY_QUOTA_POLL_INTERVAL_MS)
     if (q && q >= 60_000) cfg.quotaPollIntervalMs = q
@@ -247,6 +274,11 @@ export function resolveConfig(
     const v = Number(env.AGY_PROXY_SSE_HEARTBEAT_MS)
     if (Number.isFinite(v) && v >= 0) cfg.sseHeartbeatMs = v
   }
+  return cfg
+}
+
+function finishConfig(cfg: GatewayConfig, env: NodeJS.ProcessEnv): GatewayConfig {
+  applyEnv(cfg, env)
   // Floors after layering (S-M4'): the overrides file and env are both
   // clamped here because a hand-edited maxConcurrent: 0 once bricked the
   // gateway — every semaphore acquire saw an exhausted cap and 429'd
@@ -254,4 +286,44 @@ export function resolveConfig(
   cfg.maxConcurrent = Math.max(1, cfg.maxConcurrent)
   cfg.maxQueueDepth = Math.max(0, cfg.maxQueueDepth)
   return cfg
+}
+
+/**
+ * Layered config read (env > overrides file > defaults). NOTE (perf): the
+ * default `overrides` parameter used to pay a synchronous stat+read on every
+ * call. B-M3 memoized the read (mtime+size), P5-svc now memoizes the
+ * overrides→base layering itself on the same stat key — one defaultConfig()
+ * + ~45 coercions per overrides-file change instead of per request; the env
+ * layer and floors still apply per call on a shallow copy. Explicit
+ * `overrides` arguments (tests, settingsView) bypass both memos.
+ */
+export function resolveConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  overrides?: OverridesFile,
+): GatewayConfig {
+  if (overrides !== undefined) {
+    // The caller's object is not the overrides file, so there is no stat key
+    // to memoize on — byte-identical to the pre-memo path.
+    return finishConfig(buildBase(overrides), env)
+  }
+  // Hot path: memoize base on the same stat identity as the B-M3 overrides
+  // memo (file + mtime + size; stat failure → 'none' — in practice stat only
+  // fails when the file is absent, where data is {}). Corrupt reads are never
+  // memoized (parsed=false), so B-M3's "a repaired file is picked up on the
+  // next read" invariant survives verbatim. The memoized base is handed out
+  // behind a shallow copy — env and floors mutate the copy, never the memo.
+  // The copy SHARES extraArgs/fallbackModels with the memo: grep-verified
+  // contract — nothing mutates those arrays in place, and the env layer only
+  // ever ASSIGNS fresh arrays (the AGY_PROXY_EXTRA_ARGS split). The documented
+  // B-M3 hole (rewrite landing in the same mtime tick at the same byte size)
+  // propagates here too — covered on the writer side by
+  // invalidateOverridesCache().
+  const rd = readOverridesWithStat()
+  const key = rd.st === null ? `none\0${rd.file}` : `${rd.file}\0${rd.st.mtimeMs}:${rd.st.size}`
+  let base = rd.parsed && baseCache !== null && baseCache.key === key ? baseCache.base : null
+  if (base === null) {
+    base = buildBase(rd.data)
+    if (rd.parsed) baseCache = { key, base }
+  }
+  return finishConfig({ ...base }, env)
 }

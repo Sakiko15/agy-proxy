@@ -98,6 +98,11 @@ export interface GatewayConfig {
    *  (rss, handle count, uptime) on stdout every N ms. 0 = off. The soak
    *  harness parses these lines; no admin surface, no persistence. */
   debugMetricsMs: number
+  /** Usage-row retention in days (B4/S8): the hourly housekeeping sweep
+   *  deletes ledger rows older than this many full local-midnight days. 0 =
+   *  keep forever (pre-S8 behavior). Ops-level tuning — reboot-effective,
+   *  deliberately not admin-UI writable. */
+  usageRetentionDays: number
 }
 
 // Fallback line-up, mined from the agy 1.1.13 binary (inherited from
@@ -143,6 +148,7 @@ export function defaultConfig(): GatewayConfig {
     quotaPollIntervalMs: 15 * 60_000,
     disableTelemetry: true,
     debugMetricsMs: 0,
+    usageRetentionDays: 0,
     dataDir: '',
     port: 8080,
     host: '0.0.0.0',

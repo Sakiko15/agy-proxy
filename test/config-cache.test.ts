@@ -12,10 +12,10 @@
 // float to both utimesSync calls reproduces the exact statSync mtimeMs the
 // memo recorded. Without the memo the re-read would see the new bytes.
 import { describe, it, expect, afterEach } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync, utimesSync, statSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, utimesSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { readOverrides, invalidateOverridesCache } from '../src/common/config.ts'
+import { join, dirname } from 'node:path'
+import { readOverrides, resolveConfig, invalidateOverridesCache } from '../src/common/config.ts'
 import { writeOverridesPatch } from '../src/server/settings.ts'
 
 const dirs: string[] = []
@@ -99,5 +99,54 @@ describe('readOverrides mtime+size cache (B-M3)', () => {
     // Repaired in place — picked up immediately (corrupt data is not cached).
     writeFileSync(file, '{"timeoutMs": 333}\n')
     expect(readOverrides(file)).toEqual({ timeoutMs: 333 })
+  })
+})
+
+// P5-svc: the hot path (no explicit overrides argument) memoizes the
+// overrides→base layering on the same stat key. These tests drive it the way
+// index.ts does — resolveConfig() with no overrides — pointed at a temp data
+// dir via AGY_PROXY_DATA_DIR.
+describe('resolveConfig base memo (P5-svc)', () => {
+  const savedDataDir = process.env.AGY_PROXY_DATA_DIR
+  afterEach(() => {
+    if (savedDataDir === undefined) delete process.env.AGY_PROXY_DATA_DIR
+    else process.env.AGY_PROXY_DATA_DIR = savedDataDir
+  })
+
+  function mkDataDir(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-cfgbase-'))
+    dirs.push(dir)
+    process.env.AGY_PROXY_DATA_DIR = dir
+    mkdirSync(join(dir, 'gateway'), { recursive: true })
+    return join(dir, 'gateway', 'runtime-overrides.json')
+  }
+
+  it('serves the memoized base on a stat-identical re-read; invalidate clears it', () => {
+    const file = mkDataDir()
+    writeFileSync(file, '{"timeoutMs": 111}\n')
+    pinMtime(file)
+    expect(resolveConfig({}, undefined).timeoutMs).toBe(111)
+    // Same size, same pinned mtime → the base memo cannot tell the rewrite
+    // from the first read and serves the stale layer (the documented B-M3
+    // hole class; the writer seam is what catches it up).
+    writeFileSync(file, '{"timeoutMs": 999}\n')
+    pinMtime(file)
+    expect(resolveConfig({}, undefined).timeoutMs).toBe(111)
+    invalidateOverridesCache()
+    expect(resolveConfig({}, undefined).timeoutMs).toBe(999)
+  })
+
+  it('a corrupt file repaired at an unchanged stat is still picked up (corrupt reads never memoize)', () => {
+    const file = mkDataDir()
+    // Both bodies are exactly 19 bytes; the first is invalid JSON (trailing
+    // comma), the second valid. The stat is pinned IDENTICAL across both.
+    writeFileSync(file, '{"timeoutMs": 444,}')
+    pinMtime(file)
+    expect(resolveConfig({}, undefined).timeoutMs).toBe(600_000) // tolerated as {}
+    writeFileSync(file, '{"timeoutMs": 444 }')
+    pinMtime(file)
+    // Without the parsed=false guard the base memo would hold base({}) under
+    // this stat key and keep serving the default forever.
+    expect(resolveConfig({}, undefined).timeoutMs).toBe(444)
   })
 })

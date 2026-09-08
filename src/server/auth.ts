@@ -44,10 +44,20 @@ export function apiKeyFrom(headers: { authorization?: string | undefined; 'x-api
   return bearerToken(headers.authorization)
 }
 
+// B3/P9: memoized expected-side digest. keyMatches rode every authenticated
+// request hashing BOTH sides; the expected side is process-static (the env
+// root key — env-only by design, never an overrides value), so one entry
+// memoizes it. The provided side is request-controlled input: caching it
+// would be unbounded memory keyed by attacker data, so it is hashed fresh
+// every call (it is the cheap half; the timing-safe compare is unchanged).
+let expectedKeyCache: { src: string; digest: Buffer } | null = null
+
 export function keyMatches(expected: string, provided: string): boolean {
-  const a = createHash('sha256').update(expected, 'utf8').digest()
+  if (expectedKeyCache === null || expectedKeyCache.src !== expected) {
+    expectedKeyCache = { src: expected, digest: createHash('sha256').update(expected, 'utf8').digest() }
+  }
   const b = createHash('sha256').update(provided, 'utf8').digest()
-  return timingSafeEqual(a, b)
+  return timingSafeEqual(expectedKeyCache.digest, b)
 }
 
 export interface AuthenticatedKey {
