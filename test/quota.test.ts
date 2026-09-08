@@ -6,12 +6,12 @@
 // detection, poll gating, fallback-merge semantics and the force/bg
 // refresh identity rules via QuotaService subclasses.
 import { describe, it, expect } from 'vitest'
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AccountPoolManager } from '../src/host/pool.ts'
 import { QuotaService, detectEmailFromAgyLogs, mergeFallbackFamilyQuota, normalizeStoredToken } from '../src/host/quota.ts'
-import { shouldPollAccount, type FamilyQuotaInfo } from '../src/common/pool-types.ts'
+import { shouldPollAccount, type FamilyQuotaInfo, type ManagedAccount } from '../src/common/pool-types.ts'
 import { writeAgyTokenFile, parsePastedCode, generatePkce } from '../src/host/oauth.ts'
 
 describe('quota: tokens', () => {
@@ -39,6 +39,34 @@ describe('quota: tokens', () => {
 
     const validToken = await quota.getValidAccessToken(acc)
     expect(validToken).toBe('fake_access_token_123')
+  })
+
+  it('token refresh persist is atomic: file updated in agy shape, no .tmp residue (audit M3)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-quota-persist-'))
+    const pool = new AccountPoolManager(dir)
+    const acc = pool.createAccountSlot('persist-test')
+    const tokenDir = join(acc.dir, '.gemini', 'antigravity-cli')
+    mkdirSync(tokenDir, { recursive: true })
+    const tokenFile = join(tokenDir, 'antigravity-oauth-token')
+    writeFileSync(
+      tokenFile,
+      JSON.stringify({ access_token: 'ya29.old', refresh_token: '1//refresh', expiry: Date.now() - 1000 }),
+      'utf8',
+    )
+    const quota = new QuotaService(pool)
+    const persist = (
+      quota as unknown as {
+        persistRefreshedToken: (account: typeof acc, tokens: { access_token: string; expiryMs?: number }) => void
+      }
+    ).persistRefreshedToken
+    persist.call(quota, acc, { access_token: 'ya29.new', expiryMs: Date.now() + 3600_000 })
+    // The refreshed access token landed in agy's original flat shape with the
+    // refresh_token untouched...
+    const saved = JSON.parse(readFileSync(tokenFile, 'utf8')) as Record<string, unknown>
+    expect(saved.access_token).toBe('ya29.new')
+    expect(saved.refresh_token).toBe('1//refresh')
+    // ...and the staging file is gone — a torn read window must not exist.
+    expect(existsSync(tokenFile + '.tmp')).toBe(false)
   })
 
   it('normalizeStoredToken reads agy 1.1.16 nested shape with ISO expiry', () => {
@@ -296,6 +324,80 @@ describe('quota: aggregation and refresh', () => {
     expect(userinfoCalls).toBe(0)
     expect(out?.google?.remainingFraction).toBe(0.9)
     expect(pool.getAccount(acc.id)!.email).toBe('stable@gmail.com')
+  })
+
+  it('refreshAllQuotas drops overlapping calls instead of stacking cycles (audit M4)', async () => {
+    // Poll tick / boot refresh / manual click all funnel into the same cycle;
+    // a second call while one is in flight must be a no-op, and the guard
+    // must clear afterwards (finally) so later calls still run.
+    const dir = mkdtempSync(join(tmpdir(), 'agy-quota-reentry-'))
+    const pool = new AccountPoolManager(dir)
+    pool.createAccountSlot('reentry')
+    let started = 0
+    class SlowService extends QuotaService {
+      override async refreshAccountQuota(_account: ManagedAccount, _force = false) {
+        started++
+        await new Promise((r) => setTimeout(r, 80))
+        return null
+      }
+    }
+    const svc = new SlowService(pool)
+    await Promise.all([svc.refreshAllQuotas(), svc.refreshAllQuotas()])
+    expect(started).toBe(1)
+    // Guard cleared: a fresh call runs a new cycle.
+    await svc.refreshAllQuotas()
+    expect(started).toBe(2)
+  })
+
+  it('endpoint failures surface per account and clear on the next success (audit F12)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-quota-f12-'))
+    const pool = new AccountPoolManager(dir)
+    const acc = pool.createAccountSlot('f12')
+    const tokenDir = join(acc.dir!, '.gemini', 'antigravity-cli')
+    mkdirSync(tokenDir, { recursive: true })
+    writeFileSync(
+      join(tokenDir, 'antigravity-oauth-token'),
+      JSON.stringify({ access_token: 'ya29.f12', expiry: Date.now() + 3600_000 }),
+      'utf8',
+    )
+    pool.updateAccountQuotas(acc.id, { google: { remainingFraction: 0.5 } }, 'f12@gmail.com')
+
+    let fail = true
+    class F12Service extends QuotaService {
+      override async fetchUserInfo(): Promise<{ email?: string; name?: string } | null> {
+        return null
+      }
+      override async fetchQuotaSummary() {
+        if (fail) return null
+        return {
+          groups: [
+            {
+              displayName: 'Gemini Models',
+              buckets: [{ bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.8, resetTime: '2026-09-01T00:00:00Z' }],
+            },
+          ],
+        } as never
+      }
+      override async fetchAvailableModels() {
+        if (fail) return null
+        return { models: {} } as never
+      }
+    }
+    const svc = new F12Service(pool)
+    // Both endpoint chains fail (force=true skips the 10s cache and the
+    // known email keeps the zero-network path): the failure must be recorded
+    // on the account, not swallowed.
+    const failed = await svc.refreshAccountQuota(pool.getAccount(acc.id)!, true)
+    expect(failed).toBeNull()
+    const err = svc.getQuotaError(acc.id)
+    expect(err?.message).toBe('quota refresh returned no data')
+    expect(err?.at).toBeGreaterThan(0)
+
+    // A successful refresh clears the error again.
+    fail = false
+    const ok = await svc.refreshAccountQuota(pool.getAccount(acc.id)!, true)
+    expect(ok?.google?.remainingFraction).toBe(0.8)
+    expect(svc.getQuotaError(acc.id)).toBeUndefined()
   })
 
   it('detectEmailFromAgyLogs returns the latest email in a log file, not the first', () => {

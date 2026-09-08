@@ -177,6 +177,72 @@ describe('engine: ok run, mirroring, binding', () => {
     expect(b.lastMessageCount).toBe(1)
   })
 
+  it('early consumer break after a delivered tool call keeps the recording for continuation (audit F4)', async () => {
+    // A streaming leg that hits its output budget breaks out of the for-await
+    // right after a tool-call block crossed the wire (app.ts budgetCut leg).
+    // The generator finalizes early, skipping the keepForContinuation tail —
+    // the client would then 404 on its mirror continuation. The span itself
+    // must keep the recording alive.
+    const { engine, argsFile, runs } = makeEngine()
+    process.env.FAKE_AGY_MODE = 'ok'
+    process.env.FAKE_AGY_ARGS_FILE = join(workDir, 'args-f4.json')
+    let runId: string | undefined
+    let toolCallId: string | undefined
+    for await (const ch of engine.stream(call([msg('user', 'hello there')]))) {
+      if (ch.type === 'block-end' && (ch as { block: { type: string } }).block.type === 'tool-call') {
+        const block = (ch as unknown as { block: { id: string; arguments: string } }).block
+        const parsed = JSON.parse(block.arguments) as { run: string; step: number }
+        runId = parsed.run
+        toolCallId = block.id
+        break
+      }
+    }
+    expect(runId).toBeDefined()
+    expect(toolCallId).toBeDefined()
+    // The dispatch loop settles the run on its own once the fake process
+    // ends; at settle the recording must be KEPT, not forgotten.
+    await vi.waitFor(() => expect(runs.get(runId!)?.isSettled).toBe(true), { timeout: 5_000, interval: 10 })
+    expect(runs.get(runId!)).toBeDefined()
+    // The continuation now replays from the recording — full span, no second
+    // spawn (no double usage).
+    const spawnsBefore = readFileSync(argsFile, 'utf8').trim().split('\n').length
+    const replay = await collect(
+      engine.stream(call([msg('user', 'hello there'), { role: 'tool', text: 'replayed', toolCallId: toolCallId! }])),
+    )
+    const finish = replay[replay.length - 1] as { type: string; reason: { kind: string } }
+    expect(finish.type).toBe('finish')
+    expect(finish.reason.kind).toBe('stop')
+    expect(readFileSync(argsFile, 'utf8').trim().split('\n').length).toBe(spawnsBefore)
+  })
+
+  it('early break without a delivered tool call forgets the recording at settle (audit F4)', async () => {
+    // A text-only budget cut breaks before any tool-call block: nothing can
+    // continue the run, so settle must still forget the recording (A-M4).
+    class CapturingRuns extends RunRegistry {
+      created: string[] = []
+      override create() {
+        const rec = super.create()
+        this.created.push(rec.runId)
+        return rec
+      }
+    }
+    const cap = new CapturingRuns()
+    const { engine } = makeEngine({}, { runs: cap })
+    process.env.FAKE_AGY_MODE = 'ok'
+    process.env.FAKE_AGY_ARGS_FILE = join(workDir, 'args-f4-neg.json')
+    for await (const ch of engine.stream(call([msg('user', 'hello there')]))) {
+      // Guard the premise: the first delivered chunk must not be a tool-call
+      // block, or this break would carry a mirror id and keep the recording.
+      expect(!(ch.type === 'block-end' && (ch as { block: { type: string } }).block.type === 'tool-call')).toBe(true)
+      break
+    }
+    expect(cap.created.length).toBe(1)
+    const runId = cap.created[0] as string
+    // Settle forgets synchronously (settle → keepForContinuation=false →
+    // forget), so poll for absence rather than for isSettled first.
+    await vi.waitFor(() => expect(cap.get(runId)).toBeUndefined(), { timeout: 5_000, interval: 10 })
+  })
+
   it('detectContinuation keys off the trailing mirror tool-result only', () => {
     const toolResult = (callId: string): EngineMessage => ({ role: 'tool', text: '', toolCallId: callId })
     expect(detectContinuation([msg('user', 'q'), toolResult('agytc-run-1-7')])).toEqual({ runId: 'run-1', eventIndex: 7 })
@@ -676,6 +742,43 @@ describe('S-H1/S-H2/H1 regressions: tenant scoping, media keys, busy tracking', 
     await expect(collect(onceBusy.engine.stream(call([msg('user', 'hello')])))).rejects.toMatchObject({ code: Err.BUSY })
     await runTurn(onceBusy.engine, [msg('user', 'hello again')], { meta: { keyId: 'root' } })
     expect(busySeen?.has('acc-1')).toBe(false)
+  })
+})
+
+// sanitizeChildEnv wiring (audit M2): the gateway's own env must never reach
+// the agy child — a tool-executing agent can be prompt-injected into reading
+// its own process env, so AGY_PROXY_API_KEY / AGY_PROXY_ADMIN_PASSWORD are
+// stripped at spawn time. Pinned end-to-end via the fake-agy env record.
+describe('spawn env sanitization', () => {
+  it('run spawn: AGY_PROXY_* secrets are stripped from the child environment', async () => {
+    const envFile = join(workDir, 'env-secrets.ndjson')
+    const saved = {
+      apiKey: process.env.AGY_PROXY_API_KEY,
+      adminPwd: process.env.AGY_PROXY_ADMIN_PASSWORD,
+      envFile: process.env.FAKE_AGY_ENV_FILE,
+    }
+    process.env.AGY_PROXY_API_KEY = 'sk-agy-under-test'
+    process.env.AGY_PROXY_ADMIN_PASSWORD = 'admin-pass-under-test'
+    process.env.FAKE_AGY_ENV_FILE = envFile
+    try {
+      const { engine } = makeEngine()
+      const chunks = await collect(engine.stream(call([msg('user', 'hello')])))
+      expect(chunks.some((c) => c.type === 'finish')).toBe(true)
+    } finally {
+      if (saved.apiKey === undefined) delete process.env.AGY_PROXY_API_KEY
+      else process.env.AGY_PROXY_API_KEY = saved.apiKey
+      if (saved.adminPwd === undefined) delete process.env.AGY_PROXY_ADMIN_PASSWORD
+      else process.env.AGY_PROXY_ADMIN_PASSWORD = saved.adminPwd
+      if (saved.envFile === undefined) delete process.env.FAKE_AGY_ENV_FILE
+      else process.env.FAKE_AGY_ENV_FILE = saved.envFile
+    }
+    const text = readFileSync(envFile, 'utf8').trim()
+    expect(text).not.toBe('')
+    for (const line of text.split('\n')) {
+      const snap = JSON.parse(line) as Record<string, string | undefined>
+      expect(snap.AGY_PROXY_API_KEY).toBeUndefined()
+      expect(snap.AGY_PROXY_ADMIN_PASSWORD).toBeUndefined()
+    }
   })
 })
 

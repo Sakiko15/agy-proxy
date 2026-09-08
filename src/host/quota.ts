@@ -4,7 +4,7 @@
 // Ported from dsh-agy-link src/host/quota.ts @ 46984db (verbatim; the
 // systemHome/Keychain branches are darwin-gated dead code on a Linux
 // gateway and stay in so the file remains diff-clean against upstream).
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -200,8 +200,30 @@ export function readMacKeychainToken(): StoredToken | null {
 
 export class QuotaService {
   private preferredEndpointIndex = 0
+  /** Audit M4: a full-pool refresh cycle is in progress — overlapping
+   *  refreshAllQuotas calls (poll tick vs boot refresh vs manual click) are
+   *  dropped rather than stacked onto the same accounts. */
+  private refreshAllInFlight = false
+  /** Audit F12: last quota-refresh failure per account, in memory like
+   *  catalog.lastError. Endpoint failures used to be swallowed entirely and
+   *  cards kept presenting stale/default quota numbers as if they were live.
+   *  Cleared on the next successful refresh for that account. */
+  private lastErrors = new Map<string, { message: string; at: number }>()
 
   constructor(private readonly pool: AccountPoolManager) {}
+
+  /** Last recorded quota-refresh failure for an account, or undefined. */
+  getQuotaError(accountId: string): { message: string; at: number } | undefined {
+    return this.lastErrors.get(accountId)
+  }
+
+  private noteQuotaError(accountId: string, message: string): void {
+    this.lastErrors.set(accountId, { message, at: Date.now() })
+  }
+
+  private clearQuotaError(accountId: string): void {
+    this.lastErrors.delete(accountId)
+  }
 
   private getTokenFilePath(account: ManagedAccount): string {
     // The primary account rides the real system HOME (Keychain-backed);
@@ -276,7 +298,17 @@ export class QuotaService {
         raw.access_token = tokens.access_token
         if (tokens.expiryMs) raw.expiry = tokens.expiryMs
       }
-      writeFileSync(file, JSON.stringify(raw), 'utf8')
+      // Atomic tmp+rename (pool.ts persist pattern). A direct overwrite let a
+      // concurrent agy spawn read torn JSON and fail auth — quarantining a
+      // healthy account with no self-heal path (audit M3).
+      const tmp = file + '.tmp'
+      writeFileSync(tmp, JSON.stringify(raw), 'utf8')
+      try {
+        renameSync(tmp, file)
+      } catch (renameErr) {
+        try { unlinkSync(tmp) } catch { /* best-effort cleanup */ }
+        throw renameErr
+      }
     } catch {
       // Best-effort
     }
@@ -352,9 +384,15 @@ export class QuotaService {
 
   /**
    * Fetch official multi-bucket quota summary (both weekly and 5h limit windows)
-   * via v1internal:retrieveUserQuotaSummary.
+   * via v1internal:retrieveUserQuotaSummary. `onFailure` (audit F12) carries
+   * the last attempt's failure reason out to the caller's per-account error
+   * channel instead of dying in this catch.
    */
-  async fetchQuotaSummary(accessToken: string, proxyUrl?: string): Promise<QuotaSummaryResponse | null> {
+  async fetchQuotaSummary(
+    accessToken: string,
+    proxyUrl?: string,
+    onFailure?: (reason: string) => void,
+  ): Promise<QuotaSummaryResponse | null> {
     const endpoints = this.getOrderedEndpoints()
     for (let i = 0; i < endpoints.length; i++) {
       const endpoint = endpoints[i]!
@@ -374,10 +412,12 @@ export class QuotaService {
         }
         // If auth fails (401/403), the token itself is invalid/expired — no need to flood other endpoints
         if (res.status === 401 || res.status === 403) {
+          onFailure?.(`quota summary endpoint returned ${res.status}`)
           break
         }
-      } catch {
-        // Try next endpoint on network connection errors
+        onFailure?.(`quota summary endpoint returned ${res.status}`)
+      } catch (err) {
+        onFailure?.(err instanceof Error ? err.message : String(err))
       }
     }
     return null
@@ -386,7 +426,11 @@ export class QuotaService {
   /**
    * Fetch available models and model-level quotas via v1internal:fetchAvailableModels.
    */
-  async fetchAvailableModels(accessToken: string, proxyUrl?: string): Promise<DiscoveredModelsResponse | null> {
+  async fetchAvailableModels(
+    accessToken: string,
+    proxyUrl?: string,
+    onFailure?: (reason: string) => void,
+  ): Promise<DiscoveredModelsResponse | null> {
     const endpoints = this.getOrderedEndpoints()
     for (let i = 0; i < endpoints.length; i++) {
       const endpoint = endpoints[i]!
@@ -405,10 +449,12 @@ export class QuotaService {
           return (await res.json()) as DiscoveredModelsResponse
         }
         if (res.status === 401 || res.status === 403) {
+          onFailure?.(`available-models endpoint returned ${res.status}`)
           break
         }
-      } catch {
-        // Try next endpoint
+        onFailure?.(`available-models endpoint returned ${res.status}`)
+      } catch (err) {
+        onFailure?.(err instanceof Error ? err.message : String(err))
       }
     }
     return null
@@ -464,9 +510,16 @@ export class QuotaService {
       this.pool.resetAccountIdentity(account.id, email)
     }
 
+    // Audit F12: pull the last endpoint failure reason out of both chains —
+    // the callbacks race, last write wins, which is all a diagnostic needs.
+    let endpointFailure = ''
     const [summary, discovered] = await Promise.all([
-      this.fetchQuotaSummary(accessToken, account.proxyUrl),
-      this.fetchAvailableModels(accessToken, account.proxyUrl),
+      this.fetchQuotaSummary(accessToken, account.proxyUrl, (reason) => {
+        endpointFailure = reason
+      }),
+      this.fetchAvailableModels(accessToken, account.proxyUrl, (reason) => {
+        endpointFailure = reason
+      }),
     ])
 
     // Query the userinfo endpoint ONLY when the email is still unknown.
@@ -479,8 +532,16 @@ export class QuotaService {
     }
 
     if (!summary && (!discovered || !discovered.models)) {
+      // Audit F12: both endpoint chains came back empty. Without a record the
+      // card keeps displaying stale/default quota numbers as if they were
+      // live; the failure now surfaces on the account (cleared on success).
+      this.noteQuotaError(
+        account.id,
+        endpointFailure !== '' ? `quota refresh failed: ${endpointFailure}` : 'quota refresh returned no data',
+      )
       return null
     }
+    this.clearQuotaError(account.id)
 
     // Authenticated backend calls just succeeded with this token: any stale
     // authRequired flag (e.g. set while the OLD account was logging out) is
@@ -599,6 +660,24 @@ export class QuotaService {
    * Google is made for this check (risk-control neutral).
    */
   async refreshAllQuotas(force = false): Promise<void> {
+    // Audit M4: reentry guard. Poll ticks, the boot refresh and manual
+    // refresh-all clicks all funnel here; a hung cycle used to outlive the
+    // 15 min interval (undici's 300s header timeout) and stack concurrent
+    // cycles over the same accounts. Callers during a cycle get a no-op:
+    // with agyFetch bounded at 10s per endpoint a cycle self-completes well
+    // under a minute, so a dropped manual click is recoverable on retry.
+    // Per-account manual refreshes stay unguarded — token persistence is
+    // atomic now (M3), making the only possible overlap benign.
+    if (this.refreshAllInFlight) return
+    this.refreshAllInFlight = true
+    try {
+      await this.runRefreshAllCycle(force)
+    } finally {
+      this.refreshAllInFlight = false
+    }
+  }
+
+  private async runRefreshAllCycle(force: boolean): Promise<void> {
     let accounts = this.pool.getAccounts()
     if (!force) {
       const now = Date.now()

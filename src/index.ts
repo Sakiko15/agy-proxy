@@ -22,6 +22,7 @@ import { startCatalogPoller } from './host/catalog-poller.ts'
 import { redactLine } from './host/diagnostics.ts'
 import { buildLogger } from './server/logger.ts'
 import { buildServer } from './server/app.ts'
+import { poolWithQuotaErrors } from './server/admin-api.ts'
 import { GatewaySemaphore } from './server/semaphore.ts'
 import { installShutdown } from './server/shutdown.ts'
 import { AdminEventBus } from './server/events.ts'
@@ -142,7 +143,12 @@ async function main(): Promise<void> {
   // ---- admin event bus (M4): /admin/events SSE. Run events share the
   // ledger row's fields (both fed from the onRun hook below); pool snapshots
   // are debounced off the pool mutation hook. ----
-  const bus = new AdminEventBus({ getPool: () => pool.getPoolData() })
+  const bus = new AdminEventBus({
+    // F12: SSE pool snapshots carry each account's last quota-refresh error
+    // (same merge as GET /admin/pool) so the cards never disagree between
+    // the snapshot and the REST path.
+    getPool: () => poolWithQuotaErrors(quota, pool.getPoolData()),
+  })
   pool.onChange(() => bus.schedulePoolChange())
 
   const bin = await resolveAgyBin(getConfig().agyBin)

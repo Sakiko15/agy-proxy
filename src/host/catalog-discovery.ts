@@ -10,7 +10,7 @@ import type { DiscoverFn } from './models.ts'
 import type { AccountPoolManager } from './pool.ts'
 import type { ManagedAccount } from '../common/pool-types.ts'
 import type { GatewayConfig } from '../common/types.ts'
-import { isolatedHomeEnv, proxyEnv, startAgyProcess } from './runner.ts'
+import { isolatedHomeEnv, proxyEnv, sanitizeChildEnv, startAgyProcess } from './runner.ts'
 
 /**
  * Picks the account whose isolated HOME hosts the next `agy models` spawn.
@@ -63,12 +63,12 @@ export function makeCatalogDiscoverFn(deps: CatalogDiscoverDeps): DiscoverFn {
     const acc = pickDiscoveryAccount(deps.pool.getAccounts(), cursor)
     cursor += 1
     const cfg = deps.getConfig()
-    const env: NodeJS.ProcessEnv = {
+    const env: NodeJS.ProcessEnv = sanitizeChildEnv({
       ...process.env,
       ...(cfg.disableTelemetry ? TELEMETRY_OFF : {}),
       ...(acc !== null && acc.dir !== '' ? isolatedHomeEnv(acc.dir) : {}),
       ...(acc?.proxyUrl ? proxyEnv(acc.proxyUrl) : {}),
-    }
+    })
     const run = startAgyProcess({
       bin,
       args: [...(deps.binArgs ?? []), 'models'],

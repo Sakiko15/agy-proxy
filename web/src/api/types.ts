@@ -43,6 +43,10 @@ export interface ManagedAccount {
   lastUsedAt?: number
   authRequired?: boolean
   authError?: string
+  /** Last quota-refresh failure (audit F12) — attached by the server from the
+   *  quota service, absent while the last refresh succeeded. */
+  quotaError?: string
+  quotaErrorAt?: number
   cooldowns: Partial<Record<string, FamilyCooldownState>>
   quotas: Partial<Record<string, FamilyQuotaInfo>>
 }

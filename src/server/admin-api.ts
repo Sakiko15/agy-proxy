@@ -16,7 +16,7 @@ import { RateLimiterMemory } from 'rate-limiter-flexible'
 import QRCode from 'qrcode'
 import type { Logger } from 'pino'
 import type { GatewayConfig } from '../common/types.ts'
-import type { ModelFamily } from '../common/pool-types.ts'
+import type { AccountPoolData, ManagedAccount, ModelFamily } from '../common/pool-types.ts'
 import type { AccountPoolManager } from '../host/pool.ts'
 import type { QuotaService } from '../host/quota.ts'
 import type { PoolAuthFlow } from '../host/pool-auth.ts'
@@ -49,6 +49,25 @@ type AdminInstance = FastifyInstance<any, any, any, Logger, any>
 
 const MUTATING = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 const MODEL_FAMILIES: ReadonlySet<string> = new Set(['google', 'anthropic', 'openai', 'unknown'])
+
+/** Audit F12: attach the quota service's last per-account refresh error (in
+ *  memory, cleared on the next successful refresh) so the WebUI can say WHY
+ *  quota numbers are stale instead of presenting defaults as live values. */
+function withQuotaError(
+  quota: QuotaService,
+  account: ManagedAccount,
+): ManagedAccount & { quotaError?: string; quotaErrorAt?: number } {
+  const err = quota.getQuotaError(account.id)
+  return err === undefined ? account : { ...account, quotaError: err.message, quotaErrorAt: err.at }
+}
+
+/** Whole-pool variant — the shape the SSE snapshot and pool REST payloads use. */
+export function poolWithQuotaErrors(
+  quota: QuotaService,
+  pool: Readonly<AccountPoolData>,
+): AccountPoolData {
+  return { ...pool, accounts: pool.accounts.map((a) => withQuotaError(quota, a)) }
+}
 
 // ---- CIDR allowlist -------------------------------------------------------------
 
@@ -270,7 +289,7 @@ export function registerAdminApi(app: AdminInstance, deps: AdminDeps): void {
 
   // ---- pool ----
   app.get('/admin/pool', guarded(), async (_request, reply) => {
-    await reply.code(200).send({ ok: true, pool: deps.pool.getPoolData() })
+    await reply.code(200).send({ ok: true, pool: poolWithQuotaErrors(deps.quota, deps.pool.getPoolData()) })
     return reply
   })
 
@@ -380,14 +399,20 @@ export function registerAdminApi(app: AdminInstance, deps: AdminDeps): void {
     }
     await deps.quota.refreshAccountQuota(account, true)
     void deps.catalog.forceRefresh().catch(() => undefined)
-    await reply.code(200).send({ ok: true, account: deps.pool.getAccount(id) })
+    const refreshed = deps.pool.getAccount(id)
+    await reply.code(200).send({
+      ok: true,
+      account: refreshed !== undefined ? withQuotaError(deps.quota, refreshed) : undefined,
+    })
     return reply
   })
 
   app.post('/admin/pool/quota/refresh', guarded({ mutating: true }), async (request, reply) => {
     const body = (request.body ?? {}) as { force?: unknown }
     await deps.quota.refreshAllQuotas(body.force !== false)
-    await reply.code(200).send({ ok: true, pool: deps.pool.getPoolData() })
+    // Audit F12: this is the response the accounts page reads right after
+    // "refresh all" — carry any freshly-recorded quota errors with it.
+    await reply.code(200).send({ ok: true, pool: poolWithQuotaErrors(deps.quota, deps.pool.getPoolData()) })
     return reply
   })
 
@@ -509,6 +534,13 @@ export function registerAdminApi(app: AdminInstance, deps: AdminDeps): void {
     const accountId = one(q.accountId)
     const model = one(q.model)
     const family = one(q.family)
+    // The WebUI sends both on every usage query (and the dashboard rides
+    // ?status=OK for the success-rate card) — ignoring them silently made the
+    // filters and the rate read 100% forever (audit M1). Unknown protocol
+    // values are dropped, matching the num() behavior for bad numbers.
+    const protocolRaw = one(q.protocol)
+    const protocol = protocolRaw === 'openai' || protocolRaw === 'anthropic' ? protocolRaw : undefined
+    const status = one(q.status)
     const from = num(q.from)
     const to = num(q.to)
     const limit = num(q.limit)
@@ -518,6 +550,8 @@ export function registerAdminApi(app: AdminInstance, deps: AdminDeps): void {
       ...(accountId !== undefined && accountId !== '' ? { accountId } : {}),
       ...(model !== undefined && model !== '' ? { model } : {}),
       ...(family !== undefined && family !== '' ? { family } : {}),
+      ...(protocol !== undefined ? { protocol } : {}),
+      ...(status !== undefined && status !== '' ? { status } : {}),
       ...(from !== undefined ? { from } : {}),
       ...(to !== undefined ? { to } : {}),
       ...(limit !== undefined ? { limit } : {}),

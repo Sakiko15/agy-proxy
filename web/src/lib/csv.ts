@@ -6,16 +6,25 @@ export interface CsvColumn<T> {
   value: (row: T) => string | number | null | undefined
 }
 
-function escapeField(value: string): string {
-  if (/[",\r\n]/.test(value)) return '"' + value.replaceAll('"', '""') + '"'
-  return value
+/** A leading formula character would be executed by Excel/LibreOffice/Sheets
+ *  when the export is opened (=HYPERLINK exfiltration via error text, @import,
+ *  +cmd). Neutralized with a text prefix per the OWASP mitigation. Numbers
+ *  skip the guard — a legitimate negative value must stay numeric. */
+const FORMULA_PREFIX = /^[=+@\t\r-]/
+
+function escapeField(value: string | number): string {
+  if (typeof value === 'number') return String(value)
+  let out = value
+  if (FORMULA_PREFIX.test(out)) out = "'" + out
+  if (/[",\r\n]/.test(out)) out = '"' + out.replaceAll('"', '""') + '"'
+  return out
 }
 
 /** Serialize rows to CSV (CRLF per RFC 4180). Always emits the header row. */
 export function toCsv<T>(rows: readonly T[], columns: ReadonlyArray<CsvColumn<T>>): string {
   const lines: string[] = [columns.map((c) => escapeField(c.header)).join(',')]
   for (const row of rows) {
-    lines.push(columns.map((c) => escapeField(String(c.value(row) ?? ''))).join(','))
+    lines.push(columns.map((c) => escapeField(c.value(row) ?? '')).join(','))
   }
   return lines.join('\r\n') + '\r\n'
 }

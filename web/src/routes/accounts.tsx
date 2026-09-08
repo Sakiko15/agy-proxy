@@ -159,6 +159,15 @@ function AccountCard({ id, onDone }: { id: string; onDone?: () => void }): React
             {account.authError !== undefined && <p className="mt-1 break-all text-muted-foreground">{account.authError}</p>}
           </div>
         )}
+        {account.quotaError !== undefined && (
+          <div className="rounded border border-amber-500/40 bg-amber-500/10 p-2 text-xs">
+            <p className="font-medium text-amber-800 dark:text-amber-300">{t('accounts.quotaErrorHint')}</p>
+            <p className="mt-1 break-all text-muted-foreground">{account.quotaError}</p>
+            <p className="mt-1 text-muted-foreground">
+              {t('accounts.quotaErrorAt')}: {formatTime(account.quotaErrorAt)}
+            </p>
+          </div>
+        )}
         <div className="flex flex-wrap gap-1.5">
           {account.enabled ? (
             <Button variant="outline" size="sm" onClick={() => void act(api.patchAccount(id, { enabled: false }))}>

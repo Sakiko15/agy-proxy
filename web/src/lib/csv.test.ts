@@ -32,4 +32,26 @@ describe('toCsv', () => {
     expect(csv.endsWith('\r\n')).toBe(true)
     expect(csv).not.toContain('\n\r,')
   })
+
+  it('neutralizes formula injection with a text prefix; numbers stay numeric', () => {
+    // A hostile errorText/model value must not execute as a formula when the
+    // export opens in Excel/LibreOffice/Sheets (OWASP CSV injection). The
+    // `'` prefix lands first, then RFC-4180 quoting still applies on top.
+    const rows: Row[] = [
+      { name: '=HYPERLINK("http://evil","x")', tokens: 5 },
+      { name: 'plus', tokens: 42, note: '@import "http://evil"' },
+    ]
+    expect(toCsv(rows, cols)).toBe(
+      [
+        'name,tokens,note',
+        '"\'=HYPERLINK(""http://evil"",""x"")",5,',
+        'plus,42,"\'@import ""http://evil"""',
+        '',
+      ].join('\r\n'),
+    )
+    // A negative NUMBER is legitimate data — no prefix, stays numeric.
+    expect(toCsv([{ name: 'neg', tokens: -7 }], cols)).toBe('name,tokens,note\r\nneg,-7,\r\n')
+    // Tab-leading strings are guarded too (no RFC quoting needed for \t).
+    expect(toCsv([{ name: 'tab', tokens: 1, note: '\t=cmd' }], cols)).toBe('name,tokens,note\r\ntab,1,\'\t=cmd\r\n')
+  })
 })

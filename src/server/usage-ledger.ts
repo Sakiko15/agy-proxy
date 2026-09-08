@@ -59,6 +59,11 @@ export interface UsageQuery {
   accountId?: string
   model?: string
   family?: string
+  /** Exact protocol match — the WebUI usage page filters on it. */
+  protocol?: 'openai' | 'anthropic'
+  /** Exact status match ('OK', failure classes) — the dashboard success-rate
+   *  query (?status=OK) and the usage page status filter ride on it. */
+  status?: string
   from?: number
   to?: number
   limit?: number
@@ -221,6 +226,8 @@ export class UsageLedger {
     if (q.accountId !== undefined) { where.push('account_id = @accountId'); params.accountId = q.accountId }
     if (q.model !== undefined) { where.push('model = @model'); params.model = q.model }
     if (q.family !== undefined) { where.push('family = @family'); params.family = q.family }
+    if (q.protocol !== undefined) { where.push('protocol = @protocol'); params.protocol = q.protocol }
+    if (q.status !== undefined) { where.push('status = @status'); params.status = q.status }
     if (q.from !== undefined) { where.push('created_at >= @from'); params.from = q.from }
     if (q.to !== undefined) { where.push('created_at <= @to'); params.to = q.to }
     const clause = where.length > 0 ? 'WHERE ' + where.join(' AND ') : ''

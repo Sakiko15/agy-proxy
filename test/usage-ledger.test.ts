@@ -183,6 +183,29 @@ describe('query', () => {
     expect(combo.total).toBe(0)
     checkpointAndClose(db)
   })
+
+  it('filters by protocol and status (WebUI filters + dashboard success rate, audit M1)', async () => {
+    const { ledger, db } = mkLedger()
+    ledger.record(rec('p1', { protocol: 'anthropic' }))
+    ledger.record(rec('p2', { protocol: 'openai' }))
+    ledger.record(rec('f1', { status: 'TIMEOUT' }))
+    await ledger.flush()
+
+    const byProtocol = ledger.query({ protocol: 'anthropic' })
+    expect(byProtocol.total).toBe(1)
+    expect(byProtocol.rows.map((r) => r.requestId)).toEqual(['p1'])
+
+    // The dashboard success-rate shape: ?status=OK must exclude failures.
+    const okOnly = ledger.query({ status: 'OK' })
+    expect(okOnly.total).toBe(2)
+    const failed = ledger.query({ status: 'TIMEOUT' })
+    expect(failed.total).toBe(1)
+
+    // Combined with a window clause, clauses AND together.
+    const windowed = ledger.query({ from: 0, status: 'OK', limit: 1 })
+    expect(windowed.total).toBe(2)
+    checkpointAndClose(db)
+  })
 })
 
 describe('close semantics', () => {

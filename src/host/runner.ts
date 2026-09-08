@@ -5,7 +5,8 @@
 // Ported from dsh-agy-link src/host/runner.ts @ 46984db (verbatim except:
 // resolveAgyBin signature takes the bin-hint string instead of PluginConfig;
 // probeProcess returns {ok,version,error} for the startup report;
-// proxyEnv helper added for non-run spawns that need account proxying).
+// proxyEnv helper added for non-run spawns that need account proxying;
+// sanitizeChildEnv helper added — every spawn must route its env through it).
 import { spawn, type ChildProcess } from 'node:child_process'
 import { accessSync, constants, existsSync, readdirSync } from 'node:fs'
 import { delimiter, join } from 'node:path'
@@ -63,6 +64,29 @@ export function proxyEnv(proxyUrl: string): Record<string, string> {
     https_proxy: proxyUrl,
     http_proxy: proxyUrl,
   }
+}
+
+/**
+ * Strip the gateway's own environment variables before handing an env to a
+ * spawned agy process. agy is a tool-executing agent: a prompt-injected run
+ * can read its own process env (plan-mode file tools, shell in skip mode), so
+ * AGY_PROXY_API_KEY / AGY_PROXY_ADMIN_PASSWORD / every other AGY_PROXY_* var
+ * must never ride into the child. Isolated HOME isolates file credentials but
+ * not the environment. A full env allowlist was considered and rejected:
+ * agy's platform env dependencies (win32 SystemRoot/APPDATA & co) are
+ * unverified, and breaking the sole upstream binary outweighs exposure the
+ * documented deployment (compose passes only AGY_PROXY_* + AGY_CLI vars)
+ * does not create. No spawn path intentionally passes an AGY_PROXY_* var to
+ * agy (config reaches it via argv), so prefix-stripping is behavior-safe.
+ */
+export function sanitizeChildEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {}
+  for (const key of Object.keys(env)) {
+    if (key.startsWith('AGY_PROXY_')) continue
+    const value = env[key]
+    if (value !== undefined) out[key] = value
+  }
+  return out
 }
 
 export const MIN_AGY_VERSION = '1.1.8'

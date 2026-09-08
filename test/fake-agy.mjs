@@ -55,8 +55,11 @@
 // FAKE_AGY_PID_FILE when set (lifetime observation for kill drills).
 // Records an env ALLOWLIST (single JSON line) to FAKE_AGY_ENV_FILE when set —
 // only {HOME, USERPROFILE, HOMEDRIVE, HOMEPATH, GEMINI_CLI_HOME, HTTPS_PROXY,
-// HTTP_PROXY, ALL_PROXY}: a full dump would carry the parent test env's
-// AGY_PROXY_* secrets into a shared record file.
+// HTTP_PROXY, ALL_PROXY, AGY_PROXY_API_KEY, AGY_PROXY_ADMIN_PASSWORD}: a full
+// dump would carry the parent test env's AGY_PROXY_* secrets into a shared
+// record file. The two AGY_PROXY_* keys exist solely so the sanitizeChildEnv
+// test can assert their ABSENCE from the spawned env (tests set fake values,
+// never real ones).
 //
 // FAKE_AGY_MODE_FILE (M5): path to a file holding the mode name, read at
 // every PROCESS START — lets a drill flip the failure mode between engine
@@ -87,7 +90,7 @@ if (process.env.FAKE_AGY_PID_FILE) {
 }
 if (process.env.FAKE_AGY_ENV_FILE) {
   try {
-    const envKeys = ['HOME', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'GEMINI_CLI_HOME', 'HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY']
+    const envKeys = ['HOME', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'GEMINI_CLI_HOME', 'HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'AGY_PROXY_API_KEY', 'AGY_PROXY_ADMIN_PASSWORD']
     const snapshot = {}
     for (const k of envKeys) {
       if (process.env[k] !== undefined) snapshot[k] = process.env[k]

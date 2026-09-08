@@ -93,7 +93,7 @@ export function makeAdminServer(
       verifyPassword: async (pw: string) => pw === 'drill-admin',
     },
   })
-  return { built, keys, ledger, db, pool, poolAuth, events }
+  return { built, keys, ledger, db, pool, poolAuth, events, quota }
 }
 
 export type ServerRef = ReturnType<typeof makeAdminServer>['built']

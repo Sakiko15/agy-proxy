@@ -119,6 +119,34 @@ describe('discovery end-to-end via fake-agy', () => {
     expect(second?.ALL_PROXY).toBe('http://127.0.0.1:7890')
   })
 
+  it('spawn env sanitization: gateway AGY_PROXY_* secrets never reach the discovery spawn', async () => {
+    snapshotEnv()
+    delete process.env.FAKE_AGY_MODELS
+    const { envFile, pool } = makeFixture()
+    pool.createAccountSlot('a')
+    const savedKey = process.env.AGY_PROXY_API_KEY
+    const savedPwd = process.env.AGY_PROXY_ADMIN_PASSWORD
+    process.env.AGY_PROXY_API_KEY = 'sk-agy-under-test'
+    process.env.AGY_PROXY_ADMIN_PASSWORD = 'admin-pass-under-test'
+    try {
+      const cfg = defaultConfig()
+      const discover = makeCatalogDiscoverFn({ bin: () => process.execPath, binArgs: [fakeScript], pool, getConfig: () => cfg })
+      const catalog = new ModelCatalog(discover, cfg.fallbackModels, cfg.modelsCacheTtlMs)
+      const after = await catalog.forceRefresh()
+      expect(after.source).toBe('discovered')
+    } finally {
+      if (savedKey === undefined) delete process.env.AGY_PROXY_API_KEY
+      else process.env.AGY_PROXY_API_KEY = savedKey
+      if (savedPwd === undefined) delete process.env.AGY_PROXY_ADMIN_PASSWORD
+      else process.env.AGY_PROXY_ADMIN_PASSWORD = savedPwd
+    }
+    const lines = recordedEnvLines(envFile)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]?.HOME).toBeDefined() // sanity: the record line exists
+    expect(lines[0]?.AGY_PROXY_API_KEY).toBeUndefined()
+    expect(lines[0]?.AGY_PROXY_ADMIN_PASSWORD).toBeUndefined()
+  })
+
   it('rotation: two eligible accounts see alternating HOMEs across refreshes', async () => {
     snapshotEnv()
     delete process.env.FAKE_AGY_MODELS

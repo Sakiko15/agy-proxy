@@ -30,7 +30,7 @@ import { parseMirrorCallId, type RunRecording, type RunRegistry } from './record
 import { defaultEffortFor, findEntry, ModelCatalog, resolveModelSlug } from './models.ts'
 import { StreamJsonParser } from './parser.ts'
 import { defaultMediaDir, stageImages, type ImageRefLike } from './media.ts'
-import { isolatedHomeEnv, startAgyProcess, type RunOutcome } from './runner.ts'
+import { isolatedHomeEnv, sanitizeChildEnv, startAgyProcess, type RunOutcome } from './runner.ts'
 import { dataDir, stateDir } from '../common/config.ts'
 import type { SessionStore } from './sessions.ts'
 import type { StreamChunk, TokenUsage } from './stream-types.ts'
@@ -764,28 +764,32 @@ export class AgyEngine {
     // Only pool accounts run with an isolated HOME (their token file lives in
     // account.dir/.gemini); injecting HOME for the real user profile would
     // hide its agy login. Attempt-scoped: a retry may re-select the account.
-    const envFor = (acc: typeof account): NodeJS.ProcessEnv => ({
-      ...process.env,
-      ...(cfg.disableTelemetry
-        ? {
-            DO_NOT_TRACK: '1',
-            DISABLE_TELEMETRY: '1',
-            GOOGLE_CLOUD_DISABLE_TELEMETRY: '1',
-            ANTIGRAVITY_DISABLE_TELEMETRY: '1',
-          }
-        : {}),
-      ...(acc && acc.dir ? isolatedHomeEnv(acc.dir) : {}),
-      ...(acc?.proxyUrl
-        ? {
-            ALL_PROXY: acc.proxyUrl,
-            HTTPS_PROXY: acc.proxyUrl,
-            HTTP_PROXY: acc.proxyUrl,
-            all_proxy: acc.proxyUrl,
-            https_proxy: acc.proxyUrl,
-            http_proxy: acc.proxyUrl,
-          }
-        : {}),
-    })
+    // The composition is routed through sanitizeChildEnv: the gateway's own
+    // AGY_PROXY_* env (root key, admin password) must never reach the child —
+    // agy is a tool-executing agent, prompt injection can read its own env.
+    const envFor = (acc: typeof account): NodeJS.ProcessEnv =>
+      sanitizeChildEnv({
+        ...process.env,
+        ...(cfg.disableTelemetry
+          ? {
+              DO_NOT_TRACK: '1',
+              DISABLE_TELEMETRY: '1',
+              GOOGLE_CLOUD_DISABLE_TELEMETRY: '1',
+              ANTIGRAVITY_DISABLE_TELEMETRY: '1',
+            }
+          : {}),
+        ...(acc && acc.dir ? isolatedHomeEnv(acc.dir) : {}),
+        ...(acc?.proxyUrl
+          ? {
+              ALL_PROXY: acc.proxyUrl,
+              HTTPS_PROXY: acc.proxyUrl,
+              HTTP_PROXY: acc.proxyUrl,
+              all_proxy: acc.proxyUrl,
+              https_proxy: acc.proxyUrl,
+              http_proxy: acc.proxyUrl,
+            }
+          : {}),
+      })
 
     // Steer preemption lives on the recording, but the abort now has to
     // survive beyond the current process (a kill between retry attempts must
@@ -1134,6 +1138,11 @@ export class AgyEngine {
   ): AsyncGenerator<StreamChunk, SpanEnd> {
     const queue = new ChunkQueue()
     let cutOnToolEnd = false
+    // Audit F4: a tool-call block handed across the yield boundary means the
+    // client holds a mirror-call id (agytc-<runId>-<idx>) and will come back
+    // for a continuation span — the recording must survive settlement.
+    let clientSawToolCall = false
+    let completed = false
     void (async () => {
       const mapper = new EventMapper({
         runId: rec.runId,
@@ -1164,7 +1173,27 @@ export class AgyEngine {
       }
       queue.close()
     })()
-    yield* queue.drain()
+    try {
+      for await (const ch of queue.drain()) {
+        // Flag BEFORE the yield: a consumer that breaks on this chunk (budget
+        // cap, disconnect) has already received it — for-await delivers the
+        // value before .return() finalizes us at this paused yield point.
+        if (ch.type === 'block-end' && ch.block.type === 'tool-call') clientSawToolCall = true
+        yield ch
+      }
+      completed = true
+    } finally {
+      // Audit F4: when the consumer finalizes the generator early (budget cut
+      // or disconnect breaks out of the for-await), the keepForContinuation
+      // tails after the two `yield*` call sites never run. Mirror the keep
+      // decision here: a delivered tool-call block must keep the recording
+      // for the coming mirror continuation; anything else forgets at settle
+      // exactly as the tails would.
+      if (!completed) {
+        rec.keepForContinuation = clientSawToolCall
+        if (!clientSawToolCall && rec.isSettled) this.deps.runs.forget(rec.runId)
+      }
+    }
     return { cutOnTool: cutOnToolEnd }
   }
 }

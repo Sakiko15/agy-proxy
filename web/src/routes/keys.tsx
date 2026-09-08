@@ -154,10 +154,19 @@ function KeyRow({ apiKey, onChanged }: { apiKey: ApiKeyWithToday; onChanged: () 
             className="flex w-full flex-wrap items-end gap-2 border-t border-border pt-3"
             onSubmit={(e: FormEvent<HTMLFormElement>) => {
               e.preventDefault()
+              const daily = Number(dailyLimit)
+              const rpm = Number(rpmLimit)
+              // A non-finite input ("1,000" → NaN, "1e999" → Infinity) used
+              // to fall through `|| 0` into 0 = unlimited with a "saved"
+              // toast — reject instead of silently unlimiting the key.
+              if (!Number.isFinite(daily) || !Number.isFinite(rpm)) {
+                toast.error(t('keys.invalidLimit'))
+                return
+              }
               void api
                 .patchKey(apiKey.id, {
-                  dailyTokenLimit: Number(dailyLimit) || 0,
-                  rpmLimit: Number(rpmLimit) || 0,
+                  dailyTokenLimit: daily,
+                  rpmLimit: rpm,
                   // '' clears the whitelist (server stores NULL) — the input's
                   // empty state IS the "unrestricted" affordance.
                   scopes,
@@ -222,14 +231,23 @@ function CreateKeyDialog({
   const [dailyLimit, setDailyLimit] = useState('0')
   const [rpmLimit, setRpmLimit] = useState('0')
   const [plaintext, setPlaintext] = useState<string | null>(null)
+  const [saved, setSaved] = useState(false)
 
   const submit = (event: FormEvent<HTMLFormElement>): void => {
     event.preventDefault()
+    const daily = Number(dailyLimit)
+    const rpm = Number(rpmLimit)
+    // Same non-finite guard as the row edit form: "1,000" must not become
+    // an unlimited budget (0) with a success toast.
+    if (!Number.isFinite(daily) || !Number.isFinite(rpm)) {
+      toast.error(t('keys.invalidLimit'))
+      return
+    }
     api
       .createKey({
         ...(name.trim() !== '' ? { name: name.trim() } : {}),
-        dailyTokenLimit: Number(dailyLimit) || 0,
-        rpmLimit: Number(rpmLimit) || 0,
+        dailyTokenLimit: daily,
+        rpmLimit: rpm,
       })
       .then((created) => {
         setPlaintext(created.plaintext)
@@ -242,6 +260,7 @@ function CreateKeyDialog({
     onOpenChange(next)
     if (next === false) {
       setPlaintext(null)
+      setSaved(false)
       setName('')
       setDailyLimit('0')
       setRpmLimit('0')
@@ -252,7 +271,10 @@ function CreateKeyDialog({
     <Dialog.Root open={open} onOpenChange={close}>
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 bg-black/50" />
-        <Dialog.Content className="fixed left-1/2 top-1/2 w-[min(92vw,28rem)] -translate-x-1/2 -translate-y-1/2 rounded-lg border border-border bg-card p-5 focus-visible:outline-ring">
+        <Dialog.Content
+          className="fixed left-1/2 top-1/2 w-[min(92vw,28rem)] -translate-x-1/2 -translate-y-1/2 rounded-lg border border-border bg-card p-5 focus-visible:outline-ring"
+          {...guardedDismissal(saved)}
+        >
           <Dialog.Title className="text-sm font-semibold">{t('keys.createTitle')}</Dialog.Title>
           {plaintext === null ? (
             <form onSubmit={submit} className="mt-3 flex flex-col gap-3">
@@ -271,7 +293,7 @@ function CreateKeyDialog({
               <Button type="submit">{t('common.create')}</Button>
             </form>
           ) : (
-            <PlaintextReveal plaintext={plaintext} onClose={() => close(false)} />
+            <PlaintextReveal plaintext={plaintext} saved={saved} onSavedChange={setSaved} onClose={() => close(false)} />
           )}
         </Dialog.Content>
       </Dialog.Portal>
@@ -282,10 +304,21 @@ function CreateKeyDialog({
 /** Shared plaintext-reveal step (create-once + rotate): the value shows
  *  exactly once per issuance; the copy button survives non-secure contexts
  *  (copyText fallback) and the "I saved it" checkbox gates the explicit
- *  close. */
-function PlaintextReveal({ plaintext, onClose }: { plaintext: string; onClose: () => void }): React.JSX.Element {
+ *  close. `saved` lives in the caller so its Dialog.Content can also block
+ *  Esc / outside-click dismissal until it is checked (audit: Esc used to
+ *  bypass the gate and discard the plaintext forever). */
+function PlaintextReveal({
+  plaintext,
+  saved,
+  onSavedChange,
+  onClose,
+}: {
+  plaintext: string
+  saved: boolean
+  onSavedChange: (saved: boolean) => void
+  onClose: () => void
+}): React.JSX.Element {
   const { t } = useTranslation()
-  const [saved, setSaved] = useState(false)
   return (
     <div className="mt-3 flex flex-col gap-3">
       <p className="text-sm font-medium text-amber-700 dark:text-amber-400">{t('keys.plaintextOnce')}</p>
@@ -303,7 +336,7 @@ function PlaintextReveal({ plaintext, onClose }: { plaintext: string; onClose: (
         {t('common.copy')}
       </Button>
       <label className="flex items-center gap-2 text-sm">
-        <input type="checkbox" checked={saved} onChange={(e) => setSaved(e.currentTarget.checked)} aria-label={t('keys.saved')} />
+        <input type="checkbox" checked={saved} onChange={(e) => onSavedChange(e.currentTarget.checked)} aria-label={t('keys.saved')} />
         {t('keys.saved')}
       </label>
       <Button disabled={!saved} onClick={onClose}>
@@ -313,21 +346,39 @@ function PlaintextReveal({ plaintext, onClose }: { plaintext: string; onClose: (
   )
 }
 
+/** Radix fires onEscapeKeyDown / onInteractOutside before closing; until the
+ *  "I saved it" gate is checked we preventDefault so the one-shot plaintext
+ *  cannot be dismissed by accident (audit: Esc discarded it permanently). */
+function guardedDismissal(saved: boolean) {
+  return {
+    onEscapeKeyDown: (event: KeyboardEvent) => {
+      if (!saved) event.preventDefault()
+    },
+    onInteractOutside: (event: Event) => {
+      if (!saved) event.preventDefault()
+    },
+  }
+}
+
 /** Post-rotate reveal: the new plaintext, same once-only gates as create. */
 function RotateDialog({ plaintext, onClose }: { plaintext: string; onClose: () => void }): React.JSX.Element {
   const { t } = useTranslation()
+  const [saved, setSaved] = useState(false)
   return (
     <Dialog.Root
       open
       onOpenChange={(next: boolean) => {
-        if (next === false) onClose()
+        if (next === false && saved) onClose()
       }}
     >
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 bg-black/50" />
-        <Dialog.Content className="fixed left-1/2 top-1/2 w-[min(92vw,28rem)] -translate-x-1/2 -translate-y-1/2 rounded-lg border border-border bg-card p-5 focus-visible:outline-ring">
+        <Dialog.Content
+          className="fixed left-1/2 top-1/2 w-[min(92vw,28rem)] -translate-x-1/2 -translate-y-1/2 rounded-lg border border-border bg-card p-5 focus-visible:outline-ring"
+          {...guardedDismissal(saved)}
+        >
           <Dialog.Title className="text-sm font-semibold">{t('keys.rotate')}</Dialog.Title>
-          <PlaintextReveal plaintext={plaintext} onClose={onClose} />
+          <PlaintextReveal plaintext={plaintext} saved={saved} onSavedChange={setSaved} onClose={onClose} />
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>

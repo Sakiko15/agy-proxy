@@ -272,6 +272,27 @@ describe('usage route account attribution (read-time pool enrichment)', () => {
     const all = await adminGet(built, '/admin/usage', cookie)
     expect((all.json() as UsageBody).total).toBe(3)
   })
+
+  it('protocol/status query filters reach the ledger (dashboard success-rate shape, audit M1)', async () => {
+    const { built, ledger } = makeAdminServer()
+    ledger.record({ requestId: 'g-ok-oa', keyId: null, accountId: null, model: 'gemini-3.7-flash', family: 'google', protocol: 'openai', promptTokens: 1, completionTokens: 1, status: 'OK' })
+    ledger.record({ requestId: 'g-ok-an', keyId: null, accountId: null, model: 'gemini-3.7-flash', family: 'google', protocol: 'anthropic', promptTokens: 1, completionTokens: 1, status: 'OK' })
+    ledger.record({ requestId: 'g-fail', keyId: null, accountId: null, model: 'gemini-3.7-flash', family: 'google', protocol: 'openai', promptTokens: 1, completionTokens: 1, status: 'TIMEOUT' })
+    await ledger.flush()
+    const { cookie } = await login(built)
+
+    const okOnly = await adminGet(built, '/admin/usage?status=OK', cookie)
+    expect((okOnly.json() as UsageBody).total).toBe(2)
+    const anthropicOnly = await adminGet(built, '/admin/usage?protocol=anthropic', cookie)
+    expect((anthropicOnly.json() as UsageBody).total).toBe(1)
+    expect(((anthropicOnly.json() as UsageBody).rows[0]?.requestId)).toBe('g-ok-an')
+
+    // An unknown protocol value must not match anything nor throw — it is
+    // dropped like an unparseable number, and the query stays unfiltered.
+    const bogus = await adminGet(built, '/admin/usage?protocol=grpc', cookie)
+    expect(bogus.statusCode).toBe(200)
+    expect((bogus.json() as UsageBody).total).toBe(3)
+  })
 })
 
 describe('pool routes against a real AccountPoolManager', () => {
@@ -323,6 +344,30 @@ describe('pool routes against a real AccountPoolManager', () => {
     const { cookie } = await login(built)
     const res = await adminSend(built, 'PATCH', '/admin/pool/accounts/acc_nope', cookie, { enabled: false })
     expect(res.statusCode).toBe(404)
+  })
+
+  it('GET /admin/pool carries the per-account quota lastError channel (audit F12)', async () => {
+    const { built, pool, quota } = makeAdminServer()
+    const { cookie } = await login(built)
+    const acc = pool.createAccountSlot('f12')
+    // note/clearQuotaError are private; reach them via the same test-only
+    // cast used for persistRefreshedToken (quota.test.ts, audit M3).
+    type ErrChannel = { noteQuotaError: (id: string, msg: string) => void; clearQuotaError: (id: string) => void }
+    const channel = quota as unknown as ErrChannel
+    channel.noteQuotaError.call(quota, acc.id, 'quota summary endpoint returned 503')
+
+    const withErr = await adminGet(built, '/admin/pool', cookie)
+    const account = (withErr.json() as { pool: { accounts: Array<{ id: string; quotaError?: string; quotaErrorAt?: number }> } })
+      .pool.accounts.find((a) => a.id === acc.id)
+    expect(account?.quotaError).toBe('quota summary endpoint returned 503')
+    expect(account?.quotaErrorAt).toBeGreaterThan(0)
+
+    // Cleared on the next successful refresh → the fields disappear again.
+    channel.clearQuotaError.call(quota, acc.id)
+    const cleared = await adminGet(built, '/admin/pool', cookie)
+    const after = (cleared.json() as { pool: { accounts: Array<{ id: string; quotaError?: string }> } })
+      .pool.accounts.find((a) => a.id === acc.id)
+    expect(after?.quotaError).toBeUndefined()
   })
 })
 
