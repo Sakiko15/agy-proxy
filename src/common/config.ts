@@ -116,6 +116,15 @@ function asNum(v: unknown): number | undefined {
   return undefined
 }
 
+/** shutdownGraceMs accept-predicate (code-review #8): values below the 1s
+ *  floor are REJECTED, not narrowed — identical to the env layer's
+ *  `>= 1_000` gate — so a bad overrides value falls through to the lower
+ *  layer instead of being clamped up to exactly 1000. */
+function asGraceMs(v: unknown): number | undefined {
+  const n = asNum(v)
+  return n !== undefined && n >= 1_000 ? n : undefined
+}
+
 const MODES: readonly PermissionMode[] = ['skip', 'plan', 'accept-edits']
 
 function asMode(v: unknown): PermissionMode | undefined {
@@ -177,7 +186,7 @@ function buildBase(overrides: OverridesFile): GatewayConfig {
     trustedProxies: asString(get('trustedProxies')) ?? base.trustedProxies,
     dbPath: asString(get('dbPath')) ?? base.dbPath,
     adminSessionTtlMs: asNum(get('adminSessionTtlMs')) ?? base.adminSessionTtlMs,
-    shutdownGraceMs: asNum(get('shutdownGraceMs')) ?? base.shutdownGraceMs,
+    shutdownGraceMs: asGraceMs(get('shutdownGraceMs')) ?? base.shutdownGraceMs,
     webDist: asString(get('webDist')) ?? base.webDist,
   }
 }
@@ -307,10 +316,9 @@ export function resolveConfig(
     return finishConfig(buildBase(overrides), env)
   }
   // Hot path: memoize base on the same stat identity as the B-M3 overrides
-  // memo (file + mtime + size; stat failure → 'none' — in practice stat only
-  // fails when the file is absent, where data is {}). Corrupt reads are never
-  // memoized (parsed=false), so B-M3's "a repaired file is picked up on the
-  // next read" invariant survives verbatim. The memoized base is handed out
+  // memo (file + mtime + size). Corrupt reads are never memoized
+  // (parsed=false), so B-M3's "a repaired file is picked up on the next
+  // read" invariant survives verbatim. The memoized base is handed out
   // behind a shallow copy — env and floors mutate the copy, never the memo.
   // The copy SHARES extraArgs/fallbackModels with the memo: grep-verified
   // contract — nothing mutates those arrays in place, and the env layer only
@@ -319,11 +327,17 @@ export function resolveConfig(
   // propagates here too — covered on the writer side by
   // invalidateOverridesCache().
   const rd = readOverridesWithStat()
-  const key = rd.st === null ? `none\0${rd.file}` : `${rd.file}\0${rd.st.mtimeMs}:${rd.st.size}`
-  let base = rd.parsed && baseCache !== null && baseCache.key === key ? baseCache.base : null
+  // Code-review #15: memoize ONLY on a real stat identity. The former
+  // `none\0<file>` key also memoized the stat-fails-but-read-succeeds case
+  // (exotic Windows ACE shape) under a constant key, pinning a stale base
+  // forever. buildBase on a missing file is pure CPU, so a statless read
+  // simply takes the unmemoized path every time.
+  if (rd.st === null || !rd.parsed) return finishConfig(buildBase(rd.data), env)
+  const key = `${rd.file}\0${rd.st.mtimeMs}:${rd.st.size}`
+  let base = baseCache !== null && baseCache.key === key ? baseCache.base : null
   if (base === null) {
     base = buildBase(rd.data)
-    if (rd.parsed) baseCache = { key, base }
+    baseCache = { key, base }
   }
   return finishConfig({ ...base }, env)
 }

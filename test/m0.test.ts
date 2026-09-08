@@ -105,6 +105,11 @@ describe('config layering (env > overrides > defaults)', () => {
     expect(resolveConfig({ AGY_PROXY_SHUTDOWN_GRACE_MS: '500' } as NodeJS.ProcessEnv, {}).shutdownGraceMs).toBe(25_000)
     // non-numeric falls through
     expect(resolveConfig({ AGY_PROXY_SHUTDOWN_GRACE_MS: 'soon' } as NodeJS.ProcessEnv, {}).shutdownGraceMs).toBe(25_000)
+    // Code-review #8: the overrides layer carries the same reject-not-narrow
+    // predicate (it used to pass any finite number straight through).
+    expect(resolveConfig({}, { shutdownGraceMs: 500 }).shutdownGraceMs).toBe(25_000)
+    expect(resolveConfig({}, { shutdownGraceMs: 999 }).shutdownGraceMs).toBe(25_000)
+    expect(resolveConfig({}, { shutdownGraceMs: 1_000 }).shutdownGraceMs).toBe(1_000)
   })
 })
 

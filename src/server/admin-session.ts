@@ -123,14 +123,24 @@ export async function ensureAdminPassword(
   try {
     existing = db.prepare('SELECT value FROM admin_settings WHERE key = ?').get(SETTINGS_KEY) as { value?: string } | undefined
   } catch (err) {
-    log.warn({ err: err instanceof Error ? err.message : String(err) }, 'admin password lookup failed — treating as first boot')
+    // Code-review #7: a failed lookup must not be read as "first boot" — the
+    // generated-password branch INSERTs OR REPLACE, which would silently
+    // rotate a stored hash we simply could not read. When the stored state
+    // is unknowable, do not guess: keep whatever is there (login may still
+    // work; the warn below says admin may be unavailable) and never overwrite.
+    log.warn({ err: err instanceof Error ? err.message : String(err) }, 'admin password lookup failed — skipping first-boot generation to preserve any stored hash')
+    return
   }
   if (existing?.value !== undefined) return
   const generated = randomBytes(12).toString('base64url')
   try {
     db.prepare('INSERT OR REPLACE INTO admin_settings (key, value) VALUES (?, ?)').run(SETTINGS_KEY, await hash(generated))
   } catch (err) {
-    log.warn({ err: err instanceof Error ? err.message : String(err) }, 'admin password store failed — admin login may be unavailable')
+    // Code-review #13: the generated value was never stored — printing it
+    // would advertise a password that does not work. Login stays broken
+    // either way; the warn below says so instead of a bogus "shown ONCE".
+    log.warn({ err: err instanceof Error ? err.message : String(err) }, 'admin password store failed — no password was generated or stored, admin login may be unavailable')
+    return
   }
   log.warn(
     { note: 'this value is shown exactly once and cannot be recovered' },
