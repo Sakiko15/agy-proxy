@@ -143,7 +143,7 @@ export const en = {
     dailyTokenLimit: 'Daily token budget (0 = unlimited)',
     rpmLimit: 'Requests per minute (0 = unlimited)',
     plaintextOnce: 'Save it now — shown exactly once, then unrecoverable',
-    invalidLimit: 'Invalid limit format — enter a non-negative number (e.g. 100000, no thousands separators)',
+    invalidLimit: 'Invalid limit format — enter a non-negative integer (e.g. 100000, no thousands separators)',
     saved: 'I saved it',
     scopesAll: 'All models',
     scopesModels: '{{n}} models',

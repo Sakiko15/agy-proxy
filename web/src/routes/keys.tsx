@@ -158,8 +158,11 @@ function KeyRow({ apiKey, onChanged }: { apiKey: ApiKeyWithToday; onChanged: () 
               const rpm = Number(rpmLimit)
               // A non-finite input ("1,000" → NaN, "1e999" → Infinity) used
               // to fall through `|| 0` into 0 = unlimited with a "saved"
-              // toast — reject instead of silently unlimiting the key.
-              if (!Number.isFinite(daily) || !Number.isFinite(rpm)) {
+              // toast — reject instead of silently unlimiting the key. The
+              // integer/non-negative half mirrors the server's 400 predicate
+              // (code-review #4): a negative used to reach the store as
+              // unlimited, a fraction was floored.
+              if (!Number.isFinite(daily) || !Number.isFinite(rpm) || !Number.isInteger(daily) || !Number.isInteger(rpm) || daily < 0 || rpm < 0) {
                 toast.error(t('keys.invalidLimit'))
                 return
               }
@@ -237,9 +240,11 @@ function CreateKeyDialog({
     event.preventDefault()
     const daily = Number(dailyLimit)
     const rpm = Number(rpmLimit)
-    // Same non-finite guard as the row edit form: "1,000" must not become
-    // an unlimited budget (0) with a success toast.
-    if (!Number.isFinite(daily) || !Number.isFinite(rpm)) {
+    // Same guard as the row edit form: "1,000" must not become an unlimited
+    // budget (0) with a success toast, and a negative/fractional limit must
+    // not ride the old isFinite-only check into the server (which 400s on
+    // non-integer/negative since code-review #4).
+    if (!Number.isFinite(daily) || !Number.isFinite(rpm) || !Number.isInteger(daily) || !Number.isInteger(rpm) || daily < 0 || rpm < 0) {
       toast.error(t('keys.invalidLimit'))
       return
     }
@@ -273,7 +278,13 @@ function CreateKeyDialog({
         <Dialog.Overlay className="fixed inset-0 bg-black/50" />
         <Dialog.Content
           className="fixed left-1/2 top-1/2 w-[min(92vw,28rem)] -translate-x-1/2 -translate-y-1/2 rounded-lg border border-border bg-card p-5 focus-visible:outline-ring"
-          {...guardedDismissal(saved)}
+          /* code-review #1: the dismissal gate guards the plaintext-reveal
+           * phase only. The form phase has nothing to lose yet used to carry
+           * the gate too — with saved=false from the start, Esc/outside-click
+           * were preventDefault'd and the create dialog was inescapable
+           * except by submitting. RotateDialog keeps the unconditional gate:
+           * its whole body IS the reveal step. */
+          {...(plaintext !== null ? guardedDismissal(saved) : {})}
         >
           <Dialog.Title className="text-sm font-semibold">{t('keys.createTitle')}</Dialog.Title>
           {plaintext === null ? (

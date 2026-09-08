@@ -143,7 +143,7 @@ export const zhCN = {
     dailyTokenLimit: '日 Token 预算（0 = 不限）',
     rpmLimit: '每分钟请求上限（0 = 不限）',
     plaintextOnce: '请立即保存该密钥 — 它只显示这一次，之后无法找回',
-    invalidLimit: '限额格式无效 — 请输入非负数字（如 100000，不要带千分位逗号）',
+    invalidLimit: '限额格式无效 — 请输入非负整数（如 100000，不要带千分位逗号）',
     saved: '我已保存',
     scopesAll: '全部模型',
     scopesModels: '{{n}} 个模型',
