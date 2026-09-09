@@ -262,7 +262,9 @@ describe('mapChatRequest', () => {
       max_tokens: 100,
       temperature: 0.7,
     })
-    expect(meta.maxTokens).toBe(100)
+    // max-tokens.ts: the 100 is lifted to the maxTokensDefault floor (65_536)
+    // — the deprecation warning still rides the original field.
+    expect(meta.maxTokens).toBe(cfg.maxTokensDefault)
     expect(meta.warnings.some((w) => w.includes('max_tokens is deprecated'))).toBe(true)
     expect(meta.warnings.some((w) => w.includes('temperature'))).toBe(true)
 
@@ -271,6 +273,27 @@ describe('mapChatRequest', () => {
     await expect(map({ ...BASE, stop: 'END' })).resolves.toBeTruthy()
     mapThrows({ ...BASE, stop: ['a', 'b', 'c', 'd', 'e'] }, /at most 4/)
     mapThrows({ ...BASE, stop: [''] }, /non-empty/)
+  })
+
+  it('maxTokensDefault lifts small caps, defaults an omitted cap, and 0 honors the client', async () => {
+    // Default config: floor 65_536.
+    expect(cfg.maxTokensDefault).toBe(65_536)
+    const lifted = await map({ ...BASE, max_completion_tokens: 100 })
+    expect(lifted.meta.maxTokens).toBe(65_536)
+    const omitted = await map(BASE) // no max_* field at all
+    expect(omitted.meta.maxTokens).toBe(65_536)
+    const big = await map({ ...BASE, max_completion_tokens: 200_000 }) // above the floor stays
+    expect(big.meta.maxTokens).toBe(200_000)
+
+    // floor 0 = disabled: the client value is honored exactly, omitted stays uncapped.
+    const off = { ...cfg, maxTokensDefault: 0 }
+    const exact = await map({ ...BASE, max_tokens: 100 }, off)
+    expect(exact.meta.maxTokens).toBe(100)
+    const none = await map(BASE, off)
+    expect(none.meta.maxTokens).toBeUndefined()
+    // Validation still precedes the lift in both modes.
+    await mapThrows({ ...BASE, max_completion_tokens: 0 }, /positive integer/, off)
+    await mapThrows({ ...BASE, max_completion_tokens: 1.5 }, /positive integer/)
   })
 
   it('json_object injects a system instruction; json_schema passes through natively', async () => {

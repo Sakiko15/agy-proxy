@@ -2,6 +2,16 @@
 
 All notable changes to agy-proxy are documented here. Format based on Keep a Changelog; versions follow semver.
 
+## Unreleased
+
+### Changed
+
+- **maxTokensDefault 接线：输出预算抬底 + 未传缺省**：`maxTokensDefault`（默认 65536，env `AGY_PROXY_MAX_TOKENS_DEFAULT`，此前是接了分层却无任何消费点的死配置）现在由两协议适配器消费（`src/server/max-tokens.ts`）——客户端 `max_tokens`/`max_completion_tokens` 低于 65536 抬到底值、OpenAI 未传以底值兜底；`0` = 关闭（完全尊重客户端，未传不设限）。根因：OpenAI SDK 常默认发 1024/4096 小上限，流式腿达限即 abort agy 把长回答截成 `length`（0.3.x 的 ABORTED 分析确认这是健康运行失败的主因）。客户端校验（正整数）先于抬底不变；新增 env 层读取（此前该键只有 overrides 文件层）；`oa10-truncation` golden 经 `case.json` 钉 `maxTokensDefault: 0` 继续验证裸客户端上限截断。不进 settings 管理白名单（协议可见行为，env/overrides 级）。
+
+### Fixed
+
+- **ABORTED 记账细分**:流式 `max_tokens` 预算截断此前被记为 `ABORTED / agy run aborted by caller` 失败——但客户端收到的是成功的 `length`/`max_tokens` 终止,健康运行在面板成功率里被记为失败、进错误列表。现在四类主动终止按原因分类(引擎按 `AbortSignal.reason` 识别,route 在预算截断时传入 `output-budget`):截断结算为正常完成(ok/OK,记一次成功账);客户端断连/关停排水/steer 抢占仍记 ABORTED,但错误详情写明具体原因,不再是笼统的 "aborted by caller"。wire 字节不变、无新状态码、面板零改动,仪表盘成功率自动修正。
+
 ## 0.3.1 - 2026-09-09
 
 ### Changed

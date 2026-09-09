@@ -74,7 +74,7 @@ agy-proxy 是自托管的 LLM 网关：把 Google Antigravity 官方 `agy` CLI �
 | OpenAI | Anthropic | agy | 说明 |
 |---|---|---|---|
 | model | model | `--model` | 统一别名表；Gemini `-low/-medium/-high` effort 后缀折叠（复用 foldEfforts） |
-| max_completion_tokens | max_tokens | 无直接对应 | 用于截断防护与记账；OpenAI 旧 `max_tokens` 接受但按弃用处理。**流式**：按 estimateTokens 启发式累计输出（text + reasoning + 工具参数，无 tokenizer，粒度为单个 delta），达上限即 abort agy 并终结——OpenAI `finish_reason:'length'` / Anthropic `stop_reason:'max_tokens'`；**非流式**：比例截断（现状） |
+| max_completion_tokens | max_tokens | 无直接对应 | 用于截断防护与记账；OpenAI 旧 `max_tokens` 接受但按弃用处理。**网关输出预算（2026-09-09，max-tokens.ts）**：客户端值先按正整数校验（0/负数仍 400），随后抬底——低于 `maxTokensDefault`（env `AGY_PROXY_MAX_TOKENS_DEFAULT`，默认 65536）的客户端上限抬到底值，OpenAI 未传时以底值兜底；`0` = 关闭（完全尊重客户端，未传即不设限）。动机：SDK 默认小上限（1024/4096）把长回答截成 `length` 是健康运行失败的主因。**流式**：按 estimateTokens 启发式累计输出（text + reasoning + 工具参数，无 tokenizer，粒度为单个 delta），达上限即 abort agy 并终结——OpenAI `finish_reason:'length'` / Anthropic `stop_reason:'max_tokens'`；**非流式**：比例截断（现状） |
 | reasoning_effort: none/minimal/low/medium/high/xhigh/max | thinking: {type:enabled(budget_tokens)/adaptive/disabled} | `--effort low/medium/high`（仅 Gemini） | 映射：none→不传 effort；minimal/low→low；medium→medium；high/xhigh/max→high；Anthropic enabled(budget) 按预算分档到 low/medium/high；adaptive→模型默认。**M2 budget 档位边界：budget_tokens ≤4096→low / ≤16384→medium / >16384→high** |
 | temperature / top_p / top_k | （三者均已弃用，4.6+ 仅接受近似值） | 忽略 | 接受不报错；差异在文档注明 |
 | stop / stop_sequences | stop_sequences | 不支持 | agy 无对应；两腿均网关侧后处理（"尽力"，字符串粒度）：**流式** SSE 层 holdback 缓冲——可能是任一 stop 前缀的文本尾巴扣留，命中即截断终结（只作用 text 流，reasoning 不截）；OpenAI `finish_reason:'stop'`，Anthropic `stop_reason:'stop_sequence'` + `stop_sequence` 回显；**非流式**最先命中截断 |
@@ -146,6 +146,7 @@ agy-proxy 是自托管的 LLM 网关：把 Google Antigravity 官方 `agy` CLI �
 - **崩溃恢复**：SQLite `journal_mode=WAL; synchronous=FULL; busy_timeout`；usage 记账以**服务端**请求 id 幂等去重（引擎级重试合并为一行；客户端自选 `x-request-id` 不作为记账键、仅观测透传——记账键可被客户端操纵会让每日预算形同虚设，S-H1 安全修复）；pool.json/sessions.json 损坏时隔离备份（`.corrupt-<ts>`）后重建（S4——备份保留损坏现场供排查，重建从默认空态起步）
 - **并发防护**：每账号串行队列（p-queue `concurrency:1`，已实现——同时消除同账号并发互踩会话绑定的竞态）+ 全局队列深度上限（超出即 429 BUSY）+ 客户端断连（AbortSignal）级联取消 agy 进程。调度补强（M5）：选择时跳过有在跑/排队的账号（busy-aware 参与参数），并发请求横向铺开而非堆叠一个账号的队列——验收 §4「互不阻塞 / ≥2.5× 吞吐」的结构性前提
 - **引擎级单次重试（M5 落地）**：仅覆盖无线上输出的故障类别（TIMEOUT / PROCESS_EXIT / 无结果 INVALID_OUTPUT），按 RETRY_POLICY 抖动延迟后重选账号重跑；任何已下发客户端可见输出（任一 step 事件）或结果形态可终止 span 的失败一律不重放。`RETRYABLE_CODES/RETRY_POLICY` 自 ADR-11 移植以来首次接入消费者
+- **abort 分类（2026-09-09）**：四类主动终止按原因细分记账——客户端断连 / 关停排水 / steer 抢占（新请求同会话抢占）仍记 `ABORTED`，但错误详情列明原因；**流式 max_tokens 预算截断结算为正常完成**（ok/OK）——客户端已收到成功的 length/max_tokens 终止，route 以 `abort(new Error('output-budget'))` 传入原因，引擎按 `AbortSignal.reason` 分类（engine.ts `abortFailure`），不再把健康运行记成面板失败拉低成功率
 - **硬限流语义（M3 修订，用户定案）**：in-flight 请求遇上游硬限流 = 该请求失败（上游真实错误透传），账号进冷却；**自下一个请求起自动切换**到池内其他账号——请求粒度的透明切换，而非中途透明重放（agy 无部分续传，跨进程重放需重新计费且会破坏会话绑定；**M5 复议定案：维持本决策**——重试机器已落地为引擎级单次重试，仅覆盖无线上输出的故障类别，与透明重放语义正交，见 §6 重试行）。全池冷却/隔离时返回 429 `POOL_EXHAUSTED` + `Retry-After`（取最早重置时刻倒计时）
 - **版本锁定**：Docker 构建期固定 agy 版本 + `AGY_CLI_DISABLE_AUTO_UPDATE=true`；启动探测 `agy --version`（最低版本可配置）
 - **PID 1**：容器内 tini（或 `docker run --init`）——转发 SIGTERM + 回收 zombie（每请求 spawn 短命子进程，zombie 回收不可省）

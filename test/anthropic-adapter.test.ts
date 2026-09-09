@@ -71,7 +71,8 @@ describe('mapMessagesRequest', () => {
     const { call, meta } = await map(BASE)
     expect(call.model).toBe('gemini-3.7-flash')
     expect(call.messages).toEqual([{ role: 'user', text: 'hi' }])
-    expect(meta.maxTokens).toBe(1024)
+    // max-tokens.ts: 1024 is lifted to the maxTokensDefault floor (65_536).
+    expect(meta.maxTokens).toBe(cfg.maxTokensDefault)
     expect(meta.stream).toBeUndefined()
   })
 
@@ -79,6 +80,19 @@ describe('mapMessagesRequest', () => {
     await mapThrows({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }, /max_tokens is required/)
     await mapThrows({ ...BASE, max_tokens: 0 }, /positive integer/)
     await mapThrows({ ...BASE, max_tokens: 'many' }, /positive integer/)
+  })
+
+  it('maxTokensDefault lifts small caps; 0 honors the client', async () => {
+    expect(cfg.maxTokensDefault).toBe(65_536)
+    const lifted = await map(BASE) // 1024 below the floor
+    expect(lifted.meta.maxTokens).toBe(65_536)
+    const big = await map({ ...BASE, max_tokens: 200_000 }) // above the floor stays
+    expect(big.meta.maxTokens).toBe(200_000)
+    const off = { ...cfg, maxTokensDefault: 0 }
+    const exact = await map(BASE, off)
+    expect(exact.meta.maxTokens).toBe(1024)
+    // The required-field check still precedes the lift in both modes.
+    await mapThrows({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }, /max_tokens is required/, off)
   })
 
   it('B-M5: staging blanks the body image payload but keeps the bytes + estimate', async () => {

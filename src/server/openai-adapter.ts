@@ -16,6 +16,7 @@ import type {
 } from '../host/stream-types.ts'
 import { GatewayHttpError, httpError, openAiError } from './errors.ts'
 import { estimateTokens } from './tokens.ts'
+import { resolveEffectiveMaxTokens } from './max-tokens.ts'
 
 // ---- response body shapes (only what this adapter emits) ----
 
@@ -332,6 +333,13 @@ export async function mapChatRequest(
     maxTokens = b.max_tokens
     warnings.push('max_tokens is deprecated by OpenAI; prefer max_completion_tokens')
   }
+  // Gateway-side output budget (maxTokensDefault, default 65_536): client
+  // values below the floor are lifted and an omitted value gets the floor —
+  // small SDK-default caps (1024/4096) otherwise truncate long answers
+  // mid-generation. floor 0 keeps the client value exactly (see
+  // max-tokens.ts); validation above still runs first, so 0/negative
+  // requests keep their 400.
+  maxTokens = resolveEffectiveMaxTokens(maxTokens, cfg.maxTokensDefault)
 
   for (const k of ['temperature', 'top_p'] as const) {
     if (b[k] !== undefined && (typeof b[k] !== 'number' || Number.isNaN(b[k]))) throw bad(k + ' must be a number')

@@ -479,7 +479,7 @@ export class AgyEngine {
         if (prev.requestAbort != null) prev.requestAbort()
         // A queued (not yet spawned) run has no process to abort — settle it
         // so the per-account queue task skips the spawn entirely.
-        else prev.settle({ kind: 'aborted', code: 'ABORTED', message: 'agy run aborted by caller' })
+        else prev.settle({ kind: 'aborted', code: 'ABORTED', message: 'superseded by a newer prompt on the same session' })
       }
     }
     const catalog = this.deps.catalog.get()
@@ -814,6 +814,23 @@ export class AgyEngine {
       proc?.kill('abort')
     }
 
+    /** One message per abort flavor: the ledger's errorText says WHICH caller
+     *  gave up (steer preemption / client disconnect / shutdown drain) instead
+     *  of a blanket 'aborted by caller'. The max-tokens budget cut is NOT a
+     *  failure: the route already emitted the successful length/max_tokens
+     *  finish before aborting, so settling it as ABORTED used to book a
+     *  healthy run as a dashboard failure — it settles as a normal completion
+     *  (failure null → ok/OK) instead. Only the route aborts with that reason
+     *  (app.ts budget cut), so it is unreachable on pre-spawn/retry-gap paths. */
+    const abortFailure = (): { kind: 'aborted'; code: string; message: string } | null => {
+      if (steerAborted) return { kind: 'aborted', code: 'ABORTED', message: 'superseded by a newer prompt on the same session' }
+      const reason = (call.signal?.reason as Error | undefined)?.message
+      if (reason === 'output-budget') return null
+      if (reason === 'client disconnected') return { kind: 'aborted', code: 'ABORTED', message: 'client disconnected mid-generation' }
+      if (reason === 'server shutting down') return { kind: 'aborted', code: 'ABORTED', message: 'server shutting down (grace drain)' }
+      return { kind: 'aborted', code: 'ABORTED', message: 'agy run aborted by caller' }
+    }
+
     /** What one spawn attempt concluded. */
     interface AttemptResult {
       failure: { kind: 'error' | 'aborted'; code: string; message: string } | null
@@ -919,7 +936,7 @@ export class AgyEngine {
         const isRateLimit = looksLikeRateLimit(rawErrText)
         let failure: { kind: 'error' | 'aborted'; code: string; message: string } | null = null
         if (outcome.aborted) {
-          failure = { kind: 'aborted', code: 'ABORTED', message: 'agy run aborted by caller' }
+          failure = abortFailure()
         } else if (outcome.timedOut) {
           failure = { kind: 'error', code: Err.TIMEOUT, message: 'agy run was idle for ' + cfg.timeoutMs + 'ms without output' }
         } else if (sawAuthFailure(parser, outcome)) {
@@ -987,8 +1004,12 @@ export class AgyEngine {
     }
 
     function spawnFailedAbort(acc: typeof account): AttemptResult {
+      // Pre-spawn/retry-gap aborts can never be a budget cut (no deltas were
+      // streamed), so a null classification is impossible here — coalesce to
+      // the generic text defensively.
+      const message = abortFailure() ?? { kind: 'aborted' as const, code: 'ABORTED', message: 'agy run aborted by caller' }
       return {
-        failure: { kind: 'aborted', code: 'ABORTED', message: 'agy run aborted by caller' },
+        failure: message,
         outcome: { code: null, signal: null, timedOut: false, aborted: true, stdout: '', stderrTail: '', durationMs: 0 },
         rawErrText: '',
         conversationId: null,

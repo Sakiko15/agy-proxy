@@ -298,7 +298,10 @@ describe('streaming max_tokens budget (T2-10)', () => {
 
   it('Anthropic leg: engine aborted mid-stream; stop_reason max_tokens', async () => {
     const signals: Array<AbortSignal> = []
-    const { built } = makeServer({}, scriptedEngine(LONG_OUTPUT, signals))
+    // maxTokensDefault: 0 pins the raw client-cap cut — the default floor
+    // (65_536) would lift max_tokens: 10 and nothing would truncate (see the
+    // lift test below).
+    const { built } = makeServer({ maxTokensDefault: 0 }, scriptedEngine(LONG_OUTPUT, signals))
     const res = await built.app.inject({
       method: 'POST',
       url: '/v1/messages',
@@ -327,7 +330,9 @@ describe('streaming max_tokens budget (T2-10)', () => {
 
   it('OpenAI leg: engine aborted mid-stream; finish_reason length', async () => {
     const signals: Array<AbortSignal> = []
-    const { built } = makeServer({}, scriptedEngine(LONG_OUTPUT, signals))
+    // maxTokensDefault: 0 pins the raw client-cap cut (see the Anthropic cut
+    // test above); the default floor would lift max_completion_tokens: 10.
+    const { built } = makeServer({ maxTokensDefault: 0 }, scriptedEngine(LONG_OUTPUT, signals))
     const res = await built.app.inject({
       method: 'POST',
       url: '/v1/chat/completions',
@@ -343,6 +348,35 @@ describe('streaming max_tokens budget (T2-10)', () => {
     expect((finish?.choices as Array<{ finish_reason: string }>)[0]?.finish_reason).toBe('length')
     expect(signals.length).toBeGreaterThan(0)
     expect(signals.every((s) => s.aborted)).toBe(true)
+    await built.app.close()
+  })
+
+  it('maxTokensDefault lifts a small client cap end-to-end (Anthropic leg)', async () => {
+    // Same request and scripted output as the Anthropic cut test above, but
+    // with the default floor on: max_tokens: 10 is lifted to 65_536, the
+    // OutputBudget never trips, and the run streams to its natural finish.
+    const signals: Array<AbortSignal> = []
+    const { built } = makeServer({}, scriptedEngine(LONG_OUTPUT, signals))
+    const res = await built.app.inject({
+      method: 'POST',
+      url: '/v1/messages',
+      payload: {
+        model: 'gemini-3.7-flash',
+        max_tokens: 10,
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    })
+    expect(res.statusCode).toBe(200)
+    const events = sseEvents(res.body)
+    const md = events.find((e) => e.event === 'message_delta')
+    expect((md?.data.delta as { stop_reason: string }).stop_reason).toBe('end_turn')
+    // Nothing was cut: both long deltas streamed through.
+    const text = events
+      .filter((e) => e.event === 'content_block_delta')
+      .map((e) => (e.data.delta as { text?: string }).text ?? '')
+      .join('')
+    expect(text).toBe('x'.repeat(80) + 'y'.repeat(80))
     await built.app.close()
   })
 })

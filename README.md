@@ -109,6 +109,14 @@ never keys the ledger, so replaying a request always books its own row (client-c
 ids are not trusted as dedupe keys). Per-key day budgets and RPM limits are enforced
 pre-engine; a rejected request never reaches agy and never books a row.
 
+Aborted runs: the `ABORTED` status is reserved for runs the gateway gave up on — a
+client disconnect mid-generation, a superseded prompt on the same session (steer
+preemption), or the shutdown grace drain (the error detail states which). A streaming
+`max_tokens` cut is NOT one: the client already received the successful
+`finish_reason:'length'` / `stop_reason:'max_tokens'` terminal, so the row books as OK
+(a budget-cut run's token counts may read 0 — agy reports usage only at step
+boundaries, and a killed step never reports).
+
 ## Deploy (docker + reverse proxy)
 
 The container shape is two-stage: `node:24-slim` builds `web/dist` (WebUI), then a slim
@@ -154,6 +162,7 @@ Layering: `AGY_PROXY_*` environment variables > `~/.agy-proxy/gateway/runtime-ov
 | `AGY_PROXY_TIMEOUT_MS` | `600000` | Idle watchdog for one agy run. |
 | `AGY_PROXY_MAX_CONCURRENT` | `3` | Concurrent agy processes. |
 | `AGY_PROXY_MAX_QUEUE_DEPTH` | `64` | Queued requests before 429 `BUSY`. |
+| `AGY_PROXY_MAX_TOKENS_DEFAULT` | `65536` | Output-budget floor + default (max-tokens.ts): client `max_tokens`/`max_completion_tokens` below this are lifted to it and an omitted OpenAI cap gets it; `0` disables the lift entirely (client values honored exactly; an omitted OpenAI cap stays uncapped). Client validation (positive integer, 400 otherwise) always runs first. Not admin-UI writable — env/overrides-file level. |
 | `AGY_PROXY_RATE_LIMIT_PER_MINUTE` | `0` (off) | Sliding-window request throttle. |
 | `AGY_PROXY_SSE_HEARTBEAT_MS` | `60000` | Idle SSE heartbeat interval; `0` disables heartbeats. |
 | `AGY_PROXY_WORKSPACE_ROOT` | `<dataDir>/workspace` | Workspace agy tools operate in. |
@@ -201,7 +210,10 @@ log sites). To verify: send a request with a fake key, then grep the log output 
   discovery error is visible on the dashboard (`GET /admin/status` → `catalog.lastError`).
 - **Fallback lineup** (served when discovery cannot run): gemini-3.8/3.7/3.6/3.5-flash,
   gemini-3.1-pro, claude-sonnet-4-6, claude-opus-4-6-thinking, gpt-oss-120b-medium.
-- **Truncation** (`max_completion_tokens`/`max_tokens`): non-streaming does a proportional
+- **Truncation** (`max_completion_tokens`/`max_tokens`): the gateway lifts client caps
+  below `AGY_PROXY_MAX_TOKENS_DEFAULT` (default `65536`) to that floor and defaults an
+  omitted OpenAI cap to it (`0` disables — see the env table); client validation still
+  400s non-positive values first. Non-streaming does a proportional
   text cut, approximate by design (no tokenizer); tool-call spans are never truncated;
   `finish_reason:'length'`. Streaming enforces the cap with the same `estimateTokens`
   heuristic (text + reasoning + tool arguments, delta granularity): once the estimate

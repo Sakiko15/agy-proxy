@@ -125,6 +125,15 @@ function asGraceMs(v: unknown): number | undefined {
   return n !== undefined && n >= 1_000 ? n : undefined
 }
 
+/** Output-budget floor (maxTokensDefault): 0 is legal and means "disabled —
+ *  honor the client's max_tokens exactly"; anything else must be a
+ *  non-negative integer. Negative/fractional values are REJECTED (fall
+ *  through to the lower layer), mirroring the asGraceMs discipline. */
+function asMaxTokensFloor(v: unknown): number | undefined {
+  const n = asNum(v)
+  return n !== undefined && Number.isInteger(n) && n >= 0 ? n : undefined
+}
+
 const MODES: readonly PermissionMode[] = ['skip', 'plan', 'accept-edits']
 
 function asMode(v: unknown): PermissionMode | undefined {
@@ -159,7 +168,7 @@ function buildBase(overrides: OverridesFile): GatewayConfig {
     maxConcurrent: asNum(get('maxConcurrent')) ?? base.maxConcurrent,
     maxQueueDepth: asNum(get('maxQueueDepth')) ?? base.maxQueueDepth,
     contextWindowDefault: asNum(get('contextWindowDefault')) ?? base.contextWindowDefault,
-    maxTokensDefault: asNum(get('maxTokensDefault')) ?? base.maxTokensDefault,
+    maxTokensDefault: asMaxTokensFloor(get('maxTokensDefault')) ?? base.maxTokensDefault,
     modelsCacheTtlMs: asNum(get('modelsCacheTtlMs')) ?? base.modelsCacheTtlMs,
     mediaDir: asString(get('mediaDir')) ?? base.mediaDir,
     mediaTtlMs: asNum(get('mediaTtlMs')) ?? base.mediaTtlMs,
@@ -221,6 +230,12 @@ function applyEnv(cfg: GatewayConfig, env: NodeJS.ProcessEnv): GatewayConfig {
   if (env.AGY_PROXY_MAX_QUEUE_DEPTH !== undefined) {
     const q = asNum(env.AGY_PROXY_MAX_QUEUE_DEPTH)
     if (q !== undefined && q >= 0) cfg.maxQueueDepth = q
+  }
+  if (env.AGY_PROXY_MAX_TOKENS_DEFAULT !== undefined) {
+    const f = asMaxTokensFloor(env.AGY_PROXY_MAX_TOKENS_DEFAULT)
+    // Output-budget floor (max-tokens.ts): 0 disables the lift entirely;
+    // negative/fractional values are ignored, not clamped.
+    if (f !== undefined) cfg.maxTokensDefault = f
   }
   if (env.AGY_PROXY_WORKSPACE_ROOT) cfg.workspaceRoot = env.AGY_PROXY_WORKSPACE_ROOT
   if (env.AGY_PROXY_MEDIA_DIR) cfg.mediaDir = env.AGY_PROXY_MEDIA_DIR

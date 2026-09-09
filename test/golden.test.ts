@@ -45,6 +45,9 @@ interface CaseConfig {
   fakeAgyExitCode?: number
   /** When present the catalog is force-refreshed from these raw models. */
   discoveredModels?: Array<{ id: string; display_name?: string }>
+  /** Output-budget floor override (e.g. oa10 pins 0 to keep its raw
+   *  client-cap truncation under the default 65_536 lift). */
+  maxTokensDefault?: number
 }
 
 /** Field-walk diff with explicit mismatch paths (acceptance §2 字段级 diff). */
@@ -145,6 +148,7 @@ async function makeServer(caseCfg: CaseConfig): Promise<{ app: ReturnType<typeof
   const workDir = mkdtempSync(join(tmpdir(), 'agy-golden-'))
   cfg.mediaDir = join(workDir, 'media')
   if (caseCfg.apiKey !== undefined) cfg.apiKey = caseCfg.apiKey
+  if (caseCfg.maxTokensDefault !== undefined) cfg.maxTokensDefault = caseCfg.maxTokensDefault
   process.env.AGY_PROXY_DATA_DIR = workDir
   process.env.AGY_PROXY_CONVERSATIONS_DIR = join(workDir, 'convs')
   const catalog = new ModelCatalog(

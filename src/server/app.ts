@@ -537,8 +537,11 @@ async function streamAnthropicMessages(args: {
 
       if (budgetCut) {
         // Cap reached by estimate: stop agy now instead of letting it run
-        // on, then end the SSE sequence at the budget.
-        abort.abort()
+        // on, then end the SSE sequence at the budget. The reason string is
+        // the engine's classification seam (abortFailure in engine.ts): the
+        // client already received the successful max-tokens finish, so the
+        // engine settles the killed run as a normal completion, not ABORTED.
+        abort.abort(new Error('output-budget'))
         if (holdback !== null) {
           const tail = holdback.close()
           if (tail.text !== '') await emit({ type: 'text-delta', index: 0, text: tail.text })
@@ -648,7 +651,9 @@ async function streamOpenAiChat(args: {
       }
 
       if (budgetCut) {
-        abort.abort()
+        // Same reason seam as the OpenAI leg: the engine settles the killed
+        // run as a normal completion (the client got the max-tokens finish).
+        abort.abort(new Error('output-budget'))
         if (holdback !== null) {
           const tail = holdback.close()
           if (tail.text !== '') await emit({ type: 'text-delta', index: 0, text: tail.text })

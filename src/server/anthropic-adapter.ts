@@ -18,6 +18,7 @@ import type {
 } from '../host/stream-types.ts'
 import { anthropicError, anthropicStatusFor, GatewayHttpError } from './errors.ts'
 import { estimateTokens } from './tokens.ts'
+import { resolveEffectiveMaxTokens } from './max-tokens.ts'
 
 // ---- response body shapes ---------------------------------------------------
 
@@ -275,6 +276,13 @@ export async function mapMessagesRequest(
     throw bad('max_tokens must be a positive integer')
   }
   maxTokens = b.max_tokens
+  // Gateway-side output budget (maxTokensDefault, default 65_536): client
+  // values below the floor are lifted — Anthropic requires max_tokens, so
+  // SDK-default small caps (1024/4096) otherwise truncate long answers
+  // mid-generation. floor 0 keeps the client value exactly (see
+  // max-tokens.ts); the required-field validation above still runs first
+  // (an8c: a missing max_tokens keeps its 400).
+  maxTokens = resolveEffectiveMaxTokens(maxTokens, cfg.maxTokensDefault)
 
   const messages: EngineMessage[] = []
   for (const raw of b.messages) {

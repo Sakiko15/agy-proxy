@@ -19,3 +19,10 @@ output_tokens=100; max_completion_tokens=3 → keepChars=0 → empty content +
 `length`. This pins the arithmetic END-TO-END (the maxTokens≤output guard,
 the exact proportional formula, the finish remap) — a regression in any of
 them flips finish_reason or the usage/echo fields.
+
+`case.json` pins `maxTokensDefault: 0`: since 0.3.x the gateway lifts client
+caps below the `maxTokensDefault` floor (default 65_536) and defaults an
+omitted cap to that floor (max-tokens.ts). This case exists to test the RAW
+client-cap truncation path, so it disables the floor for this replay —
+otherwise `max_completion_tokens: 3` would be lifted to 65_536 and nothing
+would truncate.

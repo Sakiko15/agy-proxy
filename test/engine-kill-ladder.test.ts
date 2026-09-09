@@ -281,3 +281,52 @@ describe('A-H1 engine-level rescue of a hung run', () => {
     expect(h.delays).toEqual([RETRY_POLICY.initialDelayMs])
   })
 })
+describe('abort-flavor classification (ledger text + budget-cut completion)', () => {
+  /** Drain one engine stream to completion, discarding chunks. */
+  async function drain(h: Harness, c: EngineCall): Promise<void> {
+    for await (const _ of h.engine.stream(c)) { /* drain */ }
+  }
+
+  it('the output-budget abort (route max-tokens cut) settles as a normal completion, not ABORTED', async () => {
+    const h = mk({ cfgOverrides: { timeoutMs: 30_000 } })
+    h.setMode('hang')
+    const controller = new AbortController()
+    const run = drain(h, call([msg('user', 'hi')], { signal: controller.signal }))
+    await vi.waitFor(() => expect(h.spawns()).toBe(1), { timeout: 10_000, interval: 10 })
+    // Simulates app.ts's budget cut exactly: the route aborts WITH the reason
+    // after the client already received the successful max-tokens finish.
+    controller.abort(new Error('output-budget'))
+    await run
+    expect(h.onRunCalls).toHaveLength(1)
+    expect(h.onRunCalls[0]).toMatchObject({ attempt: 0, final: true, ok: true, code: 'OK' })
+    expect(h.onRunCalls[0]?.failureMessage).toBeUndefined()
+    expect(h.delays).toEqual([]) // no retry tail behind a completed run
+  })
+
+  it('a client-disconnect abort books ABORTED with the precise disconnect text', async () => {
+    const h = mk({ cfgOverrides: { timeoutMs: 30_000 } })
+    h.setMode('hang')
+    const controller = new AbortController()
+    const run = drain(h, call([msg('user', 'hi')], { signal: controller.signal }))
+    await vi.waitFor(() => expect(h.spawns()).toBe(1), { timeout: 10_000, interval: 10 })
+    controller.abort(new Error('client disconnected'))
+    await run
+    expect(h.onRunCalls).toHaveLength(1)
+    expect(h.onRunCalls[0]).toMatchObject({ final: true, ok: false, code: 'ABORTED', failureMessage: 'client disconnected mid-generation' })
+  })
+
+  it('steer preemption books the superseded run with the supersession text', async () => {
+    const h = mk({ cfgOverrides: { timeoutMs: 30_000 } })
+    h.setMode('hang')
+    const first = drain(h, call([msg('user', 'first')], { sessionKey: 's1' }))
+    await vi.waitFor(() => expect(h.spawns()).toBe(1), { timeout: 10_000, interval: 10 })
+    // A new prompt on the same session preempting a live run (different text
+    // so the duplicate-submission debounce does not fire).
+    h.setMode('ok')
+    await drain(h, call([msg('user', 'second')], { sessionKey: 's1' }))
+    await first
+    expect(h.spawns()).toBe(2)
+    const superseded = h.onRunCalls.find((i) => i.failureMessage !== undefined && i.failureMessage.includes('superseded'))
+    expect(superseded).toMatchObject({ ok: false, code: 'ABORTED', final: true, failureMessage: 'superseded by a newer prompt on the same session' })
+  })
+})
