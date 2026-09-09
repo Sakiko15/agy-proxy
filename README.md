@@ -125,7 +125,7 @@ docker logs agy-proxy | grep -i password          # first-boot admin password �
 ```
 
 Deploying from a **1Panel** server? Use the panel's 编排 flow (容器 → 编排 → create → paste this
-compose; the image reference is env-interpolated — Docker Hub is the primary registry, pushed
+compose; the image reference is env-interpolated — ghcr.io is the primary registry, pushed
 on the explicit release command). Without a reverse proxy, bind stays loopback-only: reach the
 WebUI through an SSH tunnel. See `docs/deploy.md` 路径 C.
 

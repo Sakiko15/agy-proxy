@@ -2,10 +2,11 @@
 
 All notable changes to agy-proxy are documented here. Format based on Keep a Changelog; versions follow semver.
 
-## Unreleased
+## 0.3.1 - 2026-09-09
 
 ### Changed
 
+- **compose 默认镜像改拉 `:latest`**:`image` 默认 `ghcr.io/sakiko15/agy-proxy:latest` + `pull_policy: always`——`restart: unless-stopped` 只重启本地镜像、永不重拉,如今每次 `docker compose up -d` 都重新拉最新发布镜像;`AGY_PROXY_IMAGE` 覆盖保留(ghcr 不通时指向本地构建,deploy.md 路径 A)。deploy.md 三处旧引用(`0.2.0`/`docker.io`)同步。
 - **思考占位行移除**:`[agy thinking turn · N thinking tokens]` 注释行(含其未发布的中间改版 `[Gateway note — …]`)整体删除。根因:agy print 模式不导出思考文本,该行由网关纯合成(mapper),接收方把它误读为上游返回的模型输出;干脆不发——纯思考回合的 reasoning 流为空,思考量只经 usage 上报(OpenAI `reasoning_tokens` / Anthropic `output_tokens_details.thinking_tokens`,记账不变)。mapper 的 placement/deferral 逻辑(上游 v0.3.2/v0.3.3 回归的修复)随占位行一并删除——占位不存在,无需安置。wire 字节变更:8 个 golden 去掉思考块/帧,PROVENANCE/README/测试同步;真思考文本路径(stepKind thinking,如 oa2/an5)与 `[agy subagent]`/`[agy finished with error]` 标注不变。
 
 ## 0.3.0 - 2026-09-08
