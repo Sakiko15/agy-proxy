@@ -1,8 +1,10 @@
 # OA3 stream-reasoning — provenance
 
 Acceptance basis: `docs/acceptance.md` §2.1 OA3 — 流式 + 思考:
-- `reasoning_content` 增量先于正文;
-- thinking / cache token 映射对齐(charter §4.3)。
+- thinking / cache token 映射对齐(charter §4.3)— 本用例钉 usage 半边;
+- `delta.reasoning_content` 出现在 content 之前那半边由 oa2 的真思考
+  文本 fixture 覆盖(占位行移除后,本 fixture 的思考回合不再产生
+  reasoning_content)。
 
 Source basis:
 - Chunk shape: OpenAI API reference — Chat Completions streaming,
@@ -25,10 +27,8 @@ golden asserts: the gateway forwards the LAST PER-CALL STEP SAMPLE
 contract.
 
 This expected.json pins ONE streamed span (no tool steps in the fixture, so
-no mirror cut). Two reasoning annotations appear:
-- the thinking-only turn (80 tokens) is annotated BEFORE any text — nothing
-  of that step had streamed, so the annotation leads;
-- the text step's own thinking (15 tokens) arrives on its DONE tail, AFTER
-  its fragments — the mapper's deferral rule (emitting at arrival would wedge
-  the annotation mid-sentence; dropping it hid the thinking entirely,
-  upstream v0.3.2/v0.3.3 regressions).
+no mirror cut). No reasoning_content appears: the formerly synthesized
+thinking-turn annotations were removed 2026-09-09 (they were mistaken for
+model output) — the thinking-only turn (80 tokens) and the text step's
+DONE-tail thinking (15 tokens) surface only through usage
+(`completion_tokens_details.reasoning_tokens` = 15).

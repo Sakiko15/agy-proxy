@@ -10,8 +10,9 @@
 // call, the client posts the tool result back, and the engine's next span (a
 // new stream() call) resumes from the message-derived cursor. Text/reasoning
 // streaming and the result envelope behave as before; thinking-only turns
-// stay token-annotated because agy print mode never streams the thoughts
-// themselves.
+// emit nothing — agy print mode never streams the thoughts, and the token
+// count rides usage (reasoningTokens) only. The former synthesized token
+// annotation was removed 2026-09-09 (it was being mistaken for model output).
 // Ported from dsh-agy-link src/host/mapper.ts @ 46984db (modified: imports
 // localized to src/host/stream-types.ts + mirror.ts; the useCodeWrapper /
 // run_code wrapper branch removed — the gateway has no dsh-tools host, so
@@ -67,7 +68,6 @@ export class EventMapper {
   private openAcc = ''
   private readonly emittedByKey = new Map<string, string>()
   private readonly announcedTools = new Set<string>()
-  private readonly thinkingAnnounced = new Set<string>()
   private sawTextStep: boolean
   private finished = false
 
@@ -110,13 +110,6 @@ export class EventMapper {
       : { type: 'reasoning-delta', index: this.blockIdx, text: delta }
   }
 
-  /** The honest thinking signal agy exposes: a token-count line. */
-  private *emitThinkingLine(thoughtTokens: number): Generator<StreamChunk> {
-    yield* this.ensureBlock('reasoning')
-    const d = this.appendDelta('[agy thinking turn · ' + thoughtTokens + ' thinking tokens]\n')
-    if (d) yield d
-  }
-
   /**
    * Map one event. `absIndex` is the event's position in the run recording;
    * it mints the mirror callId and is what continuation detection parses
@@ -129,36 +122,14 @@ export class EventMapper {
     if (ev.kind === 'step') {
       if (ev.usage) this.opts.usage?.noteStepUsage(ev.usage)
       if (ev.stepKind === 'text') {
-        // agy ≥1.1.15 thinking turns: agent_response steps with usage but no
-        // text_delta. The thoughts themselves are not streamed in print mode,
-        // so surface the turn honestly as a token-annotated reasoning line.
-        //
-        // Placement: agy attaches usage (and with it thinking_tokens) to the
-        // step's DONE tail — AFTER the text fragments already streamed. So:
-        //  - nothing of this step streamed yet (thinking-only turn, one-shot
-        //    envelope) -> annotate FIRST, then the text;
-        //  - fragments already went out -> DEFER the annotation until the
-        //    step's text is complete, then emit it as a trailing reasoning
-        //    block. Emitting at arrival would wedge the annotation mid-sentence
-        //    (upstream v0.3.2 regression); dropping it hid the first turn's
-        //    thinking entirely (upstream v0.3.3 regression). Both fixed by
-        //    deferral.
-        const thoughtTokens = ev.usage?.thinking_tokens ?? 0
-        const stepTextEmitted = (this.emittedByKey.get(ev.stepKey) ?? '') !== ''
-        if (thoughtTokens > 0 && !stepTextEmitted && !this.thinkingAnnounced.has(ev.stepKey)) {
-          this.thinkingAnnounced.add(ev.stepKey)
-          yield* this.emitThinkingLine(thoughtTokens)
-        }
-        const deferred = thoughtTokens > 0 && stepTextEmitted && !this.thinkingAnnounced.has(ev.stepKey)
-        if (ev.text === '' && !ev.fragment) {
-          // DONE tail carrying usage with no text: the step is already
-          // complete — flush the deferred annotation now.
-          if (deferred) {
-            this.thinkingAnnounced.add(ev.stepKey)
-            yield* this.emitThinkingLine(thoughtTokens)
-          }
-          return
-        }
+        // agy ≥1.1.15 attaches thinking_tokens to agent_response steps' usage;
+        // print mode never streams the thoughts themselves, so the count rides
+        // usage only (noteStepUsage above → reasoningTokens → reasoning_tokens
+        // / thinking_tokens). The gateway renders no placeholder text for
+        // thinking turns: the formerly synthesized annotation was mistaken for
+        // model output and was removed 2026-09-09 — its upstream v0.3.2/v0.3.3
+        // placement regressions died with it.
+        if (ev.text === '' && !ev.fragment) return
         this.sawTextStep = true
         yield* this.ensureBlock('text')
         let d: StreamChunk | null
@@ -175,12 +146,6 @@ export class EventMapper {
           d = this.appendDelta(delta)
         }
         if (d) yield d
-        if (deferred) {
-          // This DONE closed the step's text: the annotation lands after the
-          // complete sentence, never between two of its fragments.
-          this.thinkingAnnounced.add(ev.stepKey)
-          yield* this.emitThinkingLine(thoughtTokens)
-        }
         return
       }
       if (ev.stepKind === 'thinking' || ev.stepKind === 'subagent') {

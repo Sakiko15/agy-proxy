@@ -347,8 +347,7 @@ describe('engine: real-shape runs and error mapping', () => {
     const finish = chunks[chunks.length - 1] as { type: string; reason: { kind: string } }
     expect(finish.reason.kind).toBe('stop')
     const reasoning = chunks.filter((c) => c.type === 'reasoning-delta').map((c) => (c as unknown as { text: string }).text).join('')
-    expect(reasoning).toContain('[agy thinking turn · 80 thinking tokens]')
-    expect(reasoning).not.toContain('[agy tool:')
+    expect(reasoning).toBe('')
     const text = chunks.filter((c) => c.type === 'text-delta').map((c) => (c as unknown as { text: string }).text).join('')
     expect(text).not.toContain('note1.txt')
     expect(text).toContain('There are 2 files, 6 words total.')

@@ -13,10 +13,11 @@ Source basis:
   (charter §4.4 usage-mapping table): agy's envelope carries thinking_tokens
   and Anthropic's official shape has no slot for it, so the gateway mirrors
   the OpenAI-side extension field name on the Anthropic surface.
-- The `[agy thinking turn · N thinking tokens]` annotation is the mapper's
-  thinking-turn marker (dsh-agy-link mapper.ts): agy's stream-json reports
-  thinking as a token-count turn, not text, so the gateway renders a
-  placeholder annotation before the text block.
+- agy's stream-json reports thinking as a token-count turn, not text. The gateway
+  formerly synthesized a `[agy thinking turn · N thinking tokens]` placeholder line;
+  it was removed 2026-09-09 (recipients mistook it for model output) — thinking
+  surfaces only via usage (`output_tokens_details.thinking_tokens` below); the
+  content stream carries no thinking block for these shapes.
 
 Fixture: the standard 2-step ok fixture (user_input + agent_response with
 text "Hello from fake agy", usage 10/5/2/3). The `msg_` id is a random 24-char

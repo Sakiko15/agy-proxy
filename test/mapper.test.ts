@@ -200,7 +200,7 @@ describe('mapper', () => {
     expect(asFinish(lastChunk(chunks)).reason.kind).toBe('stop')
   })
 
-  it('agy 1.1.15 stream maps onto spans: thinking turn, tool cuts, fragments, result', () => {
+  it('agy 1.1.15 stream maps onto spans: silent thinking turn, tool cuts, fragments, result', () => {
     const events: unknown[] = [
       { kind: 'init', conversationId: 'c15' },
       // thinking-only turn (usage, no text)
@@ -215,11 +215,11 @@ describe('mapper', () => {
       { kind: 'step', stepKey: '5', stepKind: 'text', text: '2 files.', fragment: true },
       { kind: 'result', conversationId: 'c15', ok: true, response: 'There are 2 files.', usage: { input_tokens: 9, output_tokens: 8, thinking_tokens: 95 } },
     ]
-    // Span 1: thinking annotation + first tool cut
+    // Span 1: first tool cut (the thinking-only turn emits nothing)
     const s1 = newSpan('run15')
     const c1 = mapAll(s1, events, 0)
     const reasoning1 = c1.filter((c) => c.type === 'reasoning-delta').map((c) => (c as { text: string }).text).join('')
-    expect(reasoning1).toContain('[agy thinking turn · 80 thinking tokens]')
+    expect(reasoning1).toBe('')
     expect(toolCallEnd(c1).block.id).toBe(mirrorCallId('run15', 3))
     expect(asFinish(lastChunk(c1)).reason.kind).toBe('tool-calls')
     // Span 2: second tool cut (the errored one)
@@ -235,31 +235,24 @@ describe('mapper', () => {
     expect(asFinish(lastChunk(c3)).reason.kind).toBe('stop')
   })
 
-  it('one-shot answer step (text + usage together) still annotates thinking', () => {
-    // agy answers trivial questions in a single DONE envelope: no separate
-    // thinking-only step ever arrives. Regression (v0.3.2): these turns used
-    // to show no thinking at all.
+  it('one-shot answer step (text + usage together) streams text; thinking rides usage only', () => {
+    // agy answers trivial questions in a single DONE envelope carrying
+    // thinking_tokens. The formerly synthesized annotation is gone: no
+    // reasoning content is rendered — the count surfaces via usage only.
     const m = newSpan('r-oneshot')
     const chunks = mapAll(m, [
       { kind: 'step', stepKey: '2', stepKind: 'text', text: '1 + 1 等于 2。', usage: { input_tokens: 100, output_tokens: 50, thinking_tokens: 154 } },
       { kind: 'result', conversationId: 'c9', ok: true, response: '1 + 1 等于 2。', usage: {} },
     ])
     const reasoning = chunks.filter((c) => c.type === 'reasoning-delta').map((c) => (c as { text: string }).text).join('')
-    expect(reasoning).toContain('[agy thinking turn · 154 thinking tokens]')
+    expect(reasoning).toBe('')
     const text = chunks.filter((c) => c.type === 'text-delta').map((c) => (c as { text: string }).text).join('')
     expect(text).toBe('1 + 1 等于 2。')
-    // protocol order: the reasoning annotation precedes the answer text
-    const types = chunks.map((c) => c.type)
-    const rIdx = types.indexOf('reasoning-delta')
-    const tIdx = types.indexOf('text-delta')
-    expect(rIdx >= 0 && tIdx > rIdx).toBe(true)
   })
 
-  it('streamed answer: DONE-tail usage annotates AFTER the complete text', () => {
-    // v0.3.2 wedged the chip mid-sentence (annotated at DONE arrival, between
-    // fragments); v0.3.3 then dropped it entirely (first turn showed no
-    // thinking). Now the annotation is deferred to the step's text completion:
-    // present, but strictly after the last fragment.
+  it('streamed answer: DONE-tail thinking usage emits no placeholder', () => {
+    // The former annotation (and its deferral rule) is gone — DONE-tail
+    // thinking_tokens rides usage only, never the content stream.
     const m = newSpan('r-tail')
     const chunks = mapAll(m, [
       { kind: 'step', stepKey: '5', stepKind: 'text', text: 'There are ', fragment: true },
@@ -267,18 +260,13 @@ describe('mapper', () => {
       { kind: 'result', conversationId: 'c9', ok: true, response: 'There are 2 files.', usage: {} },
     ])
     const reasoning = chunks.filter((c) => c.type === 'reasoning-delta').map((c) => (c as { text: string }).text).join('')
-    expect(reasoning).toContain('[agy thinking turn · 15 thinking tokens]')
+    expect(reasoning).toBe('')
     const text = chunks.filter((c) => c.type === 'text-delta').map((c) => (c as { text: string }).text).join('')
     expect(text).toBe('There are 2 files.')
-    // the annotation trails the LAST text delta — never between fragments
-    const types = chunks.map((c) => c.type)
-    const lastTextIdx = types.lastIndexOf('text-delta')
-    const reasoningIdx = types.indexOf('reasoning-delta')
-    expect(lastTextIdx >= 0 && reasoningIdx > lastTextIdx).toBe(true)
     expect(asFinish(lastChunk(chunks)).reason.kind).toBe('stop')
   })
 
-  it('DONE tail with usage but no text still annotates after streamed text', () => {
+  it('DONE tail with usage but no text emits nothing', () => {
     const m = newSpan('r-tail2')
     const chunks = mapAll(m, [
       { kind: 'step', stepKey: '7', stepKind: 'text', text: 'Answer.', fragment: true },
@@ -286,7 +274,7 @@ describe('mapper', () => {
       { kind: 'result', conversationId: 'c9', ok: true, response: 'Answer.', usage: {} },
     ])
     const reasoning = chunks.filter((c) => c.type === 'reasoning-delta').map((c) => (c as { text: string }).text).join('')
-    expect(reasoning).toContain('[agy thinking turn · 9 thinking tokens]')
+    expect(reasoning).toBe('')
     const text = chunks.filter((c) => c.type === 'text-delta').map((c) => (c as { text: string }).text).join('')
     expect(text).toBe('Answer.')
   })

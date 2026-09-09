@@ -2,6 +2,12 @@
 
 All notable changes to agy-proxy are documented here. Format based on Keep a Changelog; versions follow semver.
 
+## Unreleased
+
+### Changed
+
+- **思考占位行移除**:`[agy thinking turn · N thinking tokens]` 注释行(含其未发布的中间改版 `[Gateway note — …]`)整体删除。根因:agy print 模式不导出思考文本,该行由网关纯合成(mapper),接收方把它误读为上游返回的模型输出;干脆不发——纯思考回合的 reasoning 流为空,思考量只经 usage 上报(OpenAI `reasoning_tokens` / Anthropic `output_tokens_details.thinking_tokens`,记账不变)。mapper 的 placement/deferral 逻辑(上游 v0.3.2/v0.3.3 回归的修复)随占位行一并删除——占位不存在,无需安置。wire 字节变更:8 个 golden 去掉思考块/帧,PROVENANCE/README/测试同步;真思考文本路径(stepKind thinking,如 oa2/an5)与 `[agy subagent]`/`[agy finished with error]` 标注不变。
+
 ## 0.3.0 - 2026-09-08
 
 功能批次(密钥可逆存储 reveal/rotate、usage 账号列、模型自动发现)、M1–M4 审计加固、S1–S9 稳定性批次、P1–P6/B3/B4 性能战役(契约:golden 双协议逐字节一致)、docker 发布链修复,以及一轮 /code-review 全量修复(15 条,5 批次)。闸门:check/build + 562 tests(55 files,0.2.0 时为 458)+ web check/test 24 + console.log grep 干净;perf 8/8 legs、soak 30min 23/23(RSS p50 203M,零 5xx 出窗)。

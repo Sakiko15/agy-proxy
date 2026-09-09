@@ -245,7 +245,11 @@ describe('AN2/AN3/AN5: streaming', () => {
   })
 
   it('AN3: thinking blocks stream as thinking_delta (no signature_delta)', async () => {
-    process.env.FAKE_AGY_MODE = 'real'
+    // Real thinking TEXT rides stepKind 'thinking' steps (default ok-mode
+    // fixture) — that is the path this block shape belongs to. The 'real'
+    // fixture's thinking arrives only as usage (no placeholder is rendered
+    // since the annotation removal), so it cannot exercise this shape.
+    process.env.FAKE_AGY_MODE = 'ok'
     const { built } = makeServer()
     const res = await post(built, { ...BASE, stream: true, thinking: { type: 'enabled', budget_tokens: 4096 } })
     expect(res.statusCode).toBe(200)

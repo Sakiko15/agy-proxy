@@ -6,7 +6,6 @@
   "role": "assistant",
   "model": "gemini-3.7-flash",
   "content": [
-    { "type": "thinking", "thinking": "[agy thinking turn · 2 thinking tokens]\n" },
     { "type": "text", "text": "Hello from fake agy" }
   ],
   "stop_reason": "end_turn",

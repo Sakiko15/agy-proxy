@@ -214,8 +214,11 @@ log sites). To verify: send a request with a fake key, then grep the log output 
   `stop_reason:'stop_sequence'` with the matched sequence echoed in `stop_sequence`.
   A stop hit never overrides a `tool-calls` terminal (the tool_use block already
   streamed).
-- **Thinking**: agy reports thinking as token-count turns, rendered as
-  `[agy thinking turn · N thinking tokens]` annotations. Anthropic thinking budget tiers:
+- **Thinking**: agy reports thinking only as a token count (`thinking_tokens` in usage —
+  the agy CLI print mode never exports thought text). The gateway surfaces it solely
+  through usage fields (`completion_tokens_details.reasoning_tokens` /
+  `output_tokens_details.thinking_tokens`); the content stream carries no thinking
+  placeholder. Anthropic thinking budget tiers:
   ≤4096 → low effort, ≤16384 → medium, >16384 → high. No `signature_delta` is ever emitted
   and inbound signatures are not validated. `reasoning_content` (OpenAI leg) is an
   ecosystem-convention field, not part of the official Chat Completions schema; no

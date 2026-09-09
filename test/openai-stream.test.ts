@@ -194,16 +194,17 @@ describe('OA2: streaming basics', () => {
 
 /** Unwrap helper: makeServer records the workDir in lastWorkDir for cleanup. */
 
-describe('OA3: reasoning_content ordering', () => {
-  it('reasoning deltas precede content; continuation carries cached/reasoning usage', async () => {
+describe('OA3: reasoning usage mapping', () => {
+  it('no placeholder reasoning for thinking-only turns; continuation carries cached/reasoning usage', async () => {
     process.env.FAKE_AGY_MODE = 'real'
     const { built } = makeServer()
-    // Hop 1 (span cut by the mirror tool step): reasoning annotation streams,
-    // then the tool_calls finish.
+    // Hop 1 (span cut by the mirror tool step): the thinking-only turn emits
+    // NO placeholder reasoning (annotation removed 2026-09-09 — thinking
+    // rides usage only; the reasoning-before-content ordering is pinned by
+    // the oa2 golden with real thinking text), then the tool_calls finish.
     const res1 = await post(built, { ...BASE, stream: true, stream_options: { include_usage: true } })
     const live1 = oa3Frames(res1.body)
-    const reasoningIdx = live1.findIndex((p) => typeof p.choices[0]?.delta.reasoning_content === 'string')
-    expect(reasoningIdx).toBeGreaterThanOrEqual(0)
+    expect(live1.some((p) => typeof p.choices[0]?.delta.reasoning_content === 'string')).toBe(false)
     expect(live1.find((p) => p.choices[0]?.finish_reason === 'tool_calls')).toBeTruthy()
     const tc = live1.find((p) => p.choices[0]?.delta.tool_calls !== undefined)?.choices[0]?.delta.tool_calls?.[0]?.id
     expect(tc).toMatch(/^agytc-/)
